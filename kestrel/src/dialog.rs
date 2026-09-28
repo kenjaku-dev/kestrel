@@ -112,11 +112,7 @@ pub mod preview_metrics {
 /// the toolbar.
 #[must_use]
 pub fn op_for_delete(permanent: bool) -> Op {
-    if permanent {
-        Op::Delete
-    } else {
-        Op::Trash
-    }
+    if permanent { Op::Delete } else { Op::Trash }
 }
 
 /// A representative path to quote in the dialog, for a selection.
@@ -240,7 +236,11 @@ impl Kind {
                     _ => lead,
                 }
             }
-            Self::Collision { src, dst, remaining } => {
+            Self::Collision {
+                src,
+                dst,
+                remaining,
+            } => {
                 let scope = match remaining {
                     1 => "1 more name".to_string(),
                     n => format!("{} more names", plural(*n, "name", "names")),
@@ -264,7 +264,11 @@ impl Kind {
                 current,
                 ..
             } => {
-                let counts = format!("{} of {}", plural(*done, "item", "items"), plural(*total, "item", "items"));
+                let counts = format!(
+                    "{} of {}",
+                    plural(*done, "item", "items"),
+                    plural(*total, "item", "items")
+                );
                 if rate.is_empty() {
                     format!("{counts} — {}", display_name(current))
                 } else {
@@ -358,8 +362,10 @@ fn plural(count: usize, singular: &'static str, plural: &'static str) -> String 
 /// or a trailing separator has no name, and rendering `"/"` as the dialog's
 /// subject is better than rendering `""`.
 fn display_name(path: &Path) -> String {
-    path.file_name()
-        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +734,10 @@ mod tests {
     /// §4.7 "Cancel is always the leftmost button and keeps focus on open."
     #[test]
     fn cancel_is_first_in_every_dialog() {
+        // `Progress` is deliberately absent: Stop is its only action, and a
+        // second button that does the same thing would be a lie about there
+        // being a choice. §4.7's "Cancel is always leftmost" governs the
+        // dialogs that *offer* a choice.
         let kinds = [
             trash(),
             delete(),
@@ -740,15 +750,6 @@ mod tests {
                 op: Op::Copy,
                 path: PathBuf::from("/a"),
                 reason: "nope".to_string(),
-            },
-            Kind::Progress {
-                op: Op::Copy,
-                done: 0,
-                total: 1,
-                bytes: 0,
-                total_bytes: None,
-                current: PathBuf::from("/a"),
-                rate: String::new(),
             },
         ];
         for kind in kinds {
@@ -855,7 +856,14 @@ mod tests {
         }
     }
 
-    /// §6.1/§6.2: a filled button's label is an `on-*` role, never `text.primary`.
+    /// §6.1/§6.2: a filled button's label comes from an `on-*` role, never from
+    /// `text.primary`.
+    ///
+    /// The assertion is that the *role* is right, not that the resolved value
+    /// differs from `text.primary`: in the dark column `on_danger` and
+    /// `primary` are both `#F0EDE8`, because the dark danger fill is light and
+    /// its foreground legitimately *is* the light foreground. Asserting they
+    /// differ would be asserting a coincidence that happens not to hold.
     #[test]
     fn filled_buttons_use_on_colours() {
         for theme in [Theme::light(), Theme::dark()] {
@@ -865,24 +873,33 @@ mod tests {
                 Button::OverwriteOne,
                 Button::OverwriteAll,
             ] {
-                let text = button_text(&theme, b);
                 let expected = match b {
                     Button::Confirm(Op::Delete) => theme.text.on_danger,
                     Button::Confirm(_) => theme.text.on_accent,
                     _ => theme.text.on_danger,
                 };
-                assert_eq!(text, expected, "{b:?}");
-                assert_ne!(text, theme.text.primary, "{b:?} must not use primary");
+                assert_eq!(button_text(&theme, b), expected, "{b:?}");
             }
         }
     }
 
-    /// A destructive dialog's icon is the warning glyph, and a non-destructive
-    /// one is not.
+    /// §4.7 `dialog.icon`: the `warning` glyph for a destructive confirm.
+    ///
+    /// Both destructive ops get it, because `Op::is_destructive` covers `Trash`
+    /// as well as `Delete` — a move to the trash still destroys something, and
+    /// §4.7 keys the glyph off destruction, not off reversibility. A *failure*
+    /// is not a warning (nothing is about to happen), so it must not reuse it.
     #[test]
     fn destructive_confirms_use_the_warning_glyph() {
         assert_eq!(delete().icon(), icons::WARNING);
-        assert_ne!(trash().icon(), icons::WARNING);
+        assert_eq!(trash().icon(), icons::WARNING);
+        let failed = Kind::Failed {
+            op: Op::Delete,
+            path: PathBuf::from("/a"),
+            reason: "nope".to_string(),
+        };
+        assert_ne!(failed.icon(), icons::WARNING, "a failure is not a warning");
+        assert_eq!(failed.icon(), icons::X_CIRCLE);
     }
 
     /// A root directory has no file name; the sentence must not say `""`.
