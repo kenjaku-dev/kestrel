@@ -1,0 +1,64 @@
+[package]
+name = "kestrel"
+description = "Kestrel — a lightweight file manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kestrel"
+path = "src/main.rs"
+
+[dependencies]
+# The headless filesystem engine. Zero UI dependencies by design.
+kestrel-fs = { path = "../kestrel-fs" }
+
+# `default-features = false` keeps wgpu (and its 200-crate graph) out of the
+# build entirely; this machine is an Intel HD 530 and we render with glow.
+#
+# NOTE: `winit/default` must NOT appear here. Cargo hard-errors on a `dep/feat`
+# string in a *dependency* feature list. Losing winit's `wayland-csd-adwaita`
+# default is fine: Hyprland provides server-side decorations.
+eframe = { version = "0.36.2", default-features = false, features = [
+  "accesskit",
+  "default_fonts",
+  "glow",
+  "links",
+  "persistence",
+  "wayland",
+  "x11",
+] }
+egui = "0.36.2"
+egui_extras = { version = "0.36.2", features = ["all_loaders"] }
+
+# Only used to read the compositor's light/dark preference off the live window
+# (`winit::window::Window::theme`). `eframe::Frame::info()` exposes no theme
+# (only `cpu_usage`), so this is the only reachable route to "system" mode.
+# Already a transitive dependency of eframe — adds zero packages to the graph.
+winit = { version = "0.30.13", default-features = false }
+
+# `statvfs` for the status bar's free-space meter. `std` has no equivalent.
+# Already in the graph via notify -> inotify, so this adds no packages, and
+# unlike `libc` its `fs::statvfs` is a safe call -- which is what lets this
+# crate keep `unsafe_code = "forbid"`.
+rustix = { version = "0.38", default-features = false, features = ["fs"] }
+
+log = "0.4.33"
+env_logger = { version = "0.11", default-features = false, features = [
+  "auto-color",
+  "humantime",
+] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+
+[dev-dependencies]
+# Real directories for the job tests: a collision, an overwrite and a cancel all
+# need an actual filesystem to happen on, not a mock. Same reason kestrel-fs has
+# it, and it is a dev-dependency so it never reaches a shipped binary.
+tempfile = "3.23.0"

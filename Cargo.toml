@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["kestrel-fs", "kestrel"]
+
+# `kestrel-fs` deliberately has zero UI dependencies so that the filesystem
+# engine stays headless-testable; `kestrel` is the egui/eframe shell that
+# depends on it, and is the only member that knows a GPU exists.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+notify = { version = "8.2", default-features = false, features = [
+    "macos_kqueue",
+] }
+trash = { version = "5.2", default-features = false }
+tempfile = "3.27"
+
+[profile.release]
+lto = "thin"

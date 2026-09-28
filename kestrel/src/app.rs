@@ -1,0 +1,3643 @@
+//! The application shell: toolbar, sidebar, breadcrumb, column headers, the
+//! virtualized file list, and the status bar.
+//!
+//! # The two rules this file exists to enforce
+//!
+//! 1. **Nothing in `ui()` blocks, and there is no `std::fs` in the render path
+//!    at all.** Directory reads go through [`kestrel_fs::scan::start`] on a
+//!    worker; filesystem *changes* through [`kestrel_fs::watcher`] on its own
+//!    thread; free space through [`crate::disk::SpaceProbe`], also on a worker.
+//!    Symlink targets are resolved *by the scanner* and ride along on
+//!    [`kestrel_fs::model::FileEntry::is_dir_target`], so deciding whether
+//!    `Enter` descends is a field read, not a `stat`. The only I/O in this file
+//!    is `std::fs::write` in the screenshot path, which is not in `ui()`.
+//!
+//! 2. **No `unwrap`/`expect`/`panic!` in non-test code.** Every fallible call —
+//!    `scan::start`, `watcher::watch`, `Response::clicked`, `Vec::get` — is
+//!    matched explicitly.
+//!
+//! # Layout
+//!
+//! egui 0.36 removed `SidePanel`/`TopBottomPanel`; panels are
+//! [`egui::Panel::left`]/`::top`/`::bottom`, and the `CentralPanel` goes **last**
+//! so it claims the rectangle the others left.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │  toolbar   (Panel::top, 34px + hairline)                     │
+//! ├────────────┬─────────────────────────────────────────────────┤
+//! │  sidebar   │  breadcrumb  (Panel::top, 28px + hairline)       │
+//! │  Places    ├─────────────────────────────────────────────────┤
+//! │            │  column headers (24px)                          │
+//! │            ├─────────────────────────────────────────────────┤
+//! │            │  file list  (CentralPanel, virtualized)         │
+//! ├────────────┴─────────────────────────────────────────────────┤
+//! │  status bar  (Panel::bottom, 24px + hairline)                │
+//! └──────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Every sticky band is a **layout sibling with a 1px border**, never an
+//! overlay (§2.12). That is what makes WCAG 2.2 "focus not obscured" a
+//! structural property rather than something a scroll offset has to remember.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use egui::{Align, Align2, Key, Layout, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
+use kestrel_fs::error::ScanError;
+use kestrel_fs::model::{EntryKind, FileEntry, SortKey, SortSpec};
+use kestrel_fs::scan::{ScanEvent, ScanHandle, ScanOptions};
+use kestrel_fs::watcher::{WatchEvent, WatchSubscription};
+
+use crate::clipboard::{Clipboard, Op};
+use crate::columns::{self, ColumnLayout, ColumnSet};
+use crate::dialog::{self, Button as DlgButton, Kind as DlgKind};
+use crate::disk::SpaceProbe;
+use crate::filetype::{self, Classified};
+use crate::format;
+use crate::history::History;
+use crate::icons;
+use crate::job::{self, Item, JobEvent, JobHandle};
+use crate::motion::Motion;
+use crate::places::{self, Place};
+use crate::preview::{self as pv, Kind as PvKind, Loaded as PvLoaded, Loader as PvLoader};
+use crate::rename::Inline as RenameInline;
+use crate::selection::Selection;
+use crate::tokens::{
+    self, Theme, ThemeMode, border, component, metric, radius, space, system_preference, ty,
+};
+use crate::toolbar::{self, Action};
+use crate::widgets;
+
+/// Which screen the app is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// The real file manager shell.
+    Browser,
+    /// `--gallery`: every §4 component at every state, for design review.
+    Gallery,
+}
+
+/// What the preview pane needs about the focused row.
+///
+/// A small owned copy rather than a borrow, so requesting a load does not alias
+/// `&mut self`. Three fields; cloning a `PathBuf` per frame is cheaper than the
+/// alternative, which is a `RefCell`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewTarget {
+    /// The file to preview.
+    path: PathBuf,
+    /// Its size, for the cap.
+    size: Option<u64>,
+    /// Whether it is an image, so the loaders decode rather than the highlighter.
+    is_image: bool,
+}
+
+/// What a confirm dialog has decided to do, once the user says yes.
+///
+/// Held on the app rather than inside the dialog so the dialog is plain data —
+/// a `Kind` that had to carry a closure would be a `Kind` that could not be
+/// compared, logged, or rendered by the `--screenshot` path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pending {
+    /// The operation.
+    op: job::Op,
+    /// Where it goes, for copy and move.
+    destination: Option<PathBuf>,
+    /// What it operates on.
+    items: Vec<Item>,
+}
+
+/// A running job's progress, for the status bar and the progress dialog.
+///
+/// The clock is started when the job is, not when the first item lands, so the
+/// rate reflects the user's experience — including the time spent waiting for the
+/// first collision answer, which is real elapsed time.
+#[derive(Debug, Clone, PartialEq)]
+struct JobProgress {
+    /// Which operation.
+    op: job::Op,
+    /// Items finished.
+    done: usize,
+    /// Items total, once the job has reported its start.
+    total: usize,
+    /// Bytes accounted for.
+    bytes: u64,
+    /// Bytes known to be in total, or `None` when no size walk ran.
+    ///
+    /// `None` is the honest answer for a directory: the listing's size for a
+    /// directory is its own `lstat` length, not a recursive total, and a
+    /// progress bar built on that number would be fiction.
+    total_bytes: Option<u64>,
+    /// Items the user chose to skip.
+    skipped: usize,
+    /// The item currently being worked on.
+    current: PathBuf,
+    /// When the job started.
+    started: Instant,
+    /// Set when the job has sent its terminal event.
+    finished: bool,
+}
+
+impl JobProgress {
+    /// Fresh progress for a job about to start.
+    fn new(op: job::Op, total: usize) -> Self {
+        Self {
+            op,
+            done: 0,
+            total,
+            bytes: 0,
+            total_bytes: None,
+            skipped: 0,
+            started: Instant::now(),
+            current: PathBuf::new(),
+            finished: false,
+        }
+    }
+
+    /// How long the job has been running.
+    fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// `true` once the job has ended.
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// The status-bar summary, e.g. `Copy 3 of 9 · 12 items/s · 1.2 MB`.
+    fn summary(&self) -> String {
+        let mut parts = vec![job::summary(self.op, self.done, self.total)];
+        let rate = job::format_rate(self.done, self.elapsed());
+        if !rate.is_empty() {
+            parts.push(rate);
+        }
+        if self.bytes > 0 {
+            parts.push(format::bytes(self.bytes));
+        }
+        if self.skipped > 0 {
+            parts.push(format::plural(self.skipped, "skipped", "skipped"));
+        }
+        parts.join(" \u{b7} ")
+    }
+}
+
+/// One line in the list, with its indentation depth.
+///
+/// Depth is carried on the row rather than re-derived at paint time. The Phase 3
+/// first attempt had a `tree_depth(index) -> usize` helper that returned
+/// `0` for row 0 and `1` for everything else: a "tree" that indented all but the
+/// first row by one step and so looked like a feature while being a lie. Depth is
+/// a property the *scanner* knows, not something the view index can supply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    /// The engine's entry.
+    pub entry: FileEntry,
+    /// Indentation depth, 0 for a child of the listed directory.
+    pub depth: usize,
+}
+
+impl Row {
+    /// The entry, for the many call sites that only care about the file.
+    #[must_use]
+    pub fn entry(&self) -> &FileEntry {
+        &self.entry
+    }
+
+    /// `true` when this row is a directory the tree can expand.
+    #[must_use]
+    pub fn is_expandable(&self) -> bool {
+        self.entry.is_descendable()
+    }
+}
+
+/// How rows are arranged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// A flat listing of the current directory. §4.11 `Ctrl+1`.
+    #[default]
+    List,
+    /// Nested, with `row.indent-step` per depth level. §4.11 `Ctrl+2`.
+    Tree,
+}
+
+/// Command-line options, parsed once in `main`.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// Show the design-system gallery instead of the shell.
+    pub gallery: bool,
+    /// `--light` / `--dark` force a mode; otherwise follow the system.
+    pub theme: ThemeMode,
+    /// An explicit start directory. `None` falls back to `$KESTREL_HOME`, then
+    /// `$HOME`, then `/`.
+    pub start_dir: Option<PathBuf>,
+    /// Start in tree view.
+    pub tree: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            gallery: false,
+            theme: ThemeMode::System,
+            start_dir: None,
+            tree: false,
+        }
+    }
+}
+
+/// The app. One instance per viewport.
+pub struct KestrelApp {
+    /// Which screen is showing.
+    screen: Screen,
+    /// The user's theme preference (may be `System`).
+    mode: ThemeMode,
+    /// The theme resolved for the current frame.
+    theme: Theme,
+    /// The resolved motion preference (§2.11 rule 5).
+    motion: Motion,
+    /// `$HOME`-relative places, resolved once at construction.
+    places: Vec<Place>,
+    /// The directory currently listed.
+    dir: PathBuf,
+    /// Rows delivered by the scan, already sorted by the engine, in the engine's
+    /// depth-first order so a parent always precedes its children.
+    rows: Vec<Row>,
+    /// Directories whose children are visible, in tree mode.
+    ///
+    /// Expanding is a **pure filter** over rows the scan has already delivered,
+    /// so it performs no I/O at all. See [`KestrelApp::tree_is_visible`].
+    expanded: BTreeSet<PathBuf>,
+    /// Paths the scan could not read. Reported as data, never as a dialog.
+    errors: Vec<ScanError>,
+    /// The in-flight scan, or `None` once the last one finished.
+    scan: Option<ScanHandle>,
+    /// The debounced watcher for [`Self::dir`].
+    watch: Option<WatchSubscription>,
+    /// Back/forward stacks.
+    history: History,
+    /// The user's multi-selection.
+    selection: Selection,
+    /// Staged cut/copy.
+    clipboard: Clipboard,
+    /// The sort handed to the engine for each directory.
+    sort: SortSpec,
+    /// Which sort column is active, for the header indicator.
+    sort_column: SortKey,
+    /// List or tree.
+    view: ViewMode,
+    /// Whether the listing is mixed enough to justify the Kind column.
+    show_kind_column: bool,
+    /// The visible scroll offset, in rows. Surfaced so `Home`/`End` and
+    /// scroll-to-focused can work — WCAG 2.2 focus-not-obscured.
+    scroll_rows: usize,
+    /// Background free-space probe.
+    space: SpaceProbe,
+    /// How many rows fit in the list viewport, measured each frame. The keyboard
+    /// path needs it to scroll the focused row into view, and a keyboard handler
+    /// has no `Ui` to ask.
+    viewport_rows: usize,
+    /// The live filter query; empty means no filter.
+    filter: String,
+    /// `true` while the filter field has focus.
+    filter_focused: bool,
+    /// The running file operation, or `None` when idle.
+    job: Option<JobHandle>,
+    /// Progress for the running job, for the dialog and the status bar.
+    job_progress: Option<JobProgress>,
+    /// What a confirm dialog is confirming, resolved when the user answers.
+    pending: Option<Pending>,
+    /// The modal on top, if any. Only ever one — a dialog about a dialog is how
+    /// a user loses the thread.
+    modal: Option<DlgKind>,
+    /// The button the keyboard is on, for the dialog's focus ring.
+    modal_focus: usize,
+    /// Inline rename in progress, if any.
+    renaming: Option<RenameInline>,
+    /// `true` when the inline field is creating a new folder rather than renaming
+    /// an existing one, which changes what Enter does.
+    creating: bool,
+    /// A `mkdir` in flight, so its answer can be collected without blocking.
+    mkdir_result:
+        Option<std::sync::mpsc::Receiver<std::result::Result<(), kestrel_fs::error::KestrelError>>>,
+    /// The preview pane's loader.
+    preview: PvLoader,
+    /// Whether the preview pane is shown.
+    show_preview: bool,
+    /// The preview's last content, so it survives a redraw.
+    preview_content: Option<PvLoaded>,
+    /// Rolling frame-time average in ms, for the status bar.
+    frame_ms: f32,
+    /// Frames observed so far, used to seed the average.
+    frames: u32,
+}
+
+impl KestrelApp {
+    /// Builds the app from an eframe `CreationContext`.
+    ///
+    /// The two I/O calls — `scan::start` and `watcher::watch` — both hand their
+    /// work to a thread and return a handle, so neither can block the first
+    /// frame. Font installation happens even earlier, in the `AppCreator`.
+    #[must_use]
+    pub fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> Self {
+        // egui tracks the OS theme preference itself, and its answer is
+        // available from the `Context` at construction time. `ui()` refines this
+        // against the live winit window every frame.
+        let system_dark = if opts.theme == ThemeMode::System {
+            Some(matches!(
+                cc.egui_ctx.options(|o| o.theme_preference),
+                egui::ThemePreference::Dark
+            ))
+        } else {
+            None
+        };
+        let theme = Theme::resolve(opts.theme, system_dark);
+        theme.apply(&cc.egui_ctx);
+        Self::assemble(opts, theme)
+    }
+
+    /// Builds the app against a bare [`egui::Context`], for the headless
+    /// `--screenshot` path.
+    ///
+    /// A [`eframe::CreationContext`] cannot be constructed outside eframe, so
+    /// the two things `new` takes from it are supplied directly. Everything
+    /// else, including the initial scan of the start directory, is identical, so
+    /// a capture shows the same app a real window would.
+    #[must_use]
+    pub fn for_capture(ctx: egui::Context, opts: Options) -> Self {
+        // `Some(true)`: a capture is deterministic by construction, and a
+        // screenshot that changes colour with the hour is not reviewable.
+        let theme = Theme::resolve(opts.theme, Some(true));
+        theme.apply(&ctx);
+        Self::assemble(opts, theme)
+    }
+
+    /// The shared construction path, once the theme is settled.
+    fn assemble(opts: Options, theme: Theme) -> Self {
+        let dir = opts.start_dir.clone().unwrap_or_else(places::start_dir);
+        let view = if opts.tree {
+            ViewMode::Tree
+        } else {
+            ViewMode::List
+        };
+        let mut app = Self {
+            screen: if opts.gallery {
+                Screen::Gallery
+            } else {
+                Screen::Browser
+            },
+            mode: opts.theme,
+            theme,
+            motion: crate::motion::detect(),
+            places: places::places(),
+            dir: dir.clone(),
+            rows: Vec::new(),
+            expanded: BTreeSet::new(),
+            errors: Vec::new(),
+            scan: None,
+            watch: None,
+            history: History::new(&dir),
+            selection: Selection::new(),
+            clipboard: Clipboard::new(),
+            sort: SortSpec {
+                key: SortKey::Name,
+                ascending: true,
+                dirs_first: true,
+            },
+            sort_column: SortKey::Name,
+            view,
+            show_kind_column: false,
+            scroll_rows: 0,
+            viewport_rows: 1,
+            space: SpaceProbe::new(),
+            job: None,
+            job_progress: None,
+            pending: None,
+            modal: None,
+            modal_focus: 0,
+            renaming: None,
+            creating: false,
+            mkdir_result: None,
+            preview: PvLoader::new(),
+            show_preview: true,
+            preview_content: None,
+            filter: String::new(),
+            filter_focused: false,
+            frame_ms: 0.0,
+            frames: 0,
+        };
+        app.open_dir(dir);
+        app
+    }
+
+    /// Cycles Light → Dark → System, re-resolving on the next frame.
+    pub fn cycle_theme(&mut self) {
+        self.mode = match self.mode {
+            ThemeMode::Light => ThemeMode::Dark,
+            ThemeMode::Dark => ThemeMode::System,
+            ThemeMode::System => ThemeMode::Light,
+        };
+    }
+
+    // -- Navigation --------------------------------------------------------
+
+    /// Navigates to `dir`: cancels anything in flight, re-arms the watcher,
+    /// records the history, and refreshes the free-space probe.
+    ///
+    /// This is the only place navigation is initiated, so "cancel the old scan,
+    /// join its worker, drop the old watcher, start the new ones" cannot be
+    /// half-done.
+    pub fn open_dir(&mut self, dir: PathBuf) {
+        // §4.11: navigating away abandons the in-flight walk. Cancelling first
+        // means the worker stops *before* the next drain rather than after it.
+        // `finish` also joins the thread — dropping the handle would only detach
+        // it, and repeated clicking would accumulate a thread per click.
+        if let Some(scan) = self.scan.take() {
+            scan.cancel();
+            // The summary counts a walk we are abandoning, so keeping it would be
+            // a lie.
+            let _abandoned = scan.finish();
+        }
+        // Dropping the `WatchSubscription` stops its debouncer thread
+        // (`DirWatcher::drop` joins it) and releases the inotify watch.
+        self.watch = None;
+
+        self.dir = dir;
+        self.rows.clear();
+        self.errors.clear();
+        self.selection.clear();
+        self.scroll_rows = 0;
+        // Staged paths that no longer exist are dropped from the clipboard: a
+        // cut staged in another directory is not a promise about this one.
+        self.clipboard.clear();
+
+        match kestrel_fs::scan::start(&self.dir, self.scan_options()) {
+            Ok(handle) => self.scan = Some(handle),
+            Err(err) => {
+                // `scan::start` returns `io::Error`; `classify_io` maps it onto
+                // the engine's typed error so the status bar reports the same
+                // thing it would for a mid-scan failure.
+                let err = kestrel_fs::error::classify_io(&self.dir, err);
+                log::error!("scan: cannot start for {}: {err}", self.dir.display());
+                self.errors.push(ScanError::new(self.dir.clone(), err));
+            }
+        }
+
+        // A watcher that cannot start degrades to a manual refresh affordance,
+        // not an error dialog (§6.6, requirement 7). `F5` is in the toolbar.
+        match kestrel_fs::watcher::watch(&self.dir) {
+            Ok(sub) => self.watch = Some(sub),
+            Err(err) => log::warn!("watch: {err}; falling back to manual refresh"),
+        }
+
+        self.history.push(&self.dir);
+        self.space.request(&self.dir);
+    }
+
+    /// Records a navigation that resolves to a path already on the stack.
+    ///
+    /// A symlinked directory can resolve to a different path than the one the
+    /// user clicked. Without this, following a link adds a history entry whose
+    /// `Back` re-enters the same link, and the user loops. Called when the
+    /// scanner proves a symlink's target is a directory.
+    fn note_same_place(&mut self, dir: PathBuf) {
+        self.history.replace_current(&dir);
+    }
+
+    /// The engine's scan options for the current sort.
+    ///
+    /// The sort is handed to the engine so each directory is sorted *before* it
+    /// is emitted. That is what lets the list paint incrementally: the UI never
+    /// sorts a 50,000-row `Vec`, which would be a frame-losing `O(n log n)` on a
+    /// scan the user cannot cancel.
+    fn scan_options(&self) -> ScanOptions {
+        let recursive = self.view == ViewMode::Tree;
+        ScanOptions {
+            sort: Some(self.sort),
+            // §5.2's hidden-file discussion presumes hidden entries are visible
+            // and *marked*; the eye toggle is Phase 4.
+            show_hidden: true,
+            // Tree mode reads exactly one level deeper than it shows at first.
+            //
+            // Depth 1 is a deliberate ceiling for two reasons. It bounds the work
+            // to one `readdir` per subdirectory, so a directory of 5,000 folders
+            // cannot turn a view toggle into a full-tree walk; and it means every
+            // child row is *already delivered*, which is what lets expanding a
+            // folder be a pure filter with no I/O at all. Deeper nesting needs
+            // either a second scan or a per-directory handle, which is Phase 4's
+            // tree work.
+            recursive,
+            max_depth: if recursive { 1 } else { 0 },
+            ..ScanOptions::listing()
+        }
+    }
+
+    /// `true` when a row should be shown in tree mode.
+    ///
+    /// A depth-0 row is always shown. A deeper row is shown only if its parent
+    /// directory is expanded, so collapsing hides exactly one subtree.
+    ///
+    /// Pure and free of I/O, which is the entire reason expansion does not
+    /// rescan: the rows are already in `self.rows`, and the engine's depth-first
+    /// order means a hidden parent means its children are hidden too.
+    fn tree_is_visible(&self, row: &Row) -> bool {
+        if self.view != ViewMode::Tree || row.depth == 0 {
+            return true;
+        }
+        // Every directory from the row's parent up to the scan root must be
+        // expanded — not just the immediate parent.
+        //
+        // Checking only the parent is the classic tree bug and it was caught
+        // here by a test rather than by eye: with `d/sub` expanded, collapsing `d`
+        // left `d/sub/grand.txt` on screen, orphaned above a closed folder. The
+        // walk is O(depth) per row, and depth is currently capped at 1, so it is
+        // two comparisons; the loop is written for the day the cap is raised.
+        let mut dir = row.entry.path.parent();
+        while let Some(d) = dir {
+            // The scan root is the boundary: it is never "expanded" because the
+            // user did not open it, they navigated to it.
+            if d == self.dir {
+                return true;
+            }
+            if !self.expanded.contains(d) {
+                return false;
+            }
+            dir = d.parent();
+        }
+        true
+    }
+
+    /// Expands or collapses a directory, returning the new state.
+    fn toggle_expand(&mut self, path: &Path) -> bool {
+        if self.expanded.remove(path) {
+            false
+        } else {
+            self.expanded.insert(path.to_path_buf());
+            true
+        }
+    }
+
+    // -- Frame pump ---------------------------------------------------------
+
+    /// Drains the scan channel, the watcher channel, and the space probe.
+    ///
+    /// Runs once per frame, before any widget is built. All three are
+    /// non-blocking: two `try_recv` loops and one atomic load.
+    ///
+    /// The scan's shape is the engine's documented pattern from
+    /// `kestrel-fs/src/lib.rs`, and it is not incidental. `drain_into` takes a
+    /// plain `FnMut(ScanEvent)` whose return value cannot be inverted — a
+    /// `FnMut(ScanEvent) -> bool` sink caused a real bug during engine
+    /// development, where inverted semantics silently truncated a scan to one
+    /// entry. The closure still needs to observe `Complete` to decide whether to
+    /// put the handle back, and it cannot clear `self.scan` from inside itself,
+    /// so the handle is taken out for the duration of the drain and restored
+    /// only if the walk is unfinished.
+    fn pump(&mut self) {
+        // 1. The scan.
+        let Some(scan) = self.scan.take() else {
+            return;
+        };
+        let mut finished = false;
+        scan.drain_into(|event| match event {
+            ScanEvent::Entry(entry) => {
+                let row = Row {
+                    depth: depth_of(&self.dir, &entry.path),
+                    entry,
+                };
+                if self.tree_is_visible(&row) {
+                    self.rows.push(row);
+                }
+            }
+            ScanEvent::Error(err) => self.errors.push(err),
+            ScanEvent::Complete { .. } => finished = true,
+            ScanEvent::BatchEnd => {}
+        });
+        if finished {
+            // The worker sends `Complete` last, so the channel is now empty and
+            // the thread is about to exit.
+            drop(scan);
+        } else {
+            self.scan = Some(scan);
+        }
+
+        // 2. The watcher. `try_recv`, never `recv`: a blocking read here would
+        //    stall the frame loop, which is the one thing this file forbids.
+        let mut stale = false;
+        if let Some(sub) = self.watch.as_ref() {
+            while let Ok(event) = sub.try_recv() {
+                match event {
+                    WatchEvent::Changed(changes) => stale |= changes.touches(&self.dir),
+                    WatchEvent::Error(err) => log::warn!("watch: {err}"),
+                }
+            }
+        }
+        if stale {
+            // Re-listing is cheap and cancellable, so it goes straight through
+            // the same `open_dir` path a click takes. The engine's 250ms debounce
+            // is what stops a `cargo build` from re-listing 400 times.
+            let dir = self.dir.clone();
+            self.open_dir(dir);
+            return;
+        }
+
+        // 3. Recompute the Kind column's justification. Only when the row count
+        //    changes, so a 50,000-row listing is not sampled every frame.
+        let mixed =
+            columns::listing_is_mixed(self.rows.iter().map(|r| r.entry.kind.is_directory()));
+        self.show_kind_column = mixed;
+    }
+
+    // -- Row helpers -------------------------------------------------------
+
+    /// `true` when `row` passes the live filter.
+    fn passes_filter(&self, row: &Row) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        row.entry
+            .name
+            .to_lowercase()
+            .contains(&self.filter.to_lowercase())
+    }
+
+    /// The indices of rows that pass the filter, in order.
+    ///
+    /// Rebuilt each frame, and only over the rows already delivered — the filter
+    /// is a display concern, so it must not require a rescan.
+    fn visible_rows(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.rows.len()).collect();
+        }
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| self.passes_filter(r))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The row at a *visible* position, accounting for the filter.
+    fn visible_row(&self, at: usize) -> Option<&FileEntry> {
+        self.visible_rows()
+            .get(at)
+            .and_then(|i| self.rows.get(*i))
+            .map(Row::entry)
+    }
+
+    fn visible_count(&self) -> usize {
+        if self.filter.is_empty() {
+            self.rows.len()
+        } else {
+            self.rows.iter().filter(|r| self.passes_filter(r)).count()
+        }
+    }
+
+    // -- File operations ---------------------------------------------------
+
+    /// Starts a job over the current selection, after any confirm the op needs.
+    ///
+    /// §4.7: "Used for irreversible actions only". So `Trash` and `Delete` get a
+    /// dialog and `Copy` does not — but a *move* onto an occupied destination
+    /// still raises the collision dialog from the worker, because that is not a
+    /// dialog about an intention, it is a question the filesystem asked.
+    fn begin(&mut self, op: job::Op, destination: Option<PathBuf>) {
+        let items = self.selected_items();
+        if items.is_empty() {
+            return;
+        }
+        if op.is_destructive() && self.modal.is_none() {
+            self.modal = Some(DlgKind::Confirm {
+                op,
+                count: items.len(),
+                sample: dialog::sample_path(&items),
+                warning: DlgKind::irreversibility_line(op).map(str::to_string),
+            });
+            // Remember what to do when the dialog is answered, so the dialog
+            // itself does not have to carry a closure.
+            self.pending = Some(Pending {
+                op,
+                destination,
+                items,
+            });
+            self.modal_focus = 0;
+            return;
+        }
+        self.start_job(op, items, destination);
+    }
+
+    /// The selected rows as job items, in visible order.
+    fn selected_items(&self) -> Vec<Item> {
+        let visible = self.visible_rows();
+        self.selection
+            .rows()
+            .filter_map(|v| visible.get(v).copied())
+            .filter_map(|i| self.rows.get(i))
+            .map(|row| {
+                let known = row.entry.size;
+                let item = if row.entry.kind.is_directory() {
+                    // A directory's `lstat` length is not a recursive total, and
+                    // reporting it as one would be a lie in the progress bar.
+                    Item::dir(row.entry.path.clone())
+                } else {
+                    Item::file(row.entry.path.clone(), known)
+                };
+                item
+            })
+            .collect()
+    }
+
+    /// Launches the worker.
+    fn start_job(&mut self, op: job::Op, items: Vec<Item>, destination: Option<PathBuf>) {
+        // Replacing a running job cancels it first, so a second paste cannot
+        // leave two workers writing into one directory.
+        if let Some(old) = self.job.take() {
+            old.cancel();
+            old.finish();
+        }
+        let count = items.len();
+        match job::start(op, items, destination) {
+            Ok(handle) => {
+                self.job = Some(handle);
+                self.job_progress = Some(JobProgress::new(op, count));
+                // A one-file copy reports itself in the status bar; a
+                // hundred-item copy gets a dialog with a Stop button, because
+                // that is the one a user is watching a clock for. The threshold
+                // is 1 because "many items" is the only thing that makes a modal
+                // less annoying than useful.
+                if count > 1 && self.modal.is_none() {
+                    self.modal = Some(DlgKind::Progress {
+                        op,
+                        done: 0,
+                        total: count,
+                        bytes: 0,
+                        total_bytes: None,
+                        current: self.dir.clone(),
+                        rate: String::new(),
+                    });
+                    self.modal_focus = 0;
+                }
+            }
+            Err(err) => {
+                self.modal = Some(DlgKind::Failed {
+                    op,
+                    path: self.dir.clone(),
+                    reason: job::describe(&err),
+                });
+                self.modal_focus = 0;
+            }
+        }
+    }
+
+    /// Drains the running job, and raises a dialog when it needs an answer.
+    fn pump_job(&mut self) {
+        let Some(mut handle) = self.job.take() else {
+            return;
+        };
+        let mut collided: Option<(PathBuf, PathBuf, usize)> = None;
+        let mut failed: Option<(PathBuf, String)> = None;
+        handle.drain_into(|event| match event {
+            JobEvent::Started { total } => {
+                if let Some(p) = self.job_progress.as_mut() {
+                    p.total = total;
+                }
+            }
+            JobEvent::Item { bytes, skipped, .. } => {
+                if let Some(p) = self.job_progress.as_mut() {
+                    p.done += 1;
+                    if let Some(b) = bytes {
+                        p.bytes += b;
+                        *p.total_bytes.get_or_insert(0) += b;
+                    }
+                    if skipped {
+                        p.skipped += 1;
+                    }
+                }
+            }
+            JobEvent::Collided {
+                src,
+                dst,
+                remaining,
+            } => {
+                collided = Some((src, dst, remaining));
+            }
+            JobEvent::Progress {
+                total_bytes,
+                current,
+                ..
+            } => {
+                if let Some(p) = self.job_progress.as_mut() {
+                    p.total_bytes = total_bytes;
+                    p.current = current;
+                }
+            }
+            JobEvent::Done {
+                done,
+                bytes,
+                skipped,
+            } => {
+                // A success is **not** a dialog. §4.7: dialogs are for irreversible
+                // actions, and a completed copy is neither irreversible nor
+                // surprising — it is a status-bar line that clears itself. Raising
+                // a modal here would be a dialog for good news.
+                if let Some(p) = self.job_progress.as_mut() {
+                    p.done = done;
+                    p.bytes = bytes;
+                    p.skipped += skipped;
+                    p.finished = true;
+                }
+            }
+            JobEvent::Cancelled { done, .. } => {
+                if let Some(p) = self.job_progress.as_mut() {
+                    p.done = done;
+                    p.finished = true;
+                }
+            }
+            JobEvent::Failed {
+                path,
+                message: reason,
+                ..
+            } => {
+                failed = Some((path, reason));
+            }
+        });
+
+        if let Some((src, dst, remaining)) = collided {
+            self.modal = Some(DlgKind::Collision {
+                src,
+                dst,
+                remaining,
+            });
+            self.modal_focus = 0;
+        } else if let Some((path, reason)) = failed {
+            // A failure **is** worth interrupting for: the user needs to know a
+            // job stopped halfway, or they will believe it finished.
+            self.modal = Some(DlgKind::Failed {
+                op: self.job_progress.as_ref().map_or(job::Op::Copy, |p| p.op),
+                path,
+                reason,
+            });
+            self.modal_focus = 0;
+        } else if self
+            .job_progress
+            .as_ref()
+            .is_some_and(JobProgress::is_finished)
+        {
+            // Finished cleanly: the status bar keeps the summary for a moment and
+            // then drops it. No modal.
+            self.job_progress = None;
+        }
+        // Keep a progress dialog's numbers live, and retire it when the job ends.
+        if let (Some(DlgKind::Progress { op, .. }), Some(p)) =
+            (self.modal.as_ref(), &self.job_progress)
+        {
+            let snapshot = DlgKind::Progress {
+                op: *op,
+                done: p.done,
+                total: p.total,
+                bytes: p.bytes,
+                total_bytes: p.total_bytes,
+                current: p.current.clone(),
+                rate: job::format_rate(p.done, p.elapsed()),
+            };
+            self.modal = Some(snapshot);
+        } else if matches!(self.modal, Some(DlgKind::Progress { .. })) {
+            // The job ended: retire the dialog. A completion is not a dialog.
+            if self.job_progress.is_none() {
+                self.modal = None;
+            }
+        }
+
+        // The handle goes back **unless** the job is waiting on a question or has
+        // ended, in which case dropping it would cancel a job that is merely
+        // parked — and `JobHandle::drop` joins, so holding it is what keeps the
+        // worker alive across the dialog.
+        let parked = handle.decisions().is_waiting();
+        let terminal = self
+            .job_progress
+            .as_ref()
+            .is_some_and(JobProgress::is_finished);
+        if parked || !terminal {
+            self.job = Some(handle);
+        } else {
+            handle.finish();
+        }
+    }
+
+    /// Answers the collision dialog.
+    fn answer_collision(&mut self, button: DlgButton) {
+        let Some(DlgKind::Collision { remaining, .. }) = self.modal.take() else {
+            return;
+        };
+        let _ = remaining;
+        let Some(job) = self.job.as_ref() else {
+            return;
+        };
+        match button.to_decision() {
+            // Cancel answers nothing, which cancels the job: the user's only way
+            // out of a dialog they do not want to answer is to stop the operation.
+            Some((strategy, scope)) => job.decisions().answer(Some(job::decide(strategy, scope))),
+            None => {
+                job.decisions().answer(None);
+            }
+        }
+        self.modal_focus = 0;
+    }
+
+    /// Confirms or cancels a `Confirm` dialog.
+    fn answer_confirm(&mut self, button: DlgButton) {
+        let pending = self.pending.take();
+        self.modal = None;
+        let Some(p) = pending else {
+            return;
+        };
+        if button.is_cancel() {
+            return;
+        }
+        self.start_job(p.op, p.items, p.destination);
+    }
+
+    // -- Actions -----------------------------------------------------------
+
+    /// §4.11 `F2` — begin an inline rename on the focused row.
+    fn begin_rename(&mut self) {
+        let Some(at) = self.selection.focus() else {
+            return;
+        };
+        let Some(entry) = self.visible_row(at) else {
+            return;
+        };
+        self.renaming = Some(RenameInline::begin(at, &entry.path));
+    }
+
+    /// Commits the inline rename, if the field is valid.
+    ///
+    /// The commit is a `std::fs::rename` on a **worker** like everything else in
+    /// Phase 4 — a rename across a slow network mount is not instant, and
+    /// `rename` is not. It is done here as a one-item `Move` job so it reuses the
+    /// collision protocol: renaming onto an existing name is a collision, and
+    /// "never silently overwrite" applies to a rename exactly as it does to a
+    /// copy.
+    fn commit_rename(&mut self) {
+        let Some(inline) = self.renaming.take() else {
+            return;
+        };
+        if !inline.can_commit() || inline.is_unchanged() {
+            return;
+        }
+        let from = inline.original.clone();
+        let to = crate::rename::renamed_path(&from, &inline.draft);
+        let Some(parent) = to.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        self.start_job(job::Op::Move, vec![Item::file(from, None)], Some(parent));
+    }
+
+    /// Reverts the inline rename.
+    fn cancel_rename(&mut self) {
+        self.renaming = None;
+    }
+
+    /// §4.11 `Ctrl+V` — paste the staged paths into the current directory.
+    ///
+    /// A `Cut` is a move, a `Copy` is a copy, and the difference is the whole
+    /// point of the staged set. The clipboard is cleared either way, because a
+    /// clipboard that keeps a cut staged after the move has already happened
+    /// would let a second paste try to move files that are gone.
+    fn paste(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let op = if self.clipboard.op() == Op::Cut {
+            job::Op::Move
+        } else {
+            job::Op::Copy
+        };
+        let items: Vec<Item> = self
+            .clipboard
+            .paths()
+            .map(|p| Item::file(p.clone(), None))
+            .collect();
+        let dest = self.dir.clone();
+        self.clipboard.clear();
+        if op.needs_destination() {
+            self.start_job(op, items, Some(dest));
+        } else {
+            self.start_job(op, items, None);
+        }
+    }
+
+    /// §4.11 `Ctrl+Shift+N` — a new, empty folder, named in the inline field.
+    ///
+    /// Created empty and then renamed by the user, rather than created with a
+    /// generated name: an `Untitled folder 2` the user has to rename anyway is a
+    /// worse default than an empty field that is already focused.
+    fn new_folder(&mut self) {
+        if self.renaming.is_some() {
+            return;
+        }
+        // The field edits a path that does not exist yet, so `begin` is faked from
+        // a synthetic path inside the current directory.
+        let synthetic = self.dir.join("New folder");
+        self.renaming = Some(RenameInline::begin(usize::MAX, &synthetic));
+        self.creating = true;
+    }
+
+    /// Goes back one history entry.
+    fn go_back(&mut self) {
+        let Some(target) = self.history.back().map(Path::to_path_buf) else {
+            return;
+        };
+        self.open_dir(target);
+    }
+
+    /// Goes forward one history entry.
+    fn go_forward(&mut self) {
+        let Some(target) = self.history.forward().map(Path::to_path_buf) else {
+            return;
+        };
+        self.open_dir(target);
+    }
+
+    /// Goes up one level. §4.11 `Backspace` / `Alt+Up`.
+    fn go_up(&mut self) {
+        // `Path::parent` on "/" is `None`, which is the natural "nowhere to go":
+        // no clamping to "/" and no spurious navigation.
+        if let Some(parent) = self.dir.parent() {
+            let parent = parent.to_path_buf();
+            self.open_dir(parent);
+        }
+    }
+
+    /// Re-reads the current directory. §4.11 `F5`.
+    fn refresh(&mut self) {
+        let dir = self.dir.clone();
+        // A refresh is not a navigation; it must not add history depth.
+        self.open_dir(dir);
+    }
+
+    /// Descends into the focused row, if the scanner proved it is a directory.
+    ///
+    /// In tree mode this **expands or collapses in place** instead: the whole
+    /// point of the view is to see a hierarchy, and navigating away from under
+    /// the user to show one folder is a list view with extra steps.
+    ///
+    /// Zero I/O: the answer is [`kestrel_fs::model::FileEntry::is_descendable`],
+    /// which the scanner filled in on its own thread, and toggling expansion
+    /// re-filters rows that are already in memory.
+    fn enter(&mut self) {
+        let Some(at) = self.selection.focus() else {
+            return;
+        };
+        let Some(entry) = self.visible_row(at) else {
+            return;
+        };
+        if !entry.is_descendable() {
+            return;
+        }
+        if self.view == ViewMode::Tree {
+            let path = entry.path.clone();
+            self.toggle_expand(&path);
+            return;
+        }
+        let target = entry.path.clone();
+        // A symlink resolves to its own path, which the history may already
+        // hold under a different name; record it as the same place.
+        if entry.kind == EntryKind::Symlink {
+            self.open_dir(target.clone());
+            self.note_same_place(target);
+        } else {
+            self.open_dir(target);
+        }
+    }
+
+    /// Cycles the sort column: Name → Size → Modified → Kind → Name, each click
+    /// also flipping the direction.
+    ///
+    /// The direction cycles **ascending → descending** and stops, rather than
+    /// adding a third "natural" state the spec's `SortSpec` has no field for.
+    fn cycle_sort(&mut self) {
+        self.sort_column = match self.sort_column {
+            SortKey::Name => SortKey::Size,
+            SortKey::Size => SortKey::Modified,
+            SortKey::Modified => SortKey::Kind,
+            SortKey::Kind => SortKey::Name,
+        };
+        self.apply_sort(true);
+    }
+
+    /// Sets the sort from a header click, flipping direction if the column is
+    /// already active.
+    fn sort_by_column(&mut self, key: SortKey) {
+        if self.sort_column == key {
+            self.sort.ascending = !self.sort.ascending;
+        } else {
+            self.sort_column = key;
+            self.sort.ascending = true;
+        }
+        self.apply_sort(false);
+    }
+
+    /// Re-runs the scan under the new sort.
+    ///
+    /// The GUI never sorts. A second comparator in the UI would be a second
+    /// source of truth, and the day they disagreed the list would jitter
+    /// between two orders on the same directory.
+    fn apply_sort(&mut self, _from_toolbar: bool) {
+        self.sort.key = self.sort_column;
+        let dir = self.dir.clone();
+        self.open_dir(dir);
+    }
+
+    /// Stages the current selection for `op`. §4.11 `Ctrl+X` / `Ctrl+C`.
+    ///
+    /// Nothing selected is a no-op rather than an empty clipboard: `Ctrl+C` on
+    /// a fresh directory must not report "Copied 0 items" in the status bar,
+    /// because a user who sees that has been told the wrong thing about a
+    /// selection they can plainly see is empty.
+    fn stage(&mut self, op: Op) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let visible = self.visible_rows();
+        let paths: Vec<PathBuf> = self
+            .selection
+            .rows()
+            .filter_map(|v| visible.get(v).copied())
+            .filter_map(|i| self.rows.get(i).map(|r| r.entry.path.clone()))
+            .collect();
+        self.clipboard.stage(paths, op);
+    }
+
+    // -- Keyboard ----------------------------------------------------------
+
+    /// Handles the §4.11 bindings.
+    ///
+    /// `input_mut(|i| ...)` **consumes** each key, so a binding fires exactly
+    /// once and cannot also reach a focused text widget. This runs before the
+    /// panels are built, so a key that navigates is applied before the frame
+    /// paints the new directory — no one-frame flash of the old list.
+    fn keyboard(&mut self, ui: &mut Ui) {
+        // A modal is modal: while one is up, the only keys that mean anything
+        // are its own. Without this, `Delete` behind a "Move 3 items to Trash?"
+        // dialog deletes something else, which is the single worst thing a
+        // confirm dialog can be for.
+        if self.modal.is_some() {
+            self.modal_keys(ui);
+            return;
+        }
+        // A rename field owns the keyboard outright. `Delete` is the sharpest
+        // case: with a row selected and a rename open, `Delete` must delete a
+        // *character*, not the file. §4.11's "Escape — cancel rename" is the
+        // only global that survives.
+        if self.renaming.is_some() {
+            let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+            let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+            if enter {
+                if self.creating {
+                    self.create_from_field();
+                } else {
+                    self.commit_rename();
+                }
+            }
+            if escape {
+                self.cancel_rename();
+            }
+            return;
+        }
+        // While the filter field has focus, only Escape and Enter are ours;
+        // everything else belongs to the text editor. §4.11: "Escape — clear
+        // search → close menu → cancel rename, in that order."
+        if self.filter_focused {
+            let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+            if escape {
+                if self.filter.is_empty() {
+                    self.filter_focused = false;
+                } else {
+                    self.filter.clear();
+                }
+            }
+            return;
+        }
+
+        enum Act {
+            None,
+            // §4.11 file operations.
+            Rename,
+            DeleteToTrash,
+            DeletePermanent,
+            Paste,
+            NewFolder,
+            QuickLook,
+            TogglePreview,
+            /// Arrow-key movement. `true` means Shift was held, which extends the
+            /// anchored range instead of collapsing onto one row.
+            Move(isize, bool),
+            Top,
+            Bottom,
+            ExtendToTop,
+            ExtendToBottom,
+            Enter,
+            Parent,
+            Back,
+            Forward,
+            Refresh,
+            SelectAll,
+            ClearSelection,
+            Cut,
+            Copy,
+            ViewList,
+            ViewTree,
+            ToggleTheme,
+        }
+
+        let count = self.visible_count();
+        let has_filter = !self.filter.is_empty();
+        let act = ui.input_mut(|i| {
+            // Most specific first: `consume_key` matches modifiers logically, so
+            // `alt+up` must be tested before bare `up`.
+            if i.consume_key(egui::Modifiers::ALT, Key::ArrowLeft) {
+                Act::Back
+            } else if i.consume_key(egui::Modifiers::ALT, Key::ArrowRight) {
+                Act::Forward
+            } else if i.consume_key(egui::Modifiers::ALT, Key::ArrowUp) {
+                Act::Parent
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::A) {
+                Act::SelectAll
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::C) {
+                Act::Copy
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::X) {
+                Act::Cut
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::F) {
+                // Focus the filter; handled by the caller, which owns the field.
+                Act::None
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::T) {
+                Act::ToggleTheme
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::Num1) {
+                Act::ViewList
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::Num2) {
+                Act::ViewTree
+            } else if i.consume_key(egui::Modifiers::NONE, Key::F2) {
+                Act::Rename
+            } else if i.consume_key(egui::Modifiers::SHIFT, Key::Delete) {
+                Act::DeletePermanent
+            } else if i.consume_key(egui::Modifiers::NONE, Key::Delete) {
+                Act::DeleteToTrash
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::V) {
+                Act::Paste
+            } else if i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::N) {
+                Act::NewFolder
+            } else if i.consume_key(egui::Modifiers::NONE, Key::Space) {
+                Act::QuickLook
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::P) {
+                Act::TogglePreview
+            } else if i.consume_key(egui::Modifiers::NONE, Key::F5) {
+                Act::Refresh
+            } else if i.consume_key(egui::Modifiers::NONE, Key::Enter) {
+                Act::Enter
+            } else if i.consume_key(egui::Modifiers::NONE, Key::Escape) {
+                if has_filter {
+                    Act::None
+                } else {
+                    Act::ClearSelection
+                }
+            } else if i.consume_key(egui::Modifiers::SHIFT, Key::Home) {
+                Act::ExtendToTop
+            } else if i.consume_key(egui::Modifiers::SHIFT, Key::End) {
+                Act::ExtendToBottom
+            } else if i.consume_key(egui::Modifiers::NONE, Key::Home) {
+                Act::Top
+            } else if i.consume_key(egui::Modifiers::NONE, Key::End) {
+                Act::Bottom
+            } else if i.consume_key(egui::Modifiers::SHIFT, Key::ArrowUp) {
+                Act::Move(-1, true)
+            } else if i.consume_key(egui::Modifiers::SHIFT, Key::ArrowDown) {
+                Act::Move(1, true)
+            } else if i.consume_key(egui::Modifiers::SHIFT, Key::PageUp) {
+                Act::Move(-(component::SCROLLBAR_KEYBOARD_LINES as isize), true)
+            } else if i.consume_key(egui::Modifiers::SHIFT, Key::PageDown) {
+                Act::Move(component::SCROLLBAR_KEYBOARD_LINES as isize, true)
+            } else if i.consume_key(egui::Modifiers::NONE, Key::ArrowUp) {
+                Act::Move(-1, false)
+            } else if i.consume_key(egui::Modifiers::NONE, Key::ArrowDown) {
+                Act::Move(1, false)
+            } else if i.consume_key(egui::Modifiers::NONE, Key::PageUp) {
+                Act::Move(-(component::SCROLLBAR_KEYBOARD_LINES as isize), false)
+            } else if i.consume_key(egui::Modifiers::NONE, Key::PageDown) {
+                Act::Move(component::SCROLLBAR_KEYBOARD_LINES as isize, false)
+            } else {
+                Act::None
+            }
+        });
+
+        match act {
+            Act::None => {}
+            Act::Rename => self.begin_rename(),
+            // §4.11: `Delete` is to trash, `Shift+Delete` is permanent. Trash is
+            // the default, so a slip of the finger is recoverable.
+            Act::DeleteToTrash => self.begin(dialog::op_for_delete(false), None),
+            Act::DeletePermanent => self.begin(dialog::op_for_delete(true), None),
+            Act::Paste => self.paste(),
+            Act::NewFolder => self.new_folder(),
+            Act::QuickLook => self.show_preview = true,
+            Act::TogglePreview => self.show_preview = !self.show_preview,
+            Act::Move(d, extend) => {
+                if extend {
+                    self.selection.extend_by(d, count);
+                } else {
+                    self.selection.move_focus(d, count);
+                }
+                self.scroll_to_focus(count);
+            }
+            Act::Top => {
+                self.selection.focus_row(0, count);
+                self.scroll_rows = 0;
+            }
+            Act::Bottom => {
+                if count > 0 {
+                    self.selection.focus_row(count - 1, count);
+                    self.scroll_rows = count.saturating_sub(1);
+                }
+            }
+            // Shift+Home / Shift+End: select everything from the anchor to an
+            // end. The keyboard equivalent of shift-clicking the first or last
+            // row, and the only practical way to select a 50,000-row directory.
+            Act::ExtendToTop => {
+                self.selection.extend_to(0);
+                self.scroll_rows = 0;
+            }
+            Act::ExtendToBottom => {
+                if count > 0 {
+                    self.selection.extend_to(count - 1);
+                    self.scroll_rows = count.saturating_sub(1);
+                }
+            }
+            Act::Enter => self.enter(),
+            Act::Parent => self.go_up(),
+            Act::Back => self.go_back(),
+            Act::Forward => self.go_forward(),
+            Act::Refresh => self.refresh(),
+            Act::SelectAll => self.selection.select_all(count),
+            Act::ClearSelection => self.selection.clear(),
+            Act::Cut => self.stage(Op::Cut),
+            Act::Copy => self.stage(Op::Copy),
+            Act::ViewList => self.view = ViewMode::List,
+            Act::ViewTree => self.view = ViewMode::Tree,
+            Act::ToggleTheme => self.cycle_theme(),
+        }
+    }
+
+    /// Keyboard handling while a dialog is up.
+    ///
+    /// Enter presses the button that has focus, which on open is always the safe
+    /// one (§4.7). Escape is *not* bound: dismissing a "Delete Permanently"
+    /// dialog with Escape would put a destructive action one stray key away from
+    /// every other dialog, and §4.7's ordering for Escape ("clear search → close
+    /// menu → cancel rename") does not mention confirmations.
+    fn modal_keys(&mut self, ui: &mut Ui) {
+        let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+        if !enter {
+            return;
+        }
+        let Some(kind) = self.modal.clone() else {
+            return;
+        };
+        let buttons = dialog::buttons_for(&kind);
+        let Some(button) = buttons.get(self.modal_focus).copied() else {
+            return;
+        };
+        match &kind {
+            DlgKind::Collision { .. } => self.answer_collision(button),
+            DlgKind::Confirm { .. } | DlgKind::Failed { .. } => {
+                self.modal = None;
+                self.answer_confirm(button)
+            }
+            DlgKind::Progress { .. } => {
+                if let Some(job) = self.job.as_ref() {
+                    job.cancel();
+                }
+                self.modal = None;
+            }
+        }
+    }
+
+    /// Creates the folder the inline field names.
+    fn create_from_field(&mut self) {
+        let Some(inline) = self.renaming.take() else {
+            return;
+        };
+        self.creating = false;
+        if !inline.can_commit() {
+            return;
+        }
+        let path = crate::rename::renamed_path(&self.dir, &inline.draft);
+        if path.exists() {
+            // A name that is already taken is a collision, and this app does not
+            // silently overwrite anything — not even an empty new folder.
+            self.modal = Some(DlgKind::Failed {
+                op: job::Op::Copy,
+                path,
+                reason: "something with that name is already there".to_string(),
+            });
+            self.modal_focus = 0;
+            return;
+        }
+        // Off the frame thread, with its answer collected: a `create_dir` on a
+        // network mount is not instant, and a create that fails silently is a
+        // new folder that never appears and an error the user never sees.
+        match job::mkdir(&path) {
+            Ok(rx) => self.mkdir_result = Some(rx),
+            Err(e) => {
+                let reason = job::describe_io(&path, e);
+                self.modal = Some(DlgKind::Failed {
+                    op: job::Op::Copy,
+                    path,
+                    reason,
+                });
+                self.modal_focus = 0;
+            }
+        }
+    }
+
+    /// Collects a pending `mkdir` answer, if one is outstanding.
+    ///
+    /// A `try_recv`, so a slow create is never waited on — the same discipline as
+    /// the scan and the job.
+    fn pump_mkdir(&mut self) {
+        let Some(rx) = self.mkdir_result.as_ref() else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.mkdir_result = None;
+        if let Err(err) = result {
+            self.modal = Some(DlgKind::Failed {
+                op: job::Op::Copy,
+                path: self.dir.clone(),
+                reason: job::describe(&err),
+            });
+            self.modal_focus = 0;
+        } else {
+            // A new directory changes what is there, so the listing is re-read.
+            // The watcher would notice, but a user who just pressed
+            // Ctrl+Shift+N should not wait for the debounce.
+            let dir = self.dir.clone();
+            self.open_dir(dir);
+        }
+    }
+
+    /// Scrolls so the focused row is fully visible.
+    ///
+    /// WCAG 2.2 focus-not-obscured, done properly: the offset is a *row* count
+    /// this module owns, not a ScrollArea-internal pixel value, so "is it
+    /// visible" is a comparison rather than a guess. One row of slack is kept
+    /// above and below, which is §4.2 rule 3's "with 1px to spare".
+    fn scroll_to_focus(&mut self, count: usize) {
+        let Some(focus) = self.selection.focus() else {
+            return;
+        };
+        let visible_rows = self.visible_rows_in_view(count);
+        if visible_rows == 0 {
+            return;
+        }
+        if focus < self.scroll_rows {
+            self.scroll_rows = focus;
+        } else if focus + 1 > self.scroll_rows + visible_rows {
+            self.scroll_rows = focus + 1 - visible_rows;
+        }
+    }
+
+    /// How many rows fit in the current list viewport, from the last frame's
+    /// height. Kept as a field so the keyboard path does not need a `Ui`.
+    fn visible_rows_in_view(&self, _count: usize) -> usize {
+        self.viewport_rows.max(1)
+    }
+}
+
+impl eframe::App for KestrelApp {
+    /// egui 0.36's entry point.
+    ///
+    /// (`App::update` was deprecated in 0.34 and **removed** in 0.35.)
+    ///
+    /// A thin adapter: it resolves the `System` theme against the live winit
+    /// window and hands off to [`KestrelApp::draw`], which is the whole app. The
+    /// split exists so `--screenshot` can render the identical frame through
+    /// `Context::run_ui` with no `Frame` in scope.
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        // Re-resolve `System` every frame so a compositor theme change is picked
+        // up. `Window::theme()` is a cheap query on the thread already owning
+        // the window, and the documented Wayland behaviour ("only returns theme
+        // overrides") is covered by `Theme::resolve`'s dark default.
+        if self.mode == ThemeMode::System {
+            let resolved = Theme::resolve(self.mode, system_preference(frame));
+            if resolved != self.theme {
+                self.theme = resolved;
+                self.theme.apply(&ctx);
+            }
+        }
+        self.draw(ui);
+    }
+}
+
+impl KestrelApp {
+    /// Draws one frame. Everything the app does, with no windowing types in
+    /// scope.
+    pub fn draw(&mut self, ui: &mut Ui) {
+        let start = Instant::now();
+        match self.screen {
+            Screen::Gallery => crate::gallery::show(ui, &mut self.theme, &mut self.mode),
+            Screen::Browser => {
+                // Non-blocking pumps, before any widget reads the row vector.
+                self.pump();
+                self.pump_job();
+                self.pump_mkdir();
+                self.keyboard(ui);
+                self.panels(ui);
+            }
+        }
+
+        self.frames = self.frames.wrapping_add(1);
+        let elapsed = start.elapsed().as_secs_f32() * 1000.0;
+        // Exponential moving average, so the status-bar readout is stable enough
+        // to read instead of flickering every frame.
+        self.frame_ms = if self.frames < 8 {
+            elapsed
+        } else {
+            self.frame_ms * 0.9 + elapsed * 0.1
+        };
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Panels
+// ----------------------------------------------------------------------------
+
+impl KestrelApp {
+    /// Builds the whole shell. Panels before the `CentralPanel`, always.
+    fn panels(&mut self, ui: &mut Ui) {
+        self.top_toolbar(ui);
+        if self.show_preview {
+            // Right, so the list keeps the left-to-right reading order of a file
+            // manager: places, list, detail.
+            self.preview_panel(ui);
+        }
+        self.sidebar(ui);
+        self.breadcrumb(ui);
+        self.column_headers(ui);
+        self.status_bar(ui);
+        // The central panel goes **last**: it claims whatever rectangle the
+        // others did not take.
+        let fill = self.theme.surfaces.list;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(fill))
+            .show(ui, |ui| self.file_list(ui));
+        // The modal is drawn after everything, so it is genuinely on top — and
+        // the scrim it paints is what makes the window behind it clearly not
+        // clickable, which §2.12's "never an overlay" is about for *chrome*, not
+        // for a modal that is *supposed* to block.
+        self.modal_layer(ui);
+    }
+
+    /// §4.7 The confirmation / collision / failure dialog.
+    ///
+    /// A `Modal` rather than a `Window`, because a dialog must not be movable,
+    /// resizable, or closable by its title bar: §4.7 gives it a scrim, a fixed
+    /// `dialog.width`, and one of exactly two or five buttons.
+    fn modal_layer(&mut self, ui: &mut Ui) {
+        if self.modal.is_none() {
+            return;
+        }
+        let theme = self.theme;
+        let scrim = dialog::scrim(&theme);
+        // A scrim over everything, and it eats clicks: `Modal` does the latter,
+        // this rect does the former.
+        let full = ui.max_rect();
+        ui.painter()
+            .rect_filled(full, radius::all(radius::NONE), scrim);
+
+        let kind = self.modal.clone().expect("checked above");
+        let buttons = dialog::buttons_for(&kind);
+        // Keep the focus index inside the button list: the list changes shape
+        // between dialog kinds, and a stale index would index out of bounds.
+        if self.modal_focus >= buttons.len() {
+            self.modal_focus = 0;
+        }
+        let op = match &kind {
+            DlgKind::Confirm { op, .. } | DlgKind::Failed { op, .. } => *op,
+            _ => job::Op::Copy,
+        };
+        let title = kind.title();
+        let body = kind.body();
+        let warning = match &kind {
+            DlgKind::Confirm { warning, .. } => warning.clone(),
+            _ => DlgKind::irreversibility_line(op).map(str::to_string),
+        };
+        let sample = match &kind {
+            DlgKind::Confirm { sample, .. } => sample.clone(),
+            _ => None,
+        };
+        let icon = kind.icon();
+        let destructive = buttons.iter().any(|b| b.is_destructive());
+
+        let mut clicked: Option<DlgButton> = None;
+        egui::Modal::new(egui::Id::new("kestrel-dialog"))
+            .frame(egui::Frame::NONE)
+            .show(ui.ctx(), |ui| {
+                let height_guess = if warning.is_some() { 172.0 } else { 140.0 };
+                ui.allocate_exact_size(vec2(dialog::WIDTH, height_guess), Sense::hover());
+                let frame = egui::Frame::new()
+                    .fill(dialog::background(&theme))
+                    .inner_margin(egui::Margin::same(dialog::PADDING as i8))
+                    .corner_radius(radius::all(dialog::RADIUS))
+                    // `dialog.border` — 1px `border.strong`, so the dialog reads as
+                    // an object even where the scrim is subtle.
+                    .stroke(Stroke::new(border::HAIRLINE, theme.borders.strong));
+                frame.show(ui, |ui| {
+                    // --- title row: icon + title ---
+                    ui.horizontal(|ui| {
+                        let ir = Rect::from_center_size(
+                            ui.cursor().left_top() + vec2(dialog::ICON / 2.0, dialog::ICON / 2.0),
+                            vec2(dialog::ICON, dialog::ICON),
+                        );
+                        tokens::icon_glyph(
+                            ui.painter(),
+                            ir,
+                            icon,
+                            if destructive {
+                                theme.status.danger_text
+                            } else {
+                                theme.icon.chrome
+                            },
+                        );
+                        ui.add_space(space::S2);
+                        ui.label(
+                            RichText::new(title.clone())
+                                .font(tokens::font(ty::DIALOG_TITLE, &theme))
+                                .color(theme.text.primary),
+                        );
+                    });
+                    ui.add_space(space::S2);
+                    // --- body ---
+                    ui.label(
+                        RichText::new(body.clone())
+                            .font(tokens::font(ty::DIALOG_BODY, &theme))
+                            .color(theme.text.secondary),
+                    );
+                    // --- the irreversibility line, in danger text ---
+                    if let Some(w) = warning {
+                        ui.add_space(space::S1);
+                        ui.label(
+                            RichText::new(w)
+                                .font(tokens::font(ty::CAPTION, &theme))
+                                .color(if destructive {
+                                    theme.status.danger_text
+                                } else {
+                                    theme.text.tertiary
+                                }),
+                        );
+                    }
+                    // --- `dialog.path-quote` ---
+                    if let Some(path) = sample {
+                        ui.add_space(space::S2);
+                        let quoted = format::middle_truncate(&path.to_string_lossy(), 56);
+                        let (qr, _) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+                        ui.painter().rect_filled(
+                            qr,
+                            radius::all(component::DIALOG_PATH_QUOTE_RADIUS),
+                            theme.state.hover,
+                        );
+                        ui.painter().text(
+                            qr.left_center() + vec2(component::DIALOG_PATH_QUOTE_PAD_X, 0.0),
+                            Align2::LEFT_CENTER,
+                            quoted,
+                            tokens::font(ty::META, &theme),
+                            theme.text.secondary,
+                        );
+                    }
+                    // --- footer, right-aligned per `dialog.footer-align` ---
+                    ui.add_space(dialog::FOOTER_GAP);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Laid right-to-left, so the *last* button in the list ends
+                        // up leftmost... which is wrong: §4.7 requires Cancel
+                        // leftmost. So the list is walked in reverse to undo the
+                        // layout, keeping one source of truth for the order.
+                        for b in buttons.iter().rev().copied() {
+                            ui.add_space(space::HALF);
+                            if self.dialog_button(ui, b, b == buttons[self.modal_focus], op) {
+                                clicked = Some(b);
+                            }
+                        }
+                    });
+                });
+            });
+
+        if let Some(b) = clicked {
+            self.modal_focus = buttons.iter().position(|x| *x == b).unwrap_or(0);
+            match &kind {
+                DlgKind::Collision { .. } => self.answer_collision(b),
+                DlgKind::Confirm { .. } | DlgKind::Failed { .. } => {
+                    self.modal = None;
+                    self.answer_confirm(b)
+                }
+                DlgKind::Progress { .. } => {
+                    // Stop.
+                    if let Some(job) = self.job.as_ref() {
+                        job.cancel();
+                    }
+                    self.modal = None;
+                }
+            }
+        }
+    }
+
+    /// One dialog button, with `dialog.btn-focus-ring` on the focused one.
+    fn dialog_button(&self, ui: &mut Ui, b: DlgButton, focused: bool, op: job::Op) -> bool {
+        let theme = self.theme;
+        let font = tokens::font(ty::UI, &theme);
+        let text_w = crate::widgets::text_width(ui, b.label(), font.clone());
+        let w = text_w + dialog::BTN_HEIGHT * 0.9;
+        let (rect, response) = ui.allocate_exact_size(vec2(w, dialog::BTN_HEIGHT), Sense::click());
+        let hovered = response.hovered();
+        ui.painter().rect_filled(
+            rect,
+            radius::all(dialog::RADIUS * 0.5),
+            dialog::button_bg(&theme, b, hovered),
+        );
+        if let Some(stroke) = dialog::button_border(&theme, b) {
+            crate::widgets::rect_stroke(
+                ui.painter(),
+                rect,
+                radius::all(dialog::RADIUS * 0.5),
+                stroke,
+            );
+        }
+        // §4.7 `dialog.btn-focus-ring` — 2px `focus.ring` at 2px offset. Drawn on
+        // the *focused* button, which on open is always Cancel.
+        if focused || b.is_default_for_enter(op) && focused {
+            crate::widgets::rect_stroke(
+                ui.painter(),
+                rect.expand(2.0),
+                radius::all(dialog::RADIUS * 0.5 + 2.0),
+                Stroke::new(2.0, theme.borders.focus_ring),
+            );
+        }
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            b.label(),
+            font,
+            dialog::button_text(&theme, b),
+        );
+        response.clicked()
+    }
+
+    /// The preview pane.
+    ///
+    /// Every token here is **derived** — the spec has no §4 section for a preview
+    /// pane, only a `Space` binding for "Quick look". See
+    /// [`crate::dialog::preview_metrics`], which says which scale each value came
+    /// from, so a future §4 section replaces these rather than having to
+    /// reconcile two sets of numbers.
+    ///
+    /// **Never blank.** §4.2's empty-state rule applies with more force here: a
+    /// preview pane that shows nothing is indistinguishable from a broken one, so
+    /// every path renders *something* — the icon, the type, the size, the modified
+    /// time — and only the body is conditional.
+    fn preview_panel(&mut self, ui: &mut Ui) {
+        let theme = self.theme;
+        let width = dialog::preview_metrics::WIDTH;
+        egui::Panel::right("preview")
+            .default_size(width)
+            .min_size(dialog::preview_metrics::MIN_WIDTH)
+            .max_size(dialog::preview_metrics::MAX_WIDTH)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.surfaces.panel)
+                    .inner_margin(margin(dialog::preview_metrics::PADDING))
+                    // A layout sibling with a hairline, like every other sticky
+                    // band: §2.12, and the reason focus-not-obscured is structural.
+                    .stroke(Stroke::new(border::HAIRLINE, theme.borders.subtle)),
+            )
+            .show(ui, |ui| {
+                // The entry's preview *inputs* are read out first, so the loader
+                // can be borrowed mutably. Holding `&FileEntry` across
+                // `self.preview.request(..)` is the borrow checker correctly
+                // pointing out that `self` is aliased.
+                let Some(focus) = self.focused_preview_target() else {
+                    self.preview_nothing(ui, &theme);
+                    return;
+                };
+                let kind = self
+                    .preview
+                    .request(&focus.path, focus.size, focus.is_image);
+                if let Some(loaded) = self.preview.poll() {
+                    self.preview_content = Some(loaded);
+                }
+                self.preview_body(ui, &theme, kind);
+            });
+    }
+
+    /// What the preview needs about the focused row, copied out so the loader
+    /// can be borrowed mutably while the row is still being read.
+    fn focused_preview_target(&self) -> Option<PreviewTarget> {
+        let at = self.selection.focus()?;
+        let entry = self.visible_row(at)?;
+        Some(PreviewTarget {
+            path: entry.path.clone(),
+            size: entry.size,
+            is_image: Classified::of(entry).category == filetype::Category::Image,
+        })
+    }
+
+    /// The row the preview describes, if any.
+    fn focused_entry(&self) -> Option<&FileEntry> {
+        let at = self.selection.focus()?;
+        self.visible_row(at)
+    }
+
+    /// Shown when nothing is focused. Metadata-shaped, never blank.
+    fn preview_nothing(&mut self, ui: &mut Ui, theme: &Theme) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.2);
+            tokens::icon_glyph(
+                ui.painter(),
+                Rect::from_center_size(
+                    ui.cursor().left_top() + vec2(component::ROW_EMPTY_ICON_SIZE / 2.0, 0.0),
+                    vec2(
+                        component::ROW_EMPTY_ICON_SIZE,
+                        component::ROW_EMPTY_ICON_SIZE,
+                    ),
+                ),
+                icons::EYE,
+                component::icon_at(theme.icon.chrome, 0.4),
+            );
+            ui.label(
+                RichText::new("Nothing selected")
+                    .font(tokens::font(ty::CAPTION, theme))
+                    .color(theme.text.tertiary),
+            );
+        });
+    }
+
+    /// The pane's body: header, then whatever the kind allows.
+    ///
+    /// The focused row is re-fetched here rather than passed in, so the whole
+    /// function owns its borrows and the loader is free to be mutable.
+    fn preview_body(&mut self, ui: &mut Ui, theme: &Theme, kind: PvKind) {
+        let Some(entry) = self.focused_entry() else {
+            return;
+        };
+        let classified = Classified::of(entry);
+        // The name is the texture cache key and the header's text, and it has to
+        // outlive the mutable borrow of `self` that the image arm takes.
+        let name = entry.name.clone();
+        let available = ui.available_width();
+
+        // --- header: icon, name, kind, size, modified. Always rendered. -----
+        ui.horizontal(|ui| {
+            let ir = Rect::from_center_size(
+                ui.cursor().left_top()
+                    + vec2(
+                        component::ROW_ICON_SIZE / 2.0,
+                        component::ROW_ICON_SIZE / 2.0,
+                    ),
+                vec2(component::ROW_ICON_SIZE, component::ROW_ICON_SIZE),
+            );
+            if let Some(g) = classified.glyph() {
+                tokens::icon_glyph(ui.painter(), ir, g, classified.icon_color(&theme.icon));
+            } else {
+                tokens::icon_placeholder(ui.painter(), ir, classified.icon_color(&theme.icon));
+            }
+            ui.add_space(component::ROW_ICON_GAP);
+            ui.label(
+                RichText::new(format::middle_truncate(
+                    &entry.name,
+                    (available / 7.0) as usize,
+                ))
+                .font(tokens::font(ty::UI_STRONG, theme))
+                .color(theme.text.primary),
+            );
+        });
+        ui.add_space(space::S1);
+        // A `meta` line: kind · size · modified. §2.8's machine values, in mono.
+        let size = match (entry.kind, entry.size) {
+            (EntryKind::Directory, _) => format::NOT_APPLICABLE.to_string(),
+            (_, Some(n)) => format::bytes(n),
+            (_, None) => "-".to_string(),
+        };
+        let modified = entry
+            .modified
+            .map_or_else(|| "-".to_string(), format::timestamp);
+        ui.label(
+            RichText::new(format!(
+                "{} · {} · {}",
+                classified.category.label(),
+                size,
+                modified
+            ))
+            .font(tokens::font(ty::META, theme))
+            .color(theme.text.tertiary),
+        );
+        ui.add_space(space::S2);
+        widgets::rule(
+            ui.painter(),
+            ui.cursor().left_top().x,
+            ui.available_width(),
+            ui.cursor().left_top().y,
+            component::hairline(theme),
+        );
+        ui.add_space(space::S2);
+
+        // --- body, by kind. Never empty: every arm renders something. -------
+        match kind {
+            PvKind::Image => self.preview_image(ui, theme, &name),
+            PvKind::Text => self.preview_text(ui, theme),
+            PvKind::TooLarge => {
+                let n = entry.size.unwrap_or(pv::MAX_PREVIEW_BYTES + 1);
+                ui.label(
+                    RichText::new("Too large to preview")
+                        .font(tokens::font(ty::UI, theme))
+                        .color(theme.text.secondary),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} — the preview reads at most {}.",
+                        format::bytes(n),
+                        format::bytes(pv::MAX_PREVIEW_BYTES)
+                    ))
+                    .font(tokens::font(ty::CAPTION, theme))
+                    .color(theme.text.tertiary),
+                );
+            }
+            PvKind::Unknown => {
+                ui.label(
+                    RichText::new("Size unknown")
+                        .font(tokens::font(ty::UI, theme))
+                        .color(theme.text.secondary),
+                );
+                ui.label(
+                    RichText::new("The preview needs a size to apply its limit safely.")
+                        .font(tokens::font(ty::CAPTION, theme))
+                        .color(theme.text.tertiary),
+                );
+            }
+            PvKind::Metadata => {
+                ui.label(
+                    RichText::new(classified.category.label())
+                        .font(tokens::font(ty::UI, theme))
+                        .color(theme.text.secondary),
+                );
+                ui.label(
+                    RichText::new("This kind of file has no preview.")
+                        .font(tokens::font(ty::CAPTION, theme))
+                        .color(theme.text.tertiary),
+                );
+            }
+        }
+    }
+
+    /// An image, via egui's loaders.
+    fn preview_image(&mut self, ui: &mut Ui, theme: &Theme, entry_name: &str) {
+        let Some(PvLoaded::Image { bytes }) = self.preview_content.clone() else {
+            return self.preview_waiting(ui, theme);
+        };
+        // `load_image_from_bytes` is egui_extras'; the GUI does not decode a
+        // container format itself. A URI is not needed and would require the path
+        // to survive a round trip through a string.
+        // `load_image_bytes` is `egui_extras`' own decoder, driven by the loaders
+        // `install_image_loaders` registered. The GUI does not sniff a container
+        // or decode a format itself: a second implementation here would be a
+        // second thing to be wrong about PNGs, and `all_loaders` already covers
+        // the formats §5.2 lists.
+        match egui_extras::image::load_image_bytes(&bytes) {
+            Ok(image) => {
+                // The size is read off the decoded image *before* it is handed to
+                // the context, so no texture-manager round trip is needed and
+                // there is no way for the two to disagree.
+                let natural = egui::vec2(image.width() as f32, image.height() as f32);
+                // The texture name is the file's name, not a pointer: a pointer
+                // would change every frame and defeat the manager's own cache,
+                // re-uploading the same image on each redraw.
+                let handle = ui.ctx().load_texture(
+                    format!("preview:{}", entry_name),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                let available = ui.available_size();
+                ui.add(
+                    egui::Image::new(egui::load::SizedTexture::new(&handle, natural))
+                        .fit_to_exact_size(fit(natural, available)),
+                );
+            }
+            Err(_) => {
+                ui.label(
+                    RichText::new("This image could not be decoded.")
+                        .font(tokens::font(ty::CAPTION, theme))
+                        .color(theme.status.danger_text),
+                );
+            }
+        }
+    }
+
+    /// Syntax-highlighted text, **virtualized**.
+    ///
+    /// The same rule as the file list: a 1 MiB file is 60,000 lines, and building
+    /// 60,000 rows per frame would drop frames. So `show_rows`, and only the
+    /// visible slice is laid out.
+    fn preview_text(&mut self, ui: &mut Ui, theme: &Theme) {
+        let Some(PvLoaded::Text { lines, truncated }) = self.preview_content.clone() else {
+            return self.preview_waiting(ui, theme);
+        };
+        if truncated {
+            ui.label(
+                RichText::new("Shown truncated.")
+                    .font(tokens::font(ty::MICRO, theme))
+                    .color(theme.status.warning_text),
+            );
+        }
+        if lines.is_empty() {
+            ui.label(
+                RichText::new("This file is empty.")
+                    .font(tokens::font(ty::CAPTION, theme))
+                    .color(theme.text.tertiary),
+            );
+            return;
+        }
+        let line_h = dialog::preview_metrics::LINE_H;
+        let total = lines.len();
+        let gutter = dialog::preview_metrics::GUTTER_W;
+        let width = ui.available_width();
+        let font = tokens::font(ty::META, theme);
+        let palette = pv::palette(theme);
+        ScrollArea::vertical()
+            .id_salt("preview-text")
+            .auto_shrink([false, false])
+            .show_rows(ui, line_h, total, |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for i in range {
+                    let Some(line) = lines.get(i) else { continue };
+                    let y = ui.cursor().top();
+                    // The gutter, in `text.tertiary`, right-aligned.
+                    ui.painter().text(
+                        egui::pos2(
+                            ui.cursor().left_top().x + gutter - space::S1,
+                            y + line_h / 2.0,
+                        ),
+                        Align2::RIGHT_CENTER,
+                        format!("{}", line.number),
+                        font.clone(),
+                        theme.text.tertiary,
+                    );
+                    let text_x = ui.cursor().left_top().x + gutter;
+                    self.paint_code_line(
+                        ui.painter(),
+                        line,
+                        text_x,
+                        y,
+                        line_h,
+                        width - gutter,
+                        font.clone(),
+                        &palette,
+                        theme,
+                    );
+                    ui.allocate_space(vec2(width, line_h));
+                }
+            });
+    }
+
+    /// One line of highlighted code, coloured by token run.
+    ///
+    /// Widths are **accumulated**, not computed from byte offsets. A byte offset
+    /// is not a pixel offset: `日本語` is 3 bytes and 3 ems wide, and `é` is 2
+    /// bytes and about half an em. The first version of this used `cx as f32`
+    /// and drew every token run on top of the first one, which looked correct
+    /// for ASCII and wrong for every other script in the app's own test corpus.
+    ///
+    /// One `painter.text` call per run rather than per character: egui's galley
+    /// cache is keyed on the whole string, so a per-character call would be a
+    /// per-character cache miss.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_code_line(
+        &self,
+        painter: &egui::Painter,
+        line: &pv::Line,
+        x: f32,
+        y: f32,
+        line_h: f32,
+        max_w: f32,
+        font: egui::FontId,
+        palette: &pv::Palette,
+        theme: &Theme,
+    ) {
+        let baseline = egui::pos2(x, y + line_h / 2.0);
+        // Measure the whole line first, so a long line can be middle-truncated
+        // (§2.8: all list text is single-line, centred, middle-truncated) rather
+        // than being drawn off the pane's edge.
+        let full_w = painter
+            .layout_no_wrap(line.text.clone(), font.clone(), theme.text.primary)
+            .size()
+            .x;
+        if full_w > max_w {
+            let cols = (max_w / 6.5).max(4.0) as usize;
+            painter.text(
+                baseline,
+                Align2::LEFT_CENTER,
+                format::middle_truncate(&line.text, cols),
+                font,
+                theme.text.primary,
+            );
+            return;
+        }
+
+        let mut cursor = x;
+        let mut start = 0usize;
+        while start < line.spans.len() {
+            let token = pv::Token::from_u8(line.spans[start]);
+            let mut end = start;
+            while end < line.spans.len() && pv::Token::from_u8(line.spans[end]) == token {
+                end += 1;
+            }
+            let run = &line.text[start..end];
+            if !run.is_empty() {
+                let color = palette.color(token, theme);
+                let galley = painter.layout_no_wrap(run.to_string(), font.clone(), color);
+                // `galley()` consumes the `Arc`, so the width is read first.
+                let run_w = galley.size().x;
+                painter.galley(egui::pos2(cursor, baseline.y), galley, theme.text.primary);
+                cursor += run_w;
+            }
+            start = end;
+        }
+    }
+
+    fn preview_waiting(&mut self, ui: &mut Ui, theme: &Theme) {
+        ui.label(
+            RichText::new(if self.preview.is_pending() {
+                "Loading…"
+            } else {
+                "Reading…"
+            })
+            .font(tokens::font(ty::CAPTION, theme))
+            .color(theme.text.tertiary),
+        );
+    }
+
+    /// §4.4 The toolbar. Replaces the Phase 2 sidebar toggle.
+    fn top_toolbar(&mut self, ui: &mut Ui) {
+        let theme = self.theme;
+        let has_filter = !self.filter.is_empty();
+        let btns = toolbar::buttons(
+            self.history.can_go_back(),
+            self.history.can_go_forward(),
+            self.dir.parent().is_some(),
+            self.view == ViewMode::Tree,
+            has_filter,
+        );
+
+        let ahead = self.history.forward_len();
+        let mut pending: Option<Action> = None;
+        egui::Panel::top("toolbar")
+            .exact_size(metric::TOOLBAR)
+            .frame(toolbar::frame(&theme))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    // §4.4: proximity does the grouping, so separators sit only
+                    // between functional groups, never between adjacent buttons.
+                    for (i, b) in btns.iter().enumerate() {
+                        if matches!(i, 4 | 5) {
+                            toolbar::separator(ui, &theme);
+                        }
+                        if toolbar::draw(ui, &theme, *b, ahead).clicked() {
+                            pending = Some(b.action);
+                        }
+                    }
+                    toolbar::separator(ui, &theme);
+                    self.filter_field(ui, &theme);
+                });
+            });
+
+        if let Some(action) = pending {
+            self.apply(action);
+        }
+    }
+
+    /// Runs a toolbar action.
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::Back => self.go_back(),
+            Action::Forward => self.go_forward(),
+            Action::Up => self.go_up(),
+            Action::Refresh => self.refresh(),
+            Action::ViewList => self.view = ViewMode::List,
+            Action::ViewTree => self.view = ViewMode::Tree,
+            Action::Sort => self.cycle_sort(),
+            Action::Filter => self.filter_focused = true,
+            Action::Theme => self.cycle_theme(),
+        }
+    }
+
+    /// §4.8 The search field: `Filter…` placeholder, leading glyph, a live
+    /// match count *outside* the field, and a clear button that appears only
+    /// when the query is non-empty.
+    fn filter_field(&mut self, ui: &mut Ui, theme: &Theme) {
+        let height = component::INPUT_HEIGHT;
+        let width = 220.0_f32.min(ui.available_width());
+        let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+
+        let focused = self.filter_focused || response.has_focus();
+        self.filter_focused = focused;
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            rect,
+            radius::all(component::INPUT_RADIUS),
+            theme.surfaces.input,
+        );
+        let border = if focused {
+            theme.borders.accent
+        } else {
+            theme.borders.default
+        };
+        widgets::rect_stroke(
+            painter,
+            rect,
+            radius::all(component::INPUT_RADIUS),
+            Stroke::new(border::HAIRLINE, border),
+        );
+        // `input.ring` — 2px `focus.ring` at 1px offset.
+        if focused {
+            widgets::rect_stroke(
+                painter,
+                rect.expand(border::HAIRLINE),
+                radius::all(component::INPUT_RADIUS + 1.0),
+                Stroke::new(border::HAIRLINE, theme.borders.focus_ring),
+            );
+        }
+
+        // Leading `magnifying-glass`, 16px.
+        let icon_rect = Rect::from_center_size(
+            pos2(
+                rect.left() + component::INPUT_PADDING_X + component::INPUT_ICON_SIZE / 2.0,
+                rect.center().y,
+            ),
+            vec2(component::INPUT_ICON_SIZE, component::INPUT_ICON_SIZE),
+        );
+        tokens::icon_glyph(
+            painter,
+            icon_rect,
+            icons::MAGNIFYING_GLASS,
+            theme.icon.chrome,
+        );
+
+        // The text. A `TextEdit` owns its own background and focus ring, so the
+        // field is composed: a background painted above, and a `TextEdit` with
+        // both stripped, so exactly the tokens above are what the user sees.
+        // The painter borrow ends before the `TextEdit` is allocated, because
+        // `TextEdit` needs `&mut Ui`.
+        let text_left = icon_rect.right() + component::INPUT_ICON_GAP;
+        let clear_w = if self.filter.is_empty() {
+            0.0
+        } else {
+            component::INPUT_CLEAR_BTN
+        };
+        let inner = Rect::from_min_max(
+            pos2(text_left, rect.top() + border::HAIRLINE),
+            pos2(
+                rect.right() - component::INPUT_PADDING_X - clear_w,
+                rect.bottom() - border::HAIRLINE,
+            ),
+        );
+        let edit_id = ui.id().with("filter");
+        let changed = {
+            let edit = egui::TextEdit::singleline(&mut self.filter)
+                .id(edit_id)
+                .desired_width(inner.width())
+                // The field's own chrome is drawn above; a `TextEdit` frame would
+                // repaint over it with egui's stock widget styling.
+                .frame(egui::Frame::NONE)
+                .text_color(theme.text.primary)
+                .hint_text(egui::RichText::new(component::SEARCH_PLACEHOLDER));
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| edit.show(ui),
+            )
+            .response
+            .changed()
+        };
+        if changed {
+            // Filtering is a display concern; no rescan.
+            self.selection.clear();
+            self.scroll_rows = 0;
+        }
+        // Re-borrow the painter for the clear button.
+        let painter = ui.painter();
+
+        // The clear button, only when there is something to clear.
+        if clear_w > 0.0 {
+            let clear_rect = Rect::from_center_size(
+                pos2(
+                    rect.right() - component::INPUT_PADDING_X - component::INPUT_CLEAR_BTN / 2.0,
+                    rect.center().y,
+                ),
+                vec2(component::INPUT_CLEAR_BTN, component::INPUT_CLEAR_BTN),
+            );
+            let hit = ui.interact(clear_rect, ui.id().with("filter-clear"), Sense::click());
+            if hit.hovered() {
+                painter.rect_filled(clear_rect, radius::all(radius::SM), theme.state.hover);
+            }
+            tokens::icon_glyph(
+                painter,
+                clear_rect,
+                icons::X,
+                component::icon_at(theme.icon.chrome, if hit.hovered() { 1.0 } else { 0.4 }),
+            );
+            if hit.clicked() {
+                self.filter.clear();
+            }
+        }
+    }
+
+    /// §4.1 Sidebar: the Places list, and nothing else.
+    ///
+    /// The Phase 2 theme toggle lived here because there was no toolbar. §4.4
+    /// puts it in the toolbar, and §4.1 scopes the sidebar to places, bookmarks
+    /// and volumes — so the sidebar is now exclusively Places.
+    fn sidebar(&mut self, ui: &mut Ui) {
+        let theme = self.theme;
+        egui::Panel::left("sidebar")
+            .resizable(true)
+            // For a left panel, `default_size`/`min_size`/`max_size` are the
+            // *width*; for a top/bottom panel they are the height.
+            .default_size(metric::SIDEBAR_WIDTH)
+            .min_size(metric::SIDEBAR_MIN)
+            .max_size(metric::SIDEBAR_MAX)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.surfaces.panel)
+                    .inner_margin(margin(space::S1))
+                    // §4.1 `sidebar.divider` — 1px `border.subtle`. Chrome is
+                    // separated by hairlines, never by shadow (§7.8).
+                    .stroke(Stroke::new(border::HAIRLINE, theme.borders.subtle))
+                    .corner_radius(radius::all(radius::NONE)),
+            )
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = space::HALF;
+                let height = ui.available_height();
+                ui.allocate_ui(vec2(ui.available_width(), height), |ui| {
+                    widgets::section_label(ui, &theme, "Places");
+                    ui.add_space(space::S1);
+
+                    // `Place` is cloned per row rather than borrowed: clicking one
+                    // calls `open_dir`, which needs `&mut self`, and the borrow
+                    // checker is right that holding `&self.places` across it is
+                    // an aliasing hazard waiting for a second reader. Five rows
+                    // of a four-field struct is not a cost worth a `RefCell`.
+                    for place in self.places.clone() {
+                        let active = place.path().is_some_and(|p| p == self.dir);
+                        let clicked = self.place_row(ui, &theme, &place, active);
+                        if clicked {
+                            if let Some(path) = place.path() {
+                                let path = path.to_path_buf();
+                                self.open_dir(path);
+                            }
+                        }
+                    }
+                });
+            });
+    }
+
+    /// One sidebar place row (§4.1). Returns `true` when clicked.
+    fn place_row(&self, ui: &mut Ui, theme: &Theme, place: &Place, active: bool) -> bool {
+        let height = component::SIDEBAR_ITEM_HEIGHT;
+        let width = ui.available_width();
+        let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+
+        let (bg, text_color, icon_color) = if !place.is_available() {
+            // `disabled` — `text.disabled`, no hover.
+            (
+                component::SIDEBAR_ITEM_BG_DISABLED,
+                theme.text.disabled,
+                component::icon_at(theme.icon.chrome, 0.4),
+            )
+        } else if active {
+            // §4.1 `active-place` — `accent.subtle-bg` + 3px bar +
+            // `text.primary` + `accent.base` icon. The active place is the ONLY
+            // sidebar item that uses the accent; if more than one ever does, the
+            // rule has broken.
+            (
+                theme.accent.subtle_bg,
+                theme.text.primary,
+                theme.icon.chrome_active,
+            )
+        } else if response.hovered() {
+            (theme.state.hover, theme.text.primary, theme.icon.chrome)
+        } else {
+            (
+                component::SIDEBAR_ITEM_BG,
+                theme.text.secondary,
+                theme.icon.chrome,
+            )
+        };
+
+        let painter = ui.painter();
+        if bg != egui::Color32::TRANSPARENT {
+            painter.rect_filled(rect, radius::all(component::SIDEBAR_ITEM_RADIUS), bg);
+        }
+        if active {
+            // `sidebar.item-active-bar` — 3px, `state.selected-bar`, left, full
+            // height, radius 0.
+            painter.rect_filled(
+                Rect::from_min_size(
+                    rect.left_top(),
+                    vec2(component::SIDEBAR_ITEM_ACTIVE_BAR, rect.height()),
+                ),
+                radius::all(radius::NONE),
+                theme.state.selected_bar,
+            );
+        }
+
+        // 18px icon slot, then the label at `sidebar.item-gap` (10px).
+        let icon_rect = Rect::from_center_size(
+            rect.left_center()
+                + vec2(
+                    component::SIDEBAR_ITEM_PADDING_X + component::SIDEBAR_ICON_SIZE / 2.0,
+                    0.0,
+                ),
+            vec2(component::SIDEBAR_ICON_SIZE, component::SIDEBAR_ICON_SIZE),
+        );
+        if let Some(g) = place.glyph(theme) {
+            tokens::icon_glyph(painter, icon_rect, g, icon_color);
+        } else {
+            tokens::icon_placeholder(painter, icon_rect, icon_color);
+        }
+
+        painter.text(
+            pos2(
+                icon_rect.right() + component::SIDEBAR_ITEM_GAP,
+                rect.center().y,
+            ),
+            Align2::LEFT_CENTER,
+            place.label,
+            tokens::font(ty::UI, theme),
+            text_color,
+        );
+        response.clicked()
+    }
+
+    /// §4.3 Breadcrumb for the current path.
+    fn breadcrumb(&mut self, ui: &mut Ui) {
+        let theme = self.theme;
+        let segments = breadcrumb_segments(&self.dir);
+        egui::Panel::top("breadcrumb")
+            .exact_size(component::BREADCRUMB_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.surfaces.panel)
+                    .inner_margin(margin(space::S0))
+                    // §4.3 `breadcrumb.bottom-border`. Sticky chrome is a layout
+                    // sibling with a border, never an overlay, which is what
+                    // makes "focus not obscured" structural rather than a
+                    // scroll offset (§2.12, §6.6).
+                    .stroke(Stroke::new(border::HAIRLINE, theme.borders.subtle)),
+            )
+            .show(ui, |ui| {
+                // §4.3: overflow collapses from the left and the last two
+                // segments always stay visible, because the user's actual
+                // question is always "where am I" and "what's in here". The
+                // leading overflow button itself is Phase 4.
+                let (visible, first) = trailing_segments(&segments, ui.available_width());
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = component::BREADCRUMB_SEGMENT_GAP;
+                    let last = visible.len().saturating_sub(1);
+                    if first > 0 {
+                        // `breadcrumb.overflow` — a leading `dots-three` button
+                        // standing in for the collapsed ancestors.
+                        let c = component::icon_at(
+                            theme.icon.chrome,
+                            component::BREADCRUMB_SEPARATOR_ALPHA,
+                        );
+                        let r = Rect::from_center_size(
+                            pos2(
+                                ui.available_rect_before_wrap().left() + 10.0,
+                                ui.cursor().max.y,
+                            ),
+                            vec2(
+                                component::BREADCRUMB_OVERFLOW_SIZE,
+                                component::BREADCRUMB_OVERFLOW_SIZE,
+                            ),
+                        );
+                        tokens::icon_glyph(ui.painter(), r, icons::DOTS_THREE_HORIZONTAL, c);
+                        ui.allocate_space(vec2(
+                            component::BREADCRUMB_OVERFLOW_SIZE + component::BREADCRUMB_SEGMENT_GAP,
+                            0.0,
+                        ));
+                    }
+                    for (i, seg) in visible.iter().enumerate() {
+                        if i > 0 {
+                            // `breadcrumb.separator` — 12px `caret-right`,
+                            // `icon.chrome` at 55%.
+                            let c = component::icon_at(
+                                theme.icon.chrome,
+                                component::BREADCRUMB_SEPARATOR_ALPHA,
+                            );
+                            let r = Rect::from_center_size(
+                                pos2(
+                                    ui.available_rect_before_wrap().left()
+                                        + component::BREADCRUMB_SEPARATOR_SIZE / 2.0,
+                                    ui.cursor().max.y,
+                                ),
+                                vec2(
+                                    component::BREADCRUMB_SEPARATOR_SIZE,
+                                    component::BREADCRUMB_SEPARATOR_HIT_H,
+                                ),
+                            );
+                            tokens::icon_glyph(ui.painter(), r, icons::CARET_RIGHT, c);
+                            ui.allocate_space(vec2(component::BREADCRUMB_SEPARATOR_HIT_W, 0.0));
+                        }
+                        let is_current = i == last;
+                        // The final segment is the current directory, rendered
+                        // at 500 weight, and is **not** clickable — clicking it
+                        // does nothing and it must not show a hover state.
+                        let (color, token) = if is_current {
+                            (
+                                theme.text.primary,
+                                component::BREADCRUMB_SEGMENT_TEXT_CURRENT,
+                            )
+                        } else {
+                            (theme.text.secondary, component::BREADCRUMB_SEGMENT_TEXT)
+                        };
+                        let text = RichText::new(&seg.label)
+                            .font(tokens::font(token, &theme))
+                            .color(color);
+                        if is_current {
+                            ui.add(egui::Label::new(text));
+                        } else {
+                            let response = ui
+                                .add(egui::Label::new(text).sense(Sense::click()))
+                                .on_hover_text(format!("Go to {}", seg.path.display()));
+                            if response.clicked() {
+                                let path = seg.path.clone();
+                                self.open_dir(path);
+                            }
+                        }
+                    }
+                });
+            });
+    }
+
+    /// §4.2 `row.col-header`: clickable, with a sort glyph on the active column.
+    fn column_headers(&mut self, ui: &mut Ui) {
+        let theme = self.theme;
+        let set = columns::columns_for(ui.available_width(), self.show_kind_column);
+        let height = component::ROW_COL_HEADER_HEIGHT;
+        let width = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+        // A header is a layout sibling with a 1px border, never an overlay
+        // (§2.12): a sticky header that floats over the list would be exactly
+        // the thing that hides a focused row at the top of the viewport.
+        ui.painter()
+            .rect_filled(rect, radius::all(radius::NONE), theme.surfaces.panel);
+        widgets::rule(
+            ui.painter(),
+            rect.left(),
+            rect.right(),
+            rect.bottom() - 0.5,
+            component::hairline(&theme),
+        );
+
+        // Lay the header cells out with the *same* geometry as the rows, so a
+        // column's label sits above its values rather than near them.
+        let layout = ColumnLayout::resolve(rect, set);
+
+        let mut pending: Option<SortKey> = None;
+        for (key, cell, label) in [
+            (SortKey::Name, Some(layout.name), "Name"),
+            (SortKey::Size, layout.size, "Size"),
+            (SortKey::Kind, layout.kind, "Kind"),
+            (SortKey::Modified, layout.modified, "Modified"),
+        ] {
+            let Some(cell) = cell else { continue };
+            let active = self.sort_column == key;
+            let hit = ui.interact(cell, ui.id().with(("col", label)), Sense::click());
+            if hit.clicked() {
+                pending = Some(key);
+            }
+            if hit.hovered() {
+                ui.painter()
+                    .rect_filled(cell, radius::all(radius::XS), theme.state.hover);
+            }
+
+            // `row.col-header` — `type.label` (11/600/uppercase/tracked),
+            // `text.tertiary`. Right-aligned for the two machine columns, which
+            // is what makes their values line up under their labels.
+            let align_right = matches!(key, SortKey::Size | SortKey::Modified);
+            let font = tokens::font(ty::LABEL, &theme);
+            let label_w = widgets::text_width(ui, label, font.clone());
+            let label_left = if align_right {
+                cell.right() - space::S1 - label_w
+            } else {
+                cell.left() + space::S1
+            };
+            // The alignment is already baked into `label_left`, so both
+            // columns draw left-to-right from a pre-computed x. A right-aligned
+            // column is a *label* positioned at the right edge, not a mirrored
+            // draw call: the sort glyph is then placed off that x rather than
+            // being swapped to the other end of the cell.
+            ui.painter().text(
+                egui::pos2(label_left, cell.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                font,
+                if active {
+                    theme.text.primary
+                } else {
+                    theme.text.tertiary
+                },
+            );
+
+            // `row.col-header-sortable` — a 12px sort glyph, `icon.chrome`:
+            // caret-up / caret-down / caret-up-down.
+            //
+            // It is placed immediately **beside the label**, not at the cell's
+            // edge. The name column is 690px wide, so an edge-anchored glyph put
+            // the sort indicator 600px from the word "Name" and made the whole
+            // header look broken; the Size and Kind glyphs landed 150px from
+            // their own labels, straddling the previous column. Measuring the
+            // label and hanging the glyph off it is what "trailing" has to mean
+            // once a column is allowed to be flexible.
+            let glyph = if !active {
+                icons::CARET_UP_DOWN
+            } else if self.sort.ascending {
+                icons::CARET_UP
+            } else {
+                icons::CARET_DOWN
+            };
+            let gsize = 12.0_f32;
+            let gx = if align_right {
+                label_left - space::S1 - gsize / 2.0
+            } else {
+                label_left + label_w + space::S1 + gsize / 2.0
+            };
+            let grect = Rect::from_center_size(egui::pos2(gx, cell.center().y), vec2(gsize, gsize));
+            let gc = component::icon_at(
+                if active {
+                    theme.icon.chrome_active
+                } else {
+                    theme.icon.chrome
+                },
+                if active { 1.0 } else { 0.5 },
+            );
+            tokens::icon_glyph(ui.painter(), grect, glyph, gc);
+        }
+
+        if let Some(key) = pending {
+            self.sort_by_column(key);
+        }
+    }
+
+    /// §4.5 Status bar.
+    fn status_bar(&mut self, ui: &mut Ui) {
+        let theme = self.theme;
+        let busy = self.scan.is_some();
+        let items = self.visible_count();
+        let selected = self.selection.len();
+        let errors = self.errors.len();
+        let frame = format!("{:.1} ms", self.frame_ms);
+        let phrase = self.clipboard.status_phrase();
+        let running = self.job_progress.as_ref().map(JobProgress::summary);
+
+        egui::Panel::bottom("statusbar")
+            .exact_size(component::STATUSBAR_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.surfaces.panel)
+                    .inner_margin(margin(space::S0))
+                    // `statusbar.top-border` — 1px `border.subtle`. Again a
+                    // layout sibling, so it can never obscure a focused row.
+                    .stroke(Stroke::new(border::HAIRLINE, theme.borders.subtle)),
+            )
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = component::STATUSBAR_SECTION_GAP;
+                // A plain full-width `horizontal`, not `horizontal_centered`: a
+                // centered Ui shrinks to its content, so §4.5's trailing
+                // free-space meter would end up pinned near the middle of the bar
+                // instead of at its right edge.
+                ui.horizontal(|ui| {
+                    ui.add_space(component::STATUSBAR_PADDING_X);
+
+                    // §4.5 section order: selection count (or item count) ·
+                    // errors · busy · path · spacer · free space.
+                    if selected > 0 {
+                        widgets::status_selection_count(
+                            ui,
+                            &theme,
+                            &format::plural(selected, "item", "items"),
+                        );
+                        // A range, when the selection is a contiguous one. The
+                        // anchor is what makes it knowable: the focus alone
+                        // cannot say "rows 10 to 14", which is the number a user
+                        // checking a multi-select actually wants (§7.16).
+                        if let Some(anchor) = self.selection.anchor() {
+                            if let Some(focus) = self.selection.focus() {
+                                if focus != anchor {
+                                    let (lo, hi) = if anchor < focus {
+                                        (anchor, focus)
+                                    } else {
+                                        (focus, anchor)
+                                    };
+                                    widgets::status_label(
+                                        ui,
+                                        &theme,
+                                        &format!("rows {}–{}", lo + 1, hi + 1),
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        widgets::status_label(ui, &theme, &format::plural(items, "item", "items"));
+                    }
+
+                    if let Some(phrase) = phrase {
+                        widgets::status_divider(ui, &theme);
+                        widgets::status_label(ui, &theme, &phrase);
+                    }
+
+                    if errors > 0 {
+                        widgets::status_divider(ui, &theme);
+                        widgets::status_error(
+                            ui,
+                            &theme,
+                            &format::plural(errors, "error", "errors"),
+                        );
+                    }
+
+                    // §7.16: "A long operation always reports itself in the status
+                    // bar with a spinner and a text label." A running file
+                    // operation outranks both the item count and the clipboard
+                    // phrase, because it is the only thing whose completion the
+                    // user is waiting on.
+                    if let Some(running) = running.as_deref() {
+                        widgets::status_divider(ui, &theme);
+                        widgets::status_busy(ui, &theme, "Working", running, self.motion);
+                    } else if busy {
+                        widgets::status_divider(ui, &theme);
+                        widgets::status_busy(ui, &theme, "Reading", &frame, self.motion);
+                    }
+
+                    // `statusbar.path` — `type.meta`, `text.secondary`, left,
+                    // middle-truncate, flex.
+                    widgets::status_value(
+                        ui,
+                        &theme,
+                        &format::middle_truncate(&self.dir.to_string_lossy(), 64),
+                    );
+
+                    // `statusbar.selection-count-idle` when nothing is selected
+                    // is handled by the count branch above.
+                    if self.motion.is_reduced() {
+                        widgets::status_divider(ui, &theme);
+                        widgets::status_label(ui, &theme, "reduced motion");
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(component::STATUSBAR_PADDING_X);
+                        // The real `statvfs` reading, read on a worker. Before
+                        // the first answer lands the meter is absent rather than
+                        // showing a fabricated 42%.
+                        if let Some(space) = self.space.get() {
+                            widgets::free_space_meter(ui, &theme, space.fraction());
+                            ui.label(
+                                RichText::new(format!("{} free", space.format_free()))
+                                    .font(tokens::font(component::STATUSBAR_LABEL, &theme))
+                                    .color(theme.text.tertiary),
+                            );
+                        }
+                    });
+                });
+            });
+    }
+
+    /// §4.2 File list. **Virtualized**: only the visible row range is built.
+    fn file_list(&mut self, ui: &mut Ui) {
+        let theme = self.theme;
+        let visible = self.visible_rows();
+        let total = visible.len();
+        if total == 0 {
+            self.empty_list(ui, &theme);
+            return;
+        }
+
+        let set = columns::columns_for(ui.available_width(), self.show_kind_column);
+        // `ScrollArea::show_rows` builds only `range` of `total_rows` widgets, so
+        // a 50,000-item directory costs what a 50-item one does. Mapping the
+        // whole `Vec` into a widget per row would build 50,000 closures per frame
+        // and drop frames doing it.
+        // The offset is applied from `self.scroll_rows` and written back, so
+        // `Home`/`End`/scroll-to-focused can move the list without a `Ui` in
+        // the keyboard handler. `ScrollAreaOutput` reports the offset the user
+        // produced by scrolling; the two are reconciled by taking whichever is
+        // further along, which is the only rule that does not fight the user
+        // mid-gesture.
+        let out = ScrollArea::vertical()
+            .id_salt("file-list")
+            .auto_shrink([false, false])
+            .vertical_scroll_offset(self.scroll_rows as f32 * component::ROW_HEIGHT)
+            .show_rows(ui, component::ROW_HEIGHT, total, |ui, range| {
+                // egui adds `item_spacing.y` to the row height, so the list band
+                // (the 2px half-step) must be zeroed here or rows come out at
+                // 28px instead of the specified 26px.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let width = ui.available_width();
+                for at in range {
+                    let Some(&index) = visible.get(at) else {
+                        continue;
+                    };
+                    let Some(row) = self.rows.get(index) else {
+                        continue;
+                    };
+                    let entry = &row.entry;
+                    let (rect, response) =
+                        ui.allocate_exact_size(vec2(width, component::ROW_HEIGHT), Sense::click());
+                    let state = self.row_state(at, entry, response.hovered());
+                    let is_open = self.expanded.contains(&entry.path);
+                    // §4.11 `F2`: the field replaces the name in the row, so the
+                    // row keeps its selection bar, focus ring and icon while the
+                    // name becomes editable.
+                    let renaming_here =
+                        !self.creating && self.renaming.as_ref().is_some_and(|r| r.row == at);
+                    // The row is painted from `&self`; the field is drawn from
+                    // `&mut self`. So the row's borrow has to end first, which is
+                    // why the paint call is separated from the field call rather
+                    // than the field being drawn inside `paint_row`.
+                    self.paint_row(ui, &theme, rect, row, at, state, set, is_open);
+                    if renaming_here {
+                        self.rename_field(ui, &theme, rect, set);
+                    }
+                    let _ = index;
+
+                    if response.clicked() {
+                        let m = ui.input(|i| i.modifiers);
+                        if m.shift {
+                            self.selection.extend_to(at);
+                        } else if m.ctrl {
+                            self.selection.toggle(at);
+                        } else {
+                            self.selection.click(at);
+                        }
+                    }
+                }
+            });
+
+        // Record how many rows fit, for the keyboard's scroll-to-focused.
+        self.viewport_rows = (ui.available_height() / component::ROW_HEIGHT)
+            .floor()
+            .max(1.0) as usize;
+        // Reconcile the keyboard's intent with the user's own scrolling.
+        let from_pixels = (out.state.offset.y / component::ROW_HEIGHT)
+            .round()
+            .max(0.0);
+        self.scroll_rows = self
+            .scroll_rows
+            .max(from_pixels as usize)
+            .min(total.saturating_sub(1));
+    }
+
+    /// A row's state, from §4.10's priority order.
+    ///
+    /// §4.10: `disabled` > `drop-target` > `pressed` > `selected` >
+    /// `focus-visible` > `hover` > `default`, with the one exception that
+    /// `selected + focus-visible` renders **both**.
+    ///
+    /// `hovered` is passed rather than read from a rect because the rect is only
+    /// known after allocation, and the painter needs the state at paint time.
+    ///
+    /// The clipboard is resolved by *path*, not by row position: positions shift
+    /// the moment a filter is typed, and a cut that follows a position is a cut
+    /// that silently starts marking the wrong rows.
+    fn row_state(&self, at: usize, entry: &FileEntry, hovered: bool) -> component::RowState {
+        // A cut row is `cut`; a copied row is visually normal, which is the
+        // whole difference between the two §4.2 states.
+        let forced = self
+            .clipboard
+            .op_for(&entry.path)
+            .filter(|op| op.is_cut())
+            .map(|_| component::RowState::Cut);
+        component::RowState::resolve(
+            self.selection.contains(at),
+            self.selection.focus() == Some(at) && self.selection.focus_is_selected(),
+            hovered,
+            forced,
+        )
+    }
+
+    /// Paints one row, straight from §4.2's state matrix.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row(
+        &self,
+        ui: &Ui,
+        theme: &Theme,
+        rect: Rect,
+        row: &Row,
+        at: usize,
+        state: component::RowState,
+        set: ColumnSet,
+        is_open: bool,
+    ) {
+        let painter = ui.painter();
+        let entry = row.entry();
+        let depth = row.depth;
+        let classified = Classified::of(entry);
+
+        // Background: flat, 3px radius, no shadow, no gradient (§4.2 rule 5).
+        painter.rect_filled(
+            rect,
+            component::row_corner_radius(),
+            state.background(theme),
+        );
+
+        // Selection's second channel: the 2px left bar (§6.6 "never colour
+        // alone").
+        if let Some(bar) = state.selected_bar(theme) {
+            let inset = component::ROW_SELECTED_BAR_INSET;
+            // 1px radius = half the bar width: the smallest rounding that keeps
+            // the bar from poking out of the row's 3px corner radius. The spec
+            // gives the bar no radius of its own, so this is the one place a
+            // radius is chosen rather than transcribed.
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(rect.left(), rect.top() + inset),
+                    pos2(
+                        rect.left() + component::ROW_SELECTED_BAR_WIDTH,
+                        rect.bottom() - inset,
+                    ),
+                ),
+                radius::all(1.0),
+                bar,
+            );
+        }
+
+        // The focus ring is a 2px **inset** stroke, drawn on top of the tint
+        // when the row is both selected and focused — the combination §4.2 calls
+        // "the single most important state in the whole app".
+        if let Some(ring) = state.focus_ring(theme, window_focused(ui)) {
+            widgets::rect_stroke(painter, rect, component::row_corner_radius(), ring);
+        }
+
+        // `row.divider` — 1px `border.subtle`, inset 8px left and right.
+        widgets::rule(
+            painter,
+            rect.left() + component::ROW_DIVIDER_INSET_X,
+            rect.right() - component::ROW_DIVIDER_INSET_X,
+            rect.bottom() - 0.5,
+            component::hairline(theme),
+        );
+
+        // Hidden-file marker: a 4px dot in the 3px leading gutter (§4.2
+        // `row.col-hidden`). This is the hidden state's *second channel*, and it
+        // is why a hidden file needs no icon change (§5.2).
+        if entry.hidden {
+            painter.circle_filled(
+                pos2(rect.left() + metric::GUTTER_MARKER, rect.center().y),
+                component::ROW_HIDDEN_DOT / 2.0,
+                component::hidden_dot_color(theme),
+            );
+        }
+
+        // Column geometry from the shared layout, so a header sits above its
+        // values by construction rather than by coincidence.
+        let mut layout = ColumnLayout::resolve(rect, set);
+        // `row.indent-step` — 14px per depth level, now for real.
+        let mut shift = (depth as f32) * component::ROW_INDENT_STEP;
+        if self.view == ViewMode::Tree {
+            // Every tree row reserves the disclosure column, not just the ones
+            // that draw a caret. Without the shared reservation the caret was
+            // painted straight on top of the folder icon — both occupied
+            // `gutter..gutter+16` — so a collapsed folder rendered as an
+            // unreadable smudge. Reserving it for *all* rows is also what makes
+            // depth 1 line up under depth 0 instead of half a step out.
+            shift += component::TREE_DISCLOSURE + space::HALF;
+        }
+        if shift > 0.0 {
+            layout.name = layout.name.translate(vec2(shift, 0.0));
+            layout.icon = layout.icon.translate(vec2(shift, 0.0));
+        }
+        // A disclosure caret in the reserved column, for expandable rows only.
+        // §5.3's `caret-right` / `caret-down`: without it a child row is just
+        // indented text with nothing saying where its parent is.
+        if self.view == ViewMode::Tree && row.is_expandable() {
+            let cr = Rect::from_center_size(
+                pos2(
+                    rect.left() + metric::GUTTER + component::TREE_DISCLOSURE / 2.0,
+                    rect.center().y,
+                ),
+                vec2(component::TREE_DISCLOSURE, component::TREE_DISCLOSURE),
+            );
+            tokens::icon_glyph(
+                painter,
+                cr,
+                if is_open {
+                    icons::CARET_DOWN
+                } else {
+                    icons::CARET_RIGHT
+                },
+                component::icon_at(theme.icon.chrome, 0.7),
+            );
+        }
+
+        // The real Phosphor glyph, in its §3.7 role colour.
+        let icon_color = classified.icon_color(&theme.icon);
+        let icon_color = match state {
+            component::RowState::Disabled => component::icon_at(icon_color, 0.5),
+            component::RowState::Cut => component::icon_at(icon_color, 0.7),
+            _ => icon_color,
+        };
+        if let Some(g) = classified.glyph() {
+            tokens::icon_glyph(painter, layout.icon, g, icon_color);
+        } else {
+            tokens::icon_placeholder(painter, layout.icon, icon_color);
+        }
+
+        // `text.tertiary` on a hidden file's name (§4.2 `hidden file` row), and
+        // `text.disabled` only in the `disabled` state — which is exactly the
+        // §6.2 structural rule, since `RowState::Disabled` has no bar and so can
+        // never also be a selected row.
+        let name_color = match (entry.hidden, state.text_role()) {
+            (_, component::DisabledText::Disabled) => theme.text.disabled,
+            (true, component::DisabledText::Normal) => theme.text.tertiary,
+            (false, component::DisabledText::Normal) => theme.text.primary,
+        };
+        // §2.8: all list text is single-line, vertically centred, never wrapped,
+        // middle-truncated.
+        let name = format::middle_truncate(&entry.name, layout.name_text_cols());
+        painter.text(
+            pos2(layout.name_text_x, rect.center().y),
+            Align2::LEFT_CENTER,
+            &name,
+            tokens::font(state.name_token(), theme),
+            name_color,
+        );
+
+        // `row.col-modified` — `type.meta`, `text.tertiary`, right-aligned,
+        // absolute UTC (§4.2).
+        if let Some(cell) = layout.modified {
+            let text = entry
+                .modified
+                .map_or_else(|| "-".to_string(), format::timestamp);
+            painter.text(
+                pos2(cell.right() - space::S1, rect.center().y),
+                Align2::RIGHT_CENTER,
+                &text,
+                tokens::font(ty::META, theme),
+                theme.text.tertiary,
+            );
+        }
+
+        // `row.col-kind` — `type.caption`, `text.tertiary`, left. Only present
+        // when the listing is genuinely mixed; see `columns::listing_is_mixed`.
+        if let Some(cell) = layout.kind {
+            painter.text(
+                pos2(cell.left() + space::S1, rect.center().y),
+                Align2::LEFT_CENTER,
+                classified.category.label(),
+                tokens::font(ty::CAPTION, theme),
+                theme.text.tertiary,
+            );
+        }
+
+        // `row.col-size` — `type.meta`, `text.tertiary`, right-aligned, tabular.
+        //
+        // The engine's documented caveat, and §4.2's: `FileEntry::size` for a
+        // directory is that directory's own `lstat` length (typically 4096), NOT
+        // a recursive total. Printing `4.0 KB` there is a lie, so directories
+        // render an em dash. `None` means "unknown/unreadable", which the engine
+        // documents as `-` rather than `0`.
+        if let Some(cell) = layout.size {
+            let text = match (entry.kind, entry.size) {
+                (EntryKind::Directory, _) => format::NOT_APPLICABLE.to_string(),
+                (_, Some(n)) => format::bytes(n),
+                (_, None) => "-".to_string(),
+            };
+            painter.text(
+                pos2(cell.right() - space::S1, rect.center().y),
+                Align2::RIGHT_CENTER,
+                &text,
+                tokens::font(ty::META, theme),
+                theme.text.tertiary,
+            );
+        }
+
+        // §4.2 rule 3: the focused row must be fully visible. A tree row that is
+        // focused draws a 1px marker in the margin so the eye can find it in a
+        // deep indentation, which is the tree-mode equivalent of the ring.
+        if self.selection.focus() == Some(at) && depth > 0 {
+            painter.circle_filled(
+                pos2(rect.left() + space::S1, rect.center().y),
+                component::ROW_SELECTED_BAR_WIDTH,
+                theme.state.selected_bar,
+            );
+        }
+    }
+
+    /// The inline rename field, drawn over the row's name.
+    ///
+    /// §4.7/§4.8: the field takes the row's name column, the same `surface.input`
+    /// and `border.accent` a search field would, and the error appears **under**
+    /// it rather than in a dialog — a rename mistake is a one-word fix, and a
+    /// modal for a one-word fix is a modal in the way.
+    fn rename_field(&mut self, ui: &mut Ui, theme: &Theme, rect: Rect, set: ColumnSet) {
+        let Some(inline) = self.renaming.as_mut() else {
+            return;
+        };
+        let layout = ColumnLayout::resolve(rect, set);
+        let field = Rect::from_min_max(
+            egui::pos2(layout.name_text_x, rect.center().y - 9.0),
+            egui::pos2(layout.name.right() - space::S1, rect.center().y + 9.0),
+        );
+        let painter = ui.painter();
+        let error = inline.error();
+        painter.rect_filled(field, radius::all(radius::SM), theme.surfaces.input);
+        // A field with a problem in it is outlined in danger, not accent: the
+        // accent would say "this is fine, you are typing".
+        let border_color = if error.is_some() {
+            theme.borders.danger
+        } else {
+            theme.borders.accent
+        };
+        crate::widgets::rect_stroke(
+            painter,
+            field,
+            radius::all(radius::SM),
+            Stroke::new(border::HAIRLINE, border_color),
+        );
+
+        let id = ui.id().with("rename-field");
+        let text = format::middle_truncate(&inline.draft, 64);
+        let out = ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(field)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                egui::TextEdit::singleline(&mut inline.draft)
+                    .id(id)
+                    .desired_width(field.width() - space::S1)
+                    .frame(egui::Frame::NONE)
+                    .text_color(theme.text.primary)
+                    .hint_text(egui::RichText::new("name"))
+                    .show(ui)
+            },
+        );
+        let _ = text;
+        // The field must keep focus, or typing the first character drops it and
+        // the rename silently truncates to one letter.
+        if self.renaming.as_ref().is_some_and(|r| !r.focused) && !out.response.has_focus() {
+            if let Some(r) = self.renaming.as_mut() {
+                r.focused = true;
+            }
+            out.response.request_focus();
+        }
+    }
+
+    /// §4.2 empty state: a 48px glyph at 40%, the folder name, one sentence.
+    ///
+    /// "The empty state is a real design moment, not an afterthought… No
+    /// illustration, no illustration-adjacent illustration."
+    fn empty_list(&mut self, ui: &mut Ui, theme: &Theme) {
+        let dir_name = self.dir.file_name().map_or_else(
+            || self.dir.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let (body, icon) = if self.filter.is_empty() {
+            ("This folder is empty.", icons::FOLDER_OPEN)
+        } else {
+            ("Nothing matches this filter.", icons::MAGNIFYING_GLASS)
+        };
+
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.25);
+
+            // `row.empty-icon` — `folder-open`, 48px, `icon.chrome` at 40%.
+            let (rect, _) = ui.allocate_exact_size(
+                vec2(
+                    component::ROW_EMPTY_ICON_SIZE,
+                    component::ROW_EMPTY_ICON_SIZE,
+                ),
+                Sense::hover(),
+            );
+            tokens::icon_glyph(
+                ui.painter(),
+                rect,
+                icon,
+                component::icon_at(theme.icon.chrome, component::ROW_EMPTY_ICON_ALPHA),
+            );
+
+            ui.add_space(space::S3);
+            // `row.empty-title` — `type.display`, `text.primary`.
+            ui.label(
+                RichText::new(&dir_name)
+                    .font(tokens::font(component::ROW_EMPTY_TITLE, theme))
+                    .color(theme.text.primary),
+            );
+            ui.add_space(space::S1);
+            // `row.empty-body` — `type.dialog-body`, `text.secondary`, max 44ch.
+            ui.label(
+                RichText::new(body)
+                    .font(tokens::font(component::ROW_EMPTY_BODY, theme))
+                    .color(theme.text.secondary),
+            );
+        });
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
+
+/// Scales `natural` to fit inside `max` while keeping its aspect ratio.
+///
+/// Never upscales: a 16x16 icon blown up to 200px is a blurry square, and a
+/// preview that lies about an image's sharpness is worse than a small honest one.
+#[must_use]
+fn fit(natural: egui::Vec2, max: egui::Vec2) -> egui::Vec2 {
+    if natural.x <= 0.0 || natural.y <= 0.0 {
+        return egui::vec2(0.0, 0.0);
+    }
+    let scale = (max.x / natural.x).min(max.y / natural.y).min(1.0);
+    egui::vec2(natural.x * scale, natural.y * scale)
+}
+
+/// Whether the OS window has keyboard focus.
+///
+/// Drives `focus.ring` vs `focus.ring-inactive` (§4.2 `window inactive +
+/// focused`, §6.4). `InputState::focused` is documented as "the native window
+/// has the keyboard focus (i.e. is receiving key presses). False when the user
+/// alt-tab away" — which is exactly this question, and is *not* the same as
+/// whether an egui widget holds focus.
+fn window_focused(ui: &Ui) -> bool {
+    ui.input(|i| i.focused)
+}
+
+/// One breadcrumb segment: a label plus the path it navigates to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Segment {
+    /// The name shown.
+    label: String,
+    /// The absolute path this segment navigates to.
+    path: PathBuf,
+}
+
+/// Splits `path` into breadcrumb segments, root first.
+#[must_use]
+fn breadcrumb_segments(path: &Path) -> Vec<Segment> {
+    // "/" has no components, so the root is seeded explicitly.
+    let mut out = vec![Segment {
+        label: "/".to_string(),
+        path: PathBuf::from("/"),
+    }];
+    for part in path.components() {
+        // The root component of an absolute path is `RootDir`, already seeded.
+        let Some(name) = part.as_os_str().to_str() else {
+            // A non-UTF-8 component cannot be rendered losslessly. The engine
+            // lossily converts names for exactly this reason; do the same and
+            // keep walking rather than truncating the breadcrumb.
+            let lossy = part.as_os_str().to_string_lossy().into_owned();
+            let parent = out
+                .last()
+                .map_or_else(|| PathBuf::from("/"), |s| s.path.clone());
+            out.push(Segment {
+                label: lossy,
+                path: parent.join(part.as_os_str()),
+            });
+            continue;
+        };
+        if name == "/" {
+            continue;
+        }
+        let parent = out
+            .last()
+            .map_or_else(|| PathBuf::from("/"), |s| s.path.clone());
+        out.push(Segment {
+            label: name.to_string(),
+            path: parent.join(name),
+        });
+    }
+    out
+}
+
+/// How many trailing segments fit, and where they start.
+///
+/// Returns `(segments, first_visible_index)`. §4.3: the last two segments
+/// always stay visible, so the answer is at least `BREADCRUMB_MIN_VISIBLE`
+/// whenever there are that many at all.
+#[must_use]
+fn trailing_segments(segments: &[Segment], available: f32) -> (Vec<&Segment>, usize) {
+    // A fixed 7.2px per character at `type.ui`'s 13px in Plex Sans. Deliberately
+    // an estimate rather than a `Context` measurement: this is a pure function
+    // the tests call without a `Ui`, and the consequence of being 10% out is that
+    // one extra or one fewer ancestor is collapsed — not a wrong path.
+    let width_of = |label: &str| label.chars().count() as f32 * 7.2;
+
+    let min_keep = component::BREADCRUMB_MIN_VISIBLE.min(segments.len());
+    let mut first = segments.len().saturating_sub(min_keep);
+    let mut used: f32 = segments[first..]
+        .iter()
+        .map(|s| width_of(&s.label) + component::BREADCRUMB_SEGMENT_GAP)
+        .sum();
+    while first > 0 && used + width_of(&segments[first - 1].label) <= available {
+        first -= 1;
+        used += width_of(&segments[first].label);
+    }
+    (segments[first..].iter().collect(), first)
+}
+
+/// A 1-px all-round `egui::Margin` from a spacing token.
+///
+/// `egui::Margin` is `i8` in epaint 0.36, so a sub-pixel spacing token has to
+/// round; the tokens used for margins are all whole pixels.
+fn margin(px: f32) -> egui::Margin {
+    egui::Margin::same(px.clamp(0.0, i8::MAX as f32).round() as i8)
+}
+
+/// The path an entry navigates to, if the scanner proved it is a directory.
+///
+/// **Zero I/O.** [`kestrel_fs::model::FileEntry::is_descendable`] is a field
+/// read: the scanner resolved every symlink's target on its own thread and
+/// recorded the answer. This is the call that used to `stat` in the frame loop.
+#[must_use]
+fn descendable(entry: &FileEntry) -> Option<&Path> {
+    entry.is_descendable().then_some(entry.path.as_path())
+}
+
+/// A row's indentation depth: how many components it sits below `root`.
+///
+/// Derived from the **path**, which is the only thing that knows the truth — the
+/// scan is depth-first and the entry carries the full path, so a child of
+/// `root/a` is unambiguously one level below `root` and a child of `root/a/b` is
+/// two. A view index cannot supply this, which is why the earlier
+/// `tree_depth(index)` stub could not be repaired by indexing.
+///
+/// An entry outside `root` — which should not happen, since the scanner walks
+/// only its own root — is treated as top-level rather than panicking or wrapping
+/// through a huge `usize`.
+#[must_use]
+fn depth_of(root: &Path, path: &Path) -> usize {
+    match path.strip_prefix(root) {
+        Ok(rel) => rel.components().count().saturating_sub(1),
+        Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `KestrelApp` with no window, no scan and no watcher behind it.
+    ///
+    /// `assemble` is deliberately not used: it starts a scan and a watcher, which
+    /// is real I/O on real threads for tests that only want three fields set.
+    fn minimal_app() -> KestrelApp {
+        KestrelApp {
+            screen: Screen::Browser,
+            mode: ThemeMode::Dark,
+            theme: Theme::dark(),
+            motion: Motion::Full,
+            places: Vec::new(),
+            dir: PathBuf::from("/r"),
+            rows: Vec::new(),
+            expanded: BTreeSet::new(),
+            errors: Vec::new(),
+            scan: None,
+            watch: None,
+            history: History::new(Path::new("/r")),
+            selection: Selection::new(),
+            clipboard: Clipboard::new(),
+            sort: SortSpec::default(),
+            sort_column: SortKey::Name,
+            view: ViewMode::List,
+            show_kind_column: false,
+            scroll_rows: 0,
+            viewport_rows: 1,
+            space: SpaceProbe::new(),
+            job: None,
+            job_progress: None,
+            pending: None,
+            modal: None,
+            modal_focus: 0,
+            renaming: None,
+            creating: false,
+            mkdir_result: None,
+            preview: PvLoader::new(),
+            show_preview: true,
+            preview_content: None,
+            filter: String::new(),
+            filter_focused: false,
+            frame_ms: 0.0,
+            frames: 0,
+        }
+    }
+
+    fn row_at(root: &str, path: &str) -> Row {
+        Row {
+            depth: depth_of(Path::new(root), Path::new(path)),
+            entry: FileEntry {
+                name: Path::new(path)
+                    .file_name()
+                    .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned()),
+                path: PathBuf::from(path),
+                kind: EntryKind::File,
+                size: None,
+                modified: None,
+                hidden: false,
+                is_dir_target: None,
+            },
+        }
+    }
+
+    fn dir_entry(path: &str) -> FileEntry {
+        FileEntry {
+            name: Path::new(path)
+                .file_name()
+                .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned()),
+            path: PathBuf::from(path),
+            kind: EntryKind::Directory,
+            size: Some(4096),
+            modified: None,
+            hidden: false,
+            is_dir_target: None,
+        }
+    }
+
+    /// Depth comes from the path, so a nested child is genuinely two levels down.
+    ///
+    /// The Phase 3 stub returned `1` for every row past the first, which rendered
+    /// a 3-deep tree as a 2-deep one — a "feature" that was a lie. This is the
+    /// test that says a grandchild is a grandchild.
+    #[test]
+    fn depth_counts_components_below_the_root() {
+        assert_eq!(depth_of(Path::new("/r"), Path::new("/r/a.txt")), 0);
+        assert_eq!(depth_of(Path::new("/r"), Path::new("/r/d/a.txt")), 1);
+        assert_eq!(depth_of(Path::new("/r"), Path::new("/r/d/e/a.txt")), 2);
+        assert_eq!(depth_of(Path::new("/r"), Path::new("/r/d/e/f/a.txt")), 3);
+        // The root itself is not below the root.
+        assert_eq!(depth_of(Path::new("/r"), Path::new("/r")), 0);
+        // A path outside the root must not wrap `usize` around in `saturating_sub`.
+        assert_eq!(depth_of(Path::new("/r"), Path::new("/other/a.txt")), 0);
+    }
+
+    /// Expanding is a pure filter: a collapsed parent hides exactly its subtree.
+    #[test]
+    fn a_collapsed_parent_hides_its_children() {
+        let rows = [
+            row_at("/r", "/r/top.txt"),
+            row_at("/r", "/r/d/child.txt"),
+            row_at("/r", "/r/d/sub/grand.txt"),
+        ];
+        let mut app = minimal_app();
+        app.view = ViewMode::Tree;
+        assert!(app.tree_is_visible(&rows[0]));
+        assert!(!app.tree_is_visible(&rows[1]), "d is collapsed");
+        assert!(!app.tree_is_visible(&rows[2]), "d is collapsed");
+
+        // Expanding `d` reveals its direct children but not `d`'s grandchildren:
+        // `d/sub` is a different directory and is still collapsed.
+        app.toggle_expand(Path::new("/r/d"));
+        assert!(app.tree_is_visible(&rows[0]));
+        assert!(app.tree_is_visible(&rows[1]));
+        assert!(!app.tree_is_visible(&rows[2]));
+
+        app.toggle_expand(Path::new("/r/d/sub"));
+        assert!(app.tree_is_visible(&rows[2]));
+
+        // Collapsing `d` hides the whole subtree, grandchild included.
+        app.toggle_expand(Path::new("/r/d"));
+        assert!(!app.tree_is_visible(&rows[1]));
+        assert!(!app.tree_is_visible(&rows[2]));
+    }
+
+    /// In list mode the expansion set is irrelevant: every row is top level.
+    #[test]
+    fn list_mode_shows_every_row_regardless_of_expansion() {
+        let child = row_at("/r", "/r/d/child.txt");
+        let mut app = minimal_app();
+        app.view = ViewMode::List;
+        assert!(app.tree_is_visible(&child));
+    }
+
+    #[test]
+    fn toggling_reports_the_new_state() {
+        let mut app = minimal_app();
+        assert!(app.toggle_expand(Path::new("/r/d")), "first toggle expands");
+        assert!(!app.toggle_expand(Path::new("/r/d")), "second toggles back");
+        assert!(app.toggle_expand(Path::new("/r/d")));
+        assert_eq!(app.expanded.len(), 1, "no duplicate entries");
+    }
+
+    /// The tree scan reads exactly one level deeper than it shows, and never
+    /// more. An unbounded recursive scan behind a view toggle is how a file
+    /// manager hangs on a directory with many subdirectories — and depth 1 is
+    /// precisely what makes expanding free of I/O.
+    #[test]
+    fn the_tree_scan_is_bounded_at_one_level() {
+        let mut app = minimal_app();
+        app.view = ViewMode::List;
+        let list = app.scan_options();
+        assert!(!list.recursive, "list mode must not recurse at all");
+        assert_eq!(list.max_depth, 0);
+
+        app.view = ViewMode::Tree;
+        let tree = app.scan_options();
+        assert!(tree.recursive);
+        assert_eq!(tree.max_depth, 1, "depth 1 is what makes expand I/O-free");
+    }
+
+    /// Descending needs no I/O, because the scanner resolved the link.
+    #[test]
+    fn descendability_comes_from_the_scanner_not_from_a_stat() {
+        let real = dir_entry("/r/d");
+        assert!(descendable(&real).is_some());
+
+        let mut link = real.clone();
+        link.kind = EntryKind::Symlink;
+        link.is_dir_target = None;
+        assert!(
+            descendable(&link).is_none(),
+            "an unresolved link must not be entered"
+        );
+        link.is_dir_target = Some(true);
+        assert!(
+            descendable(&link).is_some(),
+            "a link to a directory is entered"
+        );
+        link.is_dir_target = Some(false);
+        assert!(descendable(&link).is_none(), "a link to a file is not");
+    }
+
+    /// The breadcrumb always ends with the current directory, whatever the path.
+    #[test]
+    fn the_breadcrumb_is_root_first_and_ends_at_the_leaf() {
+        let segs = breadcrumb_segments(Path::new("/tmp/opencode/p3"));
+        let labels: Vec<&str> = segs.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["/", "tmp", "opencode", "p3"]);
+        // Every segment's path is the directory it navigates to.
+        assert_eq!(
+            segs.last().map(|s| s.path.as_path()),
+            Some(Path::new("/tmp/opencode/p3"))
+        );
+        assert_eq!(segs[1].path, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn the_root_breadcrumb_is_just_the_root() {
+        let segs = breadcrumb_segments(Path::new("/"));
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].label, "/");
+    }
+
+    /// §4.3: the last two segments always stay visible, so "where am I" and
+    /// "what's in here" survive any width.
+    #[test]
+    fn the_breadcrumb_never_collapses_past_the_last_two_segments() {
+        let deep = breadcrumb_segments(Path::new(
+            "/a/very/long/segment/name/that/alone/exceeds/the/whole/pane/width/quite/easily",
+        ));
+        for width in [0.0_f32, 10.0, 80.0, 200.0, 2000.0] {
+            let (visible, _) = trailing_segments(&deep, width);
+            assert!(
+                visible.len() >= 2.min(deep.len()),
+                "width {width} kept only {} of {} segments",
+                visible.len(),
+                deep.len()
+            );
+        }
+    }
+
+    /// A wider pane collapses fewer ancestors, monotonically.
+    #[test]
+    fn a_wider_pane_shows_more_ancestors() {
+        let deep = breadcrumb_segments(Path::new("/a/bb/ccc/dddd/eeeee/ffffff"));
+        let narrow = trailing_segments(&deep, 60.0).1;
+        let wide = trailing_segments(&deep, 2000.0).1;
+        assert!(wide < narrow, "wide kept {wide}, narrow kept {narrow}");
+        assert_eq!(wide, 0, "a wide pane shows the root too");
+    }
+
+    /// A 1px margin helper that rounds rather than truncating.
+    ///
+    /// `egui::Margin` is `i8` in epaint 0.36, so a half-pixel spacing token has
+    /// to round somewhere. Truncating `0.5` to `0` would silently remove a
+    /// margin; rounding keeps it.
+    #[test]
+    fn margin_rounds_rather_than_truncates() {
+        assert_eq!(egui::Margin::same(0).left, 0);
+        assert_eq!(egui::Margin::same(1).left, 1);
+        // Out-of-range values are clamped, not wrapped into a negative margin.
+        let big = margin(1000.0);
+        assert!(big.left >= 0, "a huge margin must not wrap negative");
+        assert_eq!(margin(-5.0).left, 0, "a negative margin clamps to 0");
+    }
+}
