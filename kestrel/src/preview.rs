@@ -81,6 +81,10 @@ pub enum Kind {
 impl Kind {
     /// A one-word label for the pane's kind line.
     #[must_use]
+    // `app.rs` currently switches on the variant and writes its own strings;
+    // this accessor is the single-source version of the same mapping. Kept so
+    // the copy has one owner once the pane starts using it.
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Image => "Image",
@@ -250,9 +254,7 @@ pub fn highlight(text: &str) -> Vec<Line> {
                             _ => raw[idx..].starts_with("--"),
                         };
                         if is_comment {
-                            for j in idx..raw.len() {
-                                spans[j] = Token::Comment as u8;
-                            }
+                            spans[idx..raw.len()].fill(Token::Comment as u8);
                             break;
                         }
                     }
@@ -271,9 +273,7 @@ pub fn highlight(text: &str) -> Vec<Line> {
                             }
                         }
                         if is_keyword(&raw[start..end]) {
-                            for j in start..end {
-                                spans[j] = Token::Keyword as u8;
-                            }
+                            spans[start..end].fill(Token::Keyword as u8);
                         }
                     }
                 }
@@ -488,6 +488,7 @@ impl Loader {
 
     /// The kind of the last request.
     #[must_use]
+    #[allow(dead_code)]
     pub fn kind(&self) -> Option<Kind> {
         self.kind
     }
@@ -815,8 +816,14 @@ mod tests {
         let path = d.path().join("a.png");
         // A real 1x1 PNG, written from hex so the byte count cannot drift out of
         // sync with the array length.
+        //
+        // The byte sequence is a genuine IHDR/IDAT/IEND stream (68 bytes, 136 hex
+        // digits, every chunk CRC correct) — the test's point is that real PNG
+        // bytes survive the loader verbatim, which a hand-edited fixture cannot
+        // demonstrate.
         let png: Vec<u8> = hex(
-            "89504e470d0a1a0a0000000d4948445200000001000000010806000000             1f15c4890000000b49444154789c63f8cfc000000301010018dd8db000000             0049454e44ae426082",
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489 \
+             0000000b49444154789c6360000200000500017a5eab3f0000000049454e44ae426082",
         );
         fs::write(&path, &png).expect("write");
         let cancel = Arc::new(AtomicBool::new(false));
@@ -914,7 +921,7 @@ mod tests {
         let raw = r#"let s = "hello";"#;
         let lines = highlight(raw);
         assert_eq!(lines[0].text, raw, "the text must be byte-identical");
-        assert!(lines[0].spans.iter().any(|s| *s == Token::Literal as u8));
+        assert!(lines[0].spans.contains(&(Token::Literal as u8)));
     }
 
     /// A keyword run is coloured, and an identifier that merely contains a
@@ -988,6 +995,6 @@ mod tests {
         let lines = highlight(raw);
         let line = &lines[0];
         assert_eq!(line.spans.len(), raw.len());
-        assert!(line.spans.iter().any(|s| *s == Token::Comment as u8));
+        assert!(line.spans.contains(&(Token::Comment as u8)));
     }
 }

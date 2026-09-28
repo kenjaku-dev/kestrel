@@ -736,14 +736,13 @@ impl KestrelApp {
             .filter_map(|i| self.rows.get(i))
             .map(|row| {
                 let known = row.entry.size;
-                let item = if row.entry.kind.is_directory() {
+                if row.entry.kind.is_directory() {
                     // A directory's `lstat` length is not a recursive total, and
                     // reporting it as one would be a lie in the progress bar.
                     Item::dir(row.entry.path.clone())
                 } else {
                     Item::file(row.entry.path.clone(), known)
-                };
-                item
+                }
             })
             .collect()
     }
@@ -3369,6 +3368,10 @@ fn margin(px: f32) -> egui::Margin {
 /// read: the scanner resolved every symlink's target on its own thread and
 /// recorded the answer. This is the call that used to `stat` in the frame loop.
 #[must_use]
+// `app.rs` inlines `is_descendable()` at its two call sites, so this wrapper
+// survives only for the symlink tests below — which are the ones that pin the
+// zero-I/O rule. Kept: those tests are the contract.
+#[cfg_attr(not(test), allow(dead_code))]
 fn descendable(entry: &FileEntry) -> Option<&Path> {
     entry.is_descendable().then_some(entry.path.as_path())
 }

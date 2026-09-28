@@ -134,12 +134,19 @@ impl Strategy {
 
     /// `true` for the strategy that destroys data at the destination.
     #[must_use]
+    // Part of the type's decision API and covered by tests, but the dialog
+    // styles its `Overwrite*` buttons by variant rather than by asking this —
+    // so nothing in `app.rs` calls it yet. Kept: the two predicates are how a
+    // caller *should* branch, and deleting one would leave its counterpart
+    // unexplained.
+    #[allow(dead_code)]
     pub fn is_destructive(self) -> bool {
         matches!(self, Self::Overwrite)
     }
 
     /// `true` when this strategy leaves the existing file in place.
     #[must_use]
+    #[allow(dead_code)]
     pub fn is_reversible(self) -> bool {
         matches!(self, Self::Skip)
     }
@@ -344,7 +351,7 @@ impl DecisionSlot {
     /// `true` when a question is waiting for an answer.
     #[must_use]
     pub fn is_waiting(&self) -> bool {
-        self.inner.lock().map_or(false, |g| g.waiting)
+        self.inner.lock().is_ok_and(|g| g.waiting)
     }
 
     /// The sticky `Scope::All` answer, if the user gave one.
@@ -390,6 +397,10 @@ impl JobHandle {
 
     /// `true` once the job has been asked to stop.
     #[must_use]
+    // The UI tracks cancellation through `JobProgress`, not through the handle,
+    // so this has no production caller. Kept because it is the honest way to
+    // ask the question and the tests use it.
+    #[allow(dead_code)]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
     }
@@ -402,6 +413,7 @@ impl JobHandle {
 
     /// `true` when the worker has sent its terminal event.
     #[must_use]
+    #[allow(dead_code)]
     pub fn is_finished(&self) -> bool {
         self.rx.try_recv().map_or(true, |e| {
             matches!(
@@ -416,9 +428,9 @@ impl JobHandle {
     /// Called when a job is replaced, so repeated operations do not accumulate
     /// threads — the same reason `ScanHandle::finish` exists.
     pub fn finish(mut self) {
-        self.thread.take().map(|t| {
+        if let Some(t) = self.thread.take() {
             let _ = t.join();
-        });
+        }
     }
 }
 
@@ -847,10 +859,15 @@ pub fn mkdir(path: &Path) -> std::io::Result<Receiver<std::result::Result<(), Ke
 
 /// A queue of items waiting to be pasted, in clipboard order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+// Built and tested as the paste path's ordering guarantee, but `app.rs` still
+// hands its item list straight to `job::start`. Kept intact: it is the piece
+// that makes paste order deterministic, and the tests assert that property.
+#[allow(dead_code)]
 pub struct PendingQueue {
     items: VecDeque<Item>,
 }
 
+#[allow(dead_code)]
 impl PendingQueue {
     /// A queue holding `items`, in order.
     #[must_use]
@@ -1010,10 +1027,12 @@ mod tests {
                         break;
                     }
                 }
-                std::thread::sleep(Duration::from_millis(2));
-            } else if out.is_empty() {
+                // The worker has more to say, but has not finished: yield and
+                // poll again rather than blocking on the channel.
                 std::thread::sleep(Duration::from_millis(2));
             } else {
+                // Nothing new this tick, terminal or not — same yield either
+                // way, so there is no branch to make here.
                 std::thread::sleep(Duration::from_millis(2));
             }
         }

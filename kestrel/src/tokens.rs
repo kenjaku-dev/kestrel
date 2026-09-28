@@ -1724,6 +1724,11 @@ pub mod component {
     /// up on the theme, not a primitive; `status.danger-solid` is already the
     /// right name and re-deriving a hex here would break the three-layer rule.
     #[must_use]
+    // The SCREAMING_CASE matches the `dialog.*` spec token it carries, which is
+    // the naming convention for every other item in this §4.7 block. Snake case
+    // would make these two functions the odd ones out in a list that is
+    // otherwise a direct transcription of the spec table.
+    #[allow(non_snake_case)]
     pub fn DIALOG_BTN_DESTRUCTIVE_BG(theme: &super::Theme) -> Color32 {
         theme.status.danger_solid
     }
@@ -1735,6 +1740,7 @@ pub mod component {
     /// token that invents a hex when one is missing is exactly the failure the
     /// three-layer rule exists to prevent.
     #[must_use]
+    #[allow(non_snake_case)]
     pub fn DIALOG_BTN_DESTRUCTIVE_BG_HOVER(theme: &super::Theme) -> Color32 {
         theme.status.danger_hover
     }

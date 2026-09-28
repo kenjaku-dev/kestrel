@@ -234,12 +234,14 @@ impl Inline {
 
     /// The byte range the seed selected, as `(start, end)` char offsets.
     #[must_use]
+    #[allow(dead_code)]
     pub fn selection(&self) -> (usize, usize) {
         (0, stem_of(&self.original_name).chars().count())
     }
 
     /// The current problems, blocking and warning alike.
     #[must_use]
+    #[allow(dead_code)]
     pub fn problems(&self) -> Vec<Problem> {
         validate(&self.draft)
     }
@@ -252,6 +254,7 @@ impl Inline {
 
     /// The first warning, which does not block.
     #[must_use]
+    #[allow(dead_code)]
     pub fn warning(&self) -> Option<String> {
         self.problems()
             .into_iter()

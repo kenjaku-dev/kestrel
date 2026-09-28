@@ -98,7 +98,6 @@ impl Clipboard {
     /// Order is the `BTreeSet`'s, so a paste is deterministic. A file manager
     /// whose paste order depended on hash iteration would be untestable and would
     /// move files in a different order on every run.
-    #[must_use]
     pub fn paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.paths.iter()
     }
