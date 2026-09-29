@@ -245,6 +245,96 @@ struct Pending {
     items: Vec<Item>,
 }
 
+/// A job the user replaced before it ended: cancelled, still draining.
+///
+/// Carries the progress snapshot from the moment of replacement so the terminal
+/// event can be reported with exact numbers — `JobEvent::Cancelled` knows
+/// `done` but not `total`, and the live [`JobProgress`] already belongs to the
+/// newer job.
+#[derive(Debug)]
+struct RetiredJob {
+    /// The cancelled handle. Never dropped on the frame thread: see
+    /// [`detach_job`].
+    handle: JobHandle,
+    /// Progress as last observed, updated by each reap's drain.
+    progress: JobProgress,
+}
+
+/// Joins a finished job handle off the frame thread.
+///
+/// `JobHandle::drop` joins, so even a handle whose worker has already sent its
+/// terminal event must not be dropped where a frame is being built: the join
+/// waits for thread exit, and thread exit is the worker's business, not the
+/// frame's. The reaper is one transient thread per finished job — jobs end
+/// rarely, and a parked-forever thread would be the worse trade.
+///
+/// If the spawn itself fails the closure (and the handle with it) is dropped
+/// inline: one hitched frame rather than a leaked worker thread.
+fn detach_job(handle: JobHandle) {
+    if std::thread::Builder::new()
+        .name("kestrel-reap".to_string())
+        .spawn(move || handle.finish())
+        .is_err()
+    {
+        log::warn!("job: could not spawn a reaper; joined on the frame thread");
+    }
+}
+
+/// Drops a replaced watcher off the frame thread.
+///
+/// `DirWatcher::drop` joins the debouncer thread, which can sleep up to one
+/// 25 ms poll before it notices the cancel flag — a hitch the frame loop must
+/// never take. Same spawn-failure trade as [`detach_job`]: the closure owns
+/// the subscription, so a failed spawn drops it inline rather than leaking the
+/// inotify watch.
+fn retire_watch(sub: WatchSubscription) {
+    if std::thread::Builder::new()
+        .name("kestrel-reap".to_string())
+        .spawn(move || drop(sub))
+        .is_err()
+    {
+        log::warn!("watch: could not spawn a reaper; joined on the frame thread");
+    }
+}
+
+/// The status-bar line for a replaced job's ending.
+///
+/// Short, because the status bar at 500px is already carrying an item count, a
+/// path and a free-space meter: the numbers are what the job actually did, not
+/// what it was asked to do.
+fn report_retired(progress: &JobProgress, event: &JobEvent) -> String {
+    match event {
+        JobEvent::Cancelled { done, bytes } => {
+            let mut line = format!(
+                "Stopped {}",
+                job::summary(progress.op, *done, progress.total)
+            );
+            if *bytes > 0 {
+                line.push_str(&format!(" · {}", format::bytes(*bytes)));
+            }
+            line
+        }
+        JobEvent::Done { done, .. } => {
+            // The cancel landed after the last byte: the job finished, and
+            // saying "Stopped" about it would be the lie in the other direction.
+            format!(
+                "{} — finished after a newer job started",
+                job::summary(progress.op, *done, progress.total)
+            )
+        }
+        JobEvent::Failed { message, .. } => {
+            format!(
+                "{} — failed: {message}",
+                job::summary(progress.op, progress.done, progress.total)
+            )
+        }
+        _ => format!(
+            "Stopped {}",
+            job::summary(progress.op, progress.done, progress.total)
+        ),
+    }
+}
+
 /// A running job's progress, for the status bar and the progress dialog.
 ///
 /// The clock is started when the job is, not when the first item lands, so the
@@ -537,6 +627,26 @@ pub struct KestrelApp {
     /// handle and not a state: the launch runs on a worker and the only work
     /// per frame is one non-blocking [`kestrel_fs::open::Opening::poll`].
     opening: Option<kestrel_fs::open::Opening>,
+    /// Jobs the user replaced before they ended.
+    ///
+    /// A replaced job is cancelled but **not** joined here — [`JobHandle::drop`]
+    /// joins, so dropping it on the frame thread would block for the length of
+    /// the in-flight work. Retired jobs are drained every frame in
+    /// [`KestrelApp::pump_job`]; once a terminal event has been observed the
+    /// handle moves to a reaper thread for the join, and the job is reported
+    /// as a "Stopped" status-bar line rather than discarded silently (§7.16).
+    retired_jobs: Vec<RetiredJob>,
+    /// What a replaced job reported when it ended, with when it ended.
+    ///
+    /// Rendered in the status bar until it ages out (twenty seconds) — long
+    /// enough to read, short enough not to become stale furniture.
+    stopped_note: Option<(String, Instant)>,
+    /// Row count the Kind column was last computed for.
+    ///
+    /// [`KestrelApp::pump_columns`] samples the whole listing, so it only runs
+    /// when the count changed rather than on every frame of a 50,000-row
+    /// directory.
+    kind_rows: usize,
 }
 
 impl KestrelApp {
@@ -577,6 +687,13 @@ impl KestrelApp {
         }
         let theme = Theme::resolve(opts.theme, system_dark.or(Some(theme.is_dark)));
         theme.apply(&cc.egui_ctx);
+        // egui's built-in id-instability check, debug builds only: fires when
+        // the same screen rect is claimed by different widget `Id`s across
+        // passes. A diagnostic, not a fix — findings are reported, not
+        // silenced.
+        #[cfg(debug_assertions)]
+        cc.egui_ctx
+            .all_styles_mut(|s| s.debug.warn_if_rect_changes_id = true);
         Self::assemble(opts, theme, stored)
     }
 
@@ -593,6 +710,10 @@ impl KestrelApp {
         // screenshot that changes colour with the hour is not reviewable.
         let theme = Theme::resolve(opts.theme, Some(true));
         theme.apply(&ctx);
+        // Same id-instability diagnostic as `new`: a capture that silently
+        // reuses one rect for two widget ids reviews a layout bug as a theme.
+        #[cfg(debug_assertions)]
+        ctx.all_styles_mut(|s| s.debug.warn_if_rect_changes_id = true);
         // Defaults, never the stored state: a capture must be reproducible, and
         // a screenshot that changed colour because a preferences file did is
         // not reviewable. `--light`/`--dark` is how a capture picks a theme.
@@ -651,6 +772,9 @@ impl KestrelApp {
             space: SpaceProbe::new(),
             job: None,
             job_progress: None,
+            retired_jobs: Vec::new(),
+            stopped_note: None,
+            kind_rows: 0,
             pending: None,
             modal: None,
             modal_focus: 0,
@@ -924,17 +1048,21 @@ impl KestrelApp {
     pub fn open_dir(&mut self, dir: PathBuf) {
         // §4.11: navigating away abandons the in-flight walk. Cancelling first
         // means the worker stops *before* the next drain rather than after it.
-        // `finish` also joins the thread — dropping the handle would only detach
-        // it, and repeated clicking would accumulate a thread per click.
+        //
+        // The old scan is cancelled and *detached*, never joined here:
+        // `ScanHandle::drop` only sets the cancel flag, so the worker exits on
+        // its own and there is nothing to wait for. Joining (`finish`) would
+        // block the frame for the length of the abandoned walk.
         if let Some(scan) = self.scan.take() {
             scan.cancel();
-            // The summary counts a walk we are abandoning, so keeping it would be
-            // a lie.
-            let _abandoned = scan.finish();
+            drop(scan);
         }
-        // Dropping the `WatchSubscription` stops its debouncer thread
-        // (`DirWatcher::drop` joins it) and releases the inotify watch.
-        self.watch = None;
+        // `WatchSubscription::drop` joins the debouncer thread, so the old
+        // watcher is retired on a reaper thread rather than dropped here —
+        // dropping it inline would hitch the frame for up to one 25 ms poll.
+        if let Some(sub) = self.watch.take() {
+            retire_watch(sub);
+        }
 
         self.dir = dir;
         // A navigation, whatever else it does. The fade starts when the listing
@@ -1082,8 +1210,23 @@ impl KestrelApp {
     /// put the handle back, and it cannot clear `self.scan` from inside itself,
     /// so the handle is taken out for the duration of the drain and restored
     /// only if the walk is unfinished.
+    ///
+    /// Three unrelated jobs lived here behind one early return: the scan drain
+    /// returned before the watcher and the Kind column whenever the scan was
+    /// settled — which is the steady state — so external changes never
+    /// refreshed the list and the Kind column never appeared. Each job is now
+    /// its own method and `pump` runs all three unconditionally.
     fn pump(&mut self) {
-        // 1. The scan.
+        self.pump_scan();
+        self.pump_watch();
+        self.pump_columns();
+    }
+
+    /// The scan drain. Takes the handle for the drain, restores it while the walk
+    /// is unfinished, and drops it once `Complete` arrives — `ScanHandle::drop`
+    /// only sets the cancel flag, so dropping here never joins and never
+    /// blocks the frame.
+    fn pump_scan(&mut self) {
         let Some(scan) = self.scan.take() else {
             return;
         };
@@ -1104,20 +1247,30 @@ impl KestrelApp {
         });
         if finished {
             // The worker sends `Complete` last, so the channel is now empty and
-            // the thread is about to exit.
+            // the thread is about to exit. `ScanHandle::drop` does not join —
+            // the worker exits on its own — so this cannot block the frame.
             drop(scan);
         } else {
             self.scan = Some(scan);
         }
+    }
 
-        // 2. The watcher. `try_recv`, never `recv`: a blocking read here would
-        //    stall the frame loop, which is the one thing this file forbids.
+    /// The watcher drain. `try_recv`, never `recv`: a blocking read here would
+    /// stall the frame loop, which is the one thing this file forbids.
+    fn pump_watch(&mut self) {
         let mut stale = false;
         if let Some(sub) = self.watch.as_ref() {
             while let Ok(event) = sub.try_recv() {
                 match event {
                     WatchEvent::Changed(changes) => stale |= changes.touches(&self.dir),
-                    WatchEvent::Error(err) => log::warn!("watch: {err}"),
+                    // A backend failure mid-watch degrades to the same visible
+                    // manual-refresh affordance as a watch that never started
+                    // (§7.16: never a silent status change) — never just a log
+                    // line the user never sees.
+                    WatchEvent::Error(err) => {
+                        log::warn!("watch: {err}");
+                        self.watch_error = Some(format!("{err}"));
+                    }
                 }
             }
         }
@@ -1127,11 +1280,16 @@ impl KestrelApp {
             // is what stops a `cargo build` from re-listing 400 times.
             let dir = self.dir.clone();
             self.open_dir(dir);
+        }
+    }
+
+    /// The Kind column's justification. Only when the row count changes, so
+    /// a 50,000-row listing is not sampled every frame.
+    fn pump_columns(&mut self) {
+        if self.rows.len() == self.kind_rows {
             return;
         }
-
-        // 3. Recompute the Kind column's justification. Only when the row count
-        //    changes, so a 50,000-row listing is not sampled every frame.
+        self.kind_rows = self.rows.len();
         let mixed =
             columns::listing_is_mixed(self.rows.iter().map(|r| r.entry.kind.is_directory()));
         self.show_kind_column = mixed;
@@ -1237,11 +1395,41 @@ impl KestrelApp {
 
     /// Launches the worker.
     fn start_job(&mut self, op: job::Op, items: Vec<Item>, destination: Option<PathBuf>) {
-        // Replacing a running job cancels it first, so a second paste cannot
-        // leave two workers writing into one directory.
+        // Replacing a running job cancels it — but the old job is **not**
+        // silently discarded. Its handle is retired: the next `pump_job` drains
+        // whatever it still says and reports the ending as a "Stopped"
+        // status-bar line (§7.16: a long operation always reports itself).
+        // Refusing the new job instead would hold explicit user intent hostage
+        // to work the user has already decided to abandon; reporting the old
+        // one keeps both visible.
+        //
+        // The join never happens here: `JobHandle::drop` joins, so dropping —
+        // or `finish`ing — the old handle would block the frame for the length
+        // of the in-flight work. See `detach_job`.
         if let Some(old) = self.job.take() {
             old.cancel();
-            old.finish();
+            if let Some(progress) = self.job_progress.take() {
+                self.retired_jobs.push(RetiredJob {
+                    handle: old,
+                    progress,
+                });
+            } else {
+                // Replaced before its first pump: no progress was ever
+                // published, so there is nothing to report — just join
+                // off-frame.
+                detach_job(old);
+            }
+            // A dialog about the old job must not survive it: answering the
+            // old collision question would write into the *new* job's decision
+            // slot, which its worker would then consume as an answer to a
+            // question nobody asked. `Confirm`/`Failed`/`CannotOpen` are not
+            // job-state dialogs and are left alone.
+            if matches!(
+                self.modal,
+                Some(DlgKind::Collision { .. }) | Some(DlgKind::Progress { .. })
+            ) {
+                self.modal = None;
+            }
         }
         let count = items.len();
         match job::start(op, items, destination) {
@@ -1278,7 +1466,21 @@ impl KestrelApp {
     }
 
     /// Drains the running job, and raises a dialog when it needs an answer.
+    ///
+    /// Also reaps [`Self::retired_jobs`]: replaced jobs are cancelled, not
+    /// forgotten. Every drain here is a `try_recv` loop and every join happens
+    /// on a reaper thread, so this never blocks the frame no matter what the
+    /// workers are doing.
     fn pump_job(&mut self) {
+        self.reap_retired_jobs();
+        // A "Stopped" line is news, not furniture: it ages out on its own.
+        if self
+            .stopped_note
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > std::time::Duration::from_secs(20))
+        {
+            self.stopped_note = None;
+        }
         let Some(mut handle) = self.job.take() else {
             return;
         };
@@ -1408,7 +1610,69 @@ impl KestrelApp {
         if parked || !terminal {
             self.job = Some(handle);
         } else {
-            handle.finish();
+            // The terminal event is the worker's last send on an unbounded
+            // channel, so the thread has already exited or is within a return
+            // epilogue of doing so — but "almost joined" is still a join on
+            // the frame thread, so the handle goes to a reaper instead.
+            detach_job(handle);
+        }
+    }
+
+    /// Drains replaced jobs and reports the ones that have ended.
+    ///
+    /// A retired job whose terminal event has arrived gets its ending told as
+    /// a status-bar line and its handle detached for the join. One that has
+    /// not ended yet stays queued — its worker is cancelled and will get
+    /// there, and holding the handle is what keeps a parked worker's channel
+    /// open until it does.
+    fn reap_retired_jobs(&mut self) {
+        let mut index = 0;
+        while index < self.retired_jobs.len() {
+            let mut terminal: Option<JobEvent> = None;
+            {
+                let retired = &mut self.retired_jobs[index];
+                retired.handle.drain_into(|event| match event {
+                    JobEvent::Started { total } => {
+                        retired.progress.total = total;
+                    }
+                    JobEvent::Item { bytes, skipped, .. } => {
+                        retired.progress.done += 1;
+                        if let Some(b) = bytes {
+                            retired.progress.bytes += b;
+                            *retired.progress.total_bytes.get_or_insert(0) += b;
+                        }
+                        if skipped {
+                            retired.progress.skipped += 1;
+                        }
+                    }
+                    JobEvent::Progress {
+                        total_bytes,
+                        current,
+                        ..
+                    } => {
+                        retired.progress.total_bytes = total_bytes;
+                        retired.progress.current = current;
+                    }
+                    // A collision question for a dead job gets no dialog: the
+                    // worker was cancelled and will take `Cancelled` instead of
+                    // an answer. Answering it here would be worse than
+                    // ignoring it — the answer has nowhere to go.
+                    JobEvent::Collided { .. } => {}
+                    ended @ (JobEvent::Done { .. }
+                    | JobEvent::Cancelled { .. }
+                    | JobEvent::Failed { .. }) => {
+                        terminal = Some(ended);
+                    }
+                });
+            }
+            if let Some(event) = terminal {
+                let retired = self.retired_jobs.remove(index);
+                let line = report_retired(&retired.progress, &event);
+                self.stopped_note = Some((line, Instant::now()));
+                detach_job(retired.handle);
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -2028,17 +2292,11 @@ impl KestrelApp {
             return;
         }
         let path = crate::rename::renamed_path(&self.dir, &inline.draft);
-        if path.exists() {
-            // A name that is already taken is a collision, and this app does not
-            // silently overwrite anything — not even an empty new folder.
-            self.modal = Some(DlgKind::Failed {
-                op: job::Op::Copy,
-                path,
-                reason: "something with that name is already there".to_string(),
-            });
-            self.modal_focus = 0;
-            return;
-        }
+        // No `exists()` check here: that is a `stat(2)` on the frame thread,
+        // on a path that may live on a network mount — and this file's first
+        // rule is that there is no `std::fs` in the render path. The worker
+        // reports an occupied name as `AlreadyExists` anyway, which `pump_mkdir`
+        // turns into the same "already there" dialog one frame later.
         // Off the frame thread, with its answer collected: a `create_dir` on a
         // network mount is not instant, and a create that fails silently is a
         // new folder that never appears and an error the user never sees.
@@ -3883,6 +4141,13 @@ impl KestrelApp {
                     } else if busy {
                         widgets::status_divider(ui, &theme);
                         widgets::status_busy(ui, &theme, "Reading", &frame, self.motion);
+                    }
+
+                    // A replaced job's ending (§7.16: a long operation reports
+                    // itself, even when it is not the operation running now).
+                    if let Some((note, _)) = self.stopped_note.as_ref() {
+                        widgets::status_divider(ui, &theme);
+                        widgets::status_label(ui, &theme, note);
                     }
 
                     // `statusbar.path` — `type.meta`, `text.secondary`, left,

@@ -59,6 +59,9 @@ fn minimal_app() -> KestrelApp {
         space: SpaceProbe::new(),
         job: None,
         job_progress: None,
+        retired_jobs: Vec::new(),
+        stopped_note: None,
+        kind_rows: 0,
         pending: None,
         modal: None,
         modal_focus: 0,
@@ -799,4 +802,190 @@ mod pane_policy {
             assert_eq!(plan(w, true, false, 280.0).preview, Some(false), "{w}");
         }
     }
+}
+
+/// External changes refresh a settled listing, and the Kind column appears.
+///
+/// Regression: `pump` returned early while the scan was settled — which is the
+/// steady state of every directory — so the watcher drain and the Kind-column
+/// recompute never ran again. `F5` kept working (it bypasses `pump`), which is
+/// why nobody noticed the list had gone deaf.
+#[test]
+fn a_settled_listing_still_hears_the_watcher() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("a.txt"), b"a").expect("write");
+    std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
+    let mut app = KestrelApp::assemble(
+        Options {
+            start_dir: Some(dir.path().to_path_buf()),
+            ..Options::default()
+        },
+        Theme::dark(),
+        settings::Stored::default(),
+    );
+    // Settle the initial scan, bounded: a test must not hang if a worker wedges.
+    let mut settled = false;
+    for _ in 0..500 {
+        app.pump();
+        if app.is_listed() {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(settled, "the initial scan must settle");
+    // One more pump with no scan in flight: the watcher and the columns must
+    // run anyway — this is the frame the old early return skipped.
+    app.pump();
+    let before = app.rows.len();
+    assert!(before >= 2, "the fixture must have listed, got {before}");
+    // Mixed files and directories earn the Kind column — recomputed after the
+    // scan settled, which the early return never reached.
+    assert!(
+        app.show_kind_column,
+        "a mixed listing earns the Kind column, even with no scan in flight"
+    );
+
+    // An external change: a file this app did not create.
+    std::fs::write(dir.path().join("b.txt"), b"b").expect("write");
+    // Bounded polls past the engine's 250 ms debounce: the watcher must
+    // notice, `pump_watch` must re-list, and the rows must grow.
+    let mut grown = false;
+    for _ in 0..400 {
+        app.pump();
+        if app.rows.len() > before {
+            grown = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        grown,
+        "the watcher must refresh a settled listing (rows stayed at {before})"
+    );
+}
+
+/// Starting a second operation reports the first instead of dropping it — and
+/// joins nothing on the frame thread.
+///
+/// The replaced job is cancelled and retired; its terminal event becomes a
+/// "Stopped" status-bar line (§7.16), and every join happens on a reaper
+/// thread. The mechanism is asserted structurally — handle counts and bounded
+/// polls — not by timing a wall clock.
+#[test]
+fn replacing_a_job_reports_the_old_one_without_joining() {
+    let src = tempfile::tempdir().expect("tempdir");
+    let dst = tempfile::tempdir().expect("tempdir");
+    let dst2 = tempfile::tempdir().expect("tempdir");
+    std::fs::write(src.path().join("a.txt"), b"new").expect("write");
+    std::fs::write(dst.path().join("a.txt"), b"old").expect("write");
+    std::fs::write(src.path().join("b.txt"), b"b").expect("write");
+
+    let mut app = minimal_app();
+    // Job A parks on a collision question: deterministic, no timing involved.
+    app.start_job(
+        job::Op::Copy,
+        vec![Item::file(src.path().join("a.txt"), Some(3))],
+        Some(dst.path().to_path_buf()),
+    );
+    let mut asked = false;
+    for _ in 0..500 {
+        app.pump_job();
+        if matches!(app.modal, Some(DlgKind::Collision { .. })) {
+            asked = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(asked, "job A must park on the collision question");
+
+    // Job B replaces it. This call must retire A's handle, not join its
+    // worker: with the old `old.cancel(); old.finish();` this blocked the
+    // frame for the length of the in-flight work.
+    app.start_job(
+        job::Op::Copy,
+        vec![Item::file(src.path().join("b.txt"), Some(1))],
+        Some(dst2.path().to_path_buf()),
+    );
+    assert_eq!(
+        app.retired_jobs.len(),
+        1,
+        "the replaced job is retired for draining, not dropped"
+    );
+    assert!(app.job.is_some(), "the new job is running");
+    // The old collision dialog died with the old job: answering it now would
+    // write into the *new* job's decision slot, which its worker would take as
+    // an answer to a question nobody asked.
+    assert!(
+        !matches!(app.modal, Some(DlgKind::Collision { .. })),
+        "a dialog about the old job must not survive it"
+    );
+
+    // Bounded polls: the retired job's worker observes the cancel, its
+    // terminal event is drained into a "Stopped" line, and the handle leaves
+    // for the reaper thread.
+    let mut reported = false;
+    for _ in 0..1000 {
+        app.pump_job();
+        if app.retired_jobs.is_empty() && app.stopped_note.is_some() {
+            reported = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        reported,
+        "the retired job must be drained, reported and detached"
+    );
+    let (note, _) = app.stopped_note.as_ref().expect("a Stopped line");
+    assert!(note.starts_with("Stopped Copy"), "got {note:?}");
+    assert_eq!(
+        std::fs::read(dst.path().join("a.txt")).expect("read"),
+        b"old",
+        "the cancelled copy must leave the destination alone"
+    );
+}
+
+/// Creating over an occupied name is the worker's verdict, not a `stat`.
+///
+/// Regression: `create_from_field` called `Path::exists()` on the frame
+/// thread — a `stat(2)` on a path that may live on a network mount, reached
+/// from `ui()`. Now the name goes to the `mkdir` worker unconditionally, which
+/// fails with `AlreadyExists` one frame later. So this asserts the synchronous
+/// path says nothing at all, then that the verdict still reaches the user.
+#[test]
+fn create_from_field_sends_an_occupied_name_to_the_worker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("taken")).expect("mkdir");
+    let mut app = minimal_app();
+    app.dir = dir.path().to_path_buf();
+    let mut inline = RenameInline::begin(0, &dir.path().join("taken"));
+    inline.draft = "taken".to_string();
+    app.renaming = Some(inline);
+    app.creating = true;
+    app.create_from_field();
+    assert!(
+        app.mkdir_result.is_some(),
+        "an occupied name must still go to the worker"
+    );
+    assert!(
+        app.modal.is_none(),
+        "no synchronous verdict: the frame thread did not stat"
+    );
+    // And the worker's answer still surfaces, one frame later. A generous
+    // bound: under a fully parallel suite this thread competes with hundreds
+    // of others for scheduling.
+    let mut failed = false;
+    for _ in 0..2000 {
+        app.pump_mkdir();
+        if matches!(app.modal, Some(DlgKind::Failed { .. })) {
+            failed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        failed,
+        "the occupied name must still raise a failure dialog"
+    );
 }
