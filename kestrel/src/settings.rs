@@ -768,8 +768,16 @@ fn checkbox(ui: &mut Ui, theme: &Theme, row: Row<'_>, width: f32, on: &mut bool)
         Sense::click().union(Sense::hover())
     };
     let response = ui.interact(control_rect, id, sense);
-    let box_rect = Rect::from_center_size(
-        control_rect.center(),
+    // Left-aligned in the control column, not centred in it. Every control on
+    // this screen starts at the same x, and that is what makes the column read
+    // as a column: a checkbox centred in a 380px cell is 190px from its label
+    // and 190px from nothing, and it is the one control on the screen whose
+    // left edge did not line up with the segmented control above it.
+    let box_rect = Rect::from_min_size(
+        egui::pos2(
+            control_rect.left(),
+            control_rect.center().y - component::CHECKBOX / 2.0,
+        ),
         vec2(component::CHECKBOX, component::CHECKBOX),
     );
     // §4.10's state priority: `hover` only when the box is idle, so a press
@@ -777,8 +785,8 @@ fn checkbox(ui: &mut Ui, theme: &Theme, row: Row<'_>, width: f32, on: &mut bool)
     let hovered = response.hovered() && !*on;
     if hovered {
         ui.painter().rect_filled(
-            Rect::from_center_size(box_rect.center(), box_rect.size()),
-            radius::all(component::DIALOG_CHECKBOX_RADIUS),
+            box_rect,
+            radius::all(component::CHECKBOX_RADIUS),
             theme.state.hover,
         );
     }
