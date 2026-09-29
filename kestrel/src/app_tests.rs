@@ -39,6 +39,8 @@ fn minimal_app() -> KestrelApp {
         motion: Motion::Full,
         places: Vec::new(),
         dir: PathBuf::from("/r"),
+        nav_fade: None,
+        nav_pending: false,
         rows: Vec::new(),
         expanded: BTreeSet::new(),
         errors: Vec::new(),
@@ -445,4 +447,109 @@ fn margin_rounds_rather_than_truncates() {
     let big = margin(1000.0);
     assert!(big.left >= 0, "a huge margin must not wrap negative");
     assert_eq!(margin(-5.0).left, 0, "a negative margin clamps to 0");
+}
+
+// -- the directory cross-fade ------------------------------------------
+
+/// Runs one frame of the app and returns the app's clock afterwards.
+fn one_frame(app: &mut KestrelApp, at: f64) {
+    let ctx = egui::Context::default();
+    crate::tokens::fonts::install(&ctx);
+    let out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0))),
+            time: Some(at),
+            ..Default::default()
+        },
+        |ui| {
+            app.pump();
+            app.draw(ui);
+        },
+    );
+    out.drop_without_applying_deltas();
+}
+
+/// The fade starts when the **listing** lands, not when the user pressed
+/// Enter, and it is over in 90ms.
+///
+/// Both halves matter and neither is visible in a screenshot: a fade from
+/// the keystroke fades an empty pane and then snaps to the content, and a
+/// fade longer than 90ms is lag on a double-click (§2.11 rule 3).
+#[test]
+fn a_directory_change_fades_in_over_the_specd_duration() {
+    let mut app = minimal_app();
+    // A navigation, with the scan already finished — the steady-state
+    // refresh path, which is the common one.
+    app.nav_pending = true;
+    app.nav_fade = None;
+    one_frame(&mut app, 10.0);
+    let started = app.nav_fade.expect("a navigation should arm the fade");
+    assert!(
+        !app.nav_pending,
+        "the pending flag is consumed exactly once"
+    );
+    // Part-way through: still fading.
+    one_frame(&mut app, 10.045);
+    assert!(
+        app.nav_fade.is_some(),
+        "45ms into a 90ms fade is still fading"
+    );
+    // Past the end: gone, and gone for good.
+    one_frame(&mut app, 10.2);
+    assert!(app.nav_fade.is_none(), "200ms is past motion.fast");
+    one_frame(&mut app, 10.3);
+    assert!(app.nav_fade.is_none(), "and it does not come back");
+    assert!(started <= 10.0);
+}
+
+/// §2.11 rule 5: reduced motion renders the final state immediately, so the
+/// fade never starts at all rather than running at 90ms.
+#[test]
+fn reduced_motion_has_no_directory_fade() {
+    let mut app = minimal_app();
+    app.motion = Motion::Reduced;
+    app.nav_pending = true;
+    one_frame(&mut app, 10.0);
+    assert!(app.nav_fade.is_none());
+    one_frame(&mut app, 10.0);
+    assert!(
+        app.nav_fade.is_none(),
+        "and it must not start on a later frame either"
+    );
+}
+
+/// A frame with no navigation in it never arms a fade, so a plain repaint —
+/// a resize, a hover, a watcher event — does not make the list blink.
+#[test]
+fn only_a_navigation_arms_the_fade() {
+    let mut app = minimal_app();
+    one_frame(&mut app, 10.0);
+    assert!(app.nav_fade.is_none());
+    one_frame(&mut app, 10.05);
+    assert!(app.nav_fade.is_none());
+}
+
+/// §7.13 and §2.11 rule 2: the fade is one `rect_filled` over the list's
+/// own rectangle. Nothing in the paint path may change a row's rect, and the
+/// assertion is that the app's layout state is identical either side of a
+/// fade — a row height that tweened would show up here.
+#[test]
+fn a_fade_does_not_move_anything() {
+    let mut app = minimal_app();
+    app.rows = vec![Row {
+        entry: dir_entry("/r/a.txt"),
+        depth: 0,
+    }];
+    let before = (app.scroll_rows, app.viewport_rows);
+    app.nav_pending = true;
+    one_frame(&mut app, 10.0);
+    one_frame(&mut app, 10.02);
+    let mid = (app.scroll_rows, app.viewport_rows);
+    one_frame(&mut app, 10.5);
+    assert_eq!(mid, before, "a mid-fade frame changed the layout");
+    assert_eq!(
+        (app.scroll_rows, app.viewport_rows),
+        before,
+        "the settled frame differs from the unfaded one"
+    );
 }

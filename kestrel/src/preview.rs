@@ -132,10 +132,35 @@ pub enum Loaded {
         /// `true` when the file was longer than the read cap and was cut.
         truncated: bool,
     },
-    /// Raw image bytes, for the image loaders.
+    /// A **decoded** image, ready to hand to the texture manager.
+    ///
+    /// # Decoded on the worker, not on the frame
+    ///
+    /// This used to carry the encoded bytes and let `app.rs` call
+    /// `egui_extras::image::load_image_bytes` at paint time. That put a full
+    /// PNG decode — inflate, unfilter, colour-convert, for every pixel — inside
+    /// the frame callback, triggered by an arrow key. A 4000x3000 PNG is 48
+    /// megabytes of output from 12 megabytes of input and takes 150-400ms; the
+    /// pane froze for that long, every frame, on every arrow press past that
+    /// file, and the "nothing blocks the frame loop" rule this crate is built on
+    /// was being broken by the one file type whose whole point is decoding.
+    ///
+    /// So the worker decodes and the frame only uploads, and
+    /// [`crate::app::KestrelApp::preview_image`] has no decoder in it at all.
+    ///
+    /// # Downscaled here, not at upload
+    ///
+    /// The decoded image is box-filtered down to [`MAX_IMAGE_EDGE`] first, so the
+    /// texture upload is bounded too. A 1 MiB cap on the *encoded* file says
+    /// nothing about the decoded size — a PNG of flat colour compresses to a
+    /// few kilobytes and decodes to 100 megapixels — and the upload is a
+    /// memcpy that would block the frame just as surely as the decode did.
     Image {
-        /// The encoded file, verbatim.
-        bytes: Vec<u8>,
+        /// The decoded pixels, already reduced to the preview's own scale.
+        image: egui::ColorImage,
+        /// The image's size **after** the reduction, so the caller can aspect-fit
+        /// it without re-deriving the scale.
+        size: egui::Vec2,
     },
     /// Too large to open.
     TooLarge {
@@ -633,10 +658,7 @@ fn load(path: &Path, is_image: bool, cancelled: &Arc<AtomicBool>) -> Loaded {
         };
     }
     if is_image {
-        // Hand the encoded bytes to egui's image loaders verbatim. Decoding is
-        // theirs, on their own terms; guessing a container here would be a
-        // second, worse implementation of something that already exists.
-        return Loaded::Image { bytes };
+        return decode_image(&bytes);
     }
     // A NUL byte means binary, and the pane should say so rather than render
     // replacement characters.
@@ -657,6 +679,126 @@ fn load(path: &Path, is_image: bool, cancelled: &Arc<AtomicBool>) -> Loaded {
             reason: "it is not valid UTF-8 text".to_string(),
         },
     }
+}
+
+/// The longest edge, in pixels, a decoded preview image is reduced to.
+///
+/// 1024: a preview pane is at most 360px wide (`settings::PREVIEW_MAX`) on a
+/// screen that might be a HiDPI panel, and the pane *upscales nothing*
+/// ([`crate::app::fit`]). Anything past 1024 is therefore pixels nobody sees,
+/// and on a 4000x3000 source they are 21 megabytes of them.
+pub const MAX_IMAGE_EDGE: u32 = 1024;
+
+/// Decodes `bytes` with egui's own image loaders, then bounds the result.
+///
+/// # The decoder is `egui_extras`' and only `egui_extras`'
+///
+/// Guessing a container here would be a second, worse implementation of
+/// something that already exists, and §5.2 lists far more formats than a
+/// hand-rolled sniffer would get right. The one thing this adds is the size
+/// bound, which no loader does.
+fn decode_image(bytes: &[u8]) -> Loaded {
+    let Ok(image) = egui_extras::image::load_image_bytes(bytes) else {
+        return Loaded::Failed {
+            reason: "it is not an image this build can decode".to_string(),
+        };
+    };
+    let (w, h) = (image.width(), image.height());
+    if w == 0 || h == 0 {
+        return Loaded::Failed {
+            reason: "it is not an image this build can decode".to_string(),
+        };
+    }
+    let longest = w.max(h);
+    if longest <= MAX_IMAGE_EDGE as usize {
+        let size = egui::vec2(w as f32, h as f32);
+        return Loaded::Image { image, size };
+    }
+    let scale = MAX_IMAGE_EDGE as f32 / longest as f32;
+    let (nw, nh) = (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    );
+    Loaded::Image {
+        size: egui::vec2(nw as f32, nh as f32),
+        image: resample(&image, nw, nh),
+    }
+}
+
+/// Box-filters `src` down to `dst_w` x `dst_h`.
+///
+/// # Box, not nearest
+///
+/// Nearest-neighbour on a 4x reduction throws away three quarters of every
+/// source pixel and turns a photo into a mosaic, and a mosaic is the first
+/// thing a user notices about a thumbnail. Averaging the source box each
+/// destination pixel covers is a few more arithmetic ops and it is the only
+/// reduction where a 4000px photo looks like a 1024px photo rather than like
+/// a 1024px mosaic.
+///
+/// The source is RGBA in `ColorImage`; egui's own layout treats that as
+/// premultiplied, and the average of premultiplied values is still premultiplied
+/// over the average coverage, which is the correct answer for transparency.
+fn resample(src: &egui::ColorImage, dst_w: u32, dst_h: u32) -> egui::ColorImage {
+    let sw = src.width();
+    let sh = src.height();
+    // A degenerate source has no pixels to average, and the edge arithmetic
+    // below would produce `x1 == x0` and divide the accumulated sums by zero.
+    // `decode_image` rejects a zero-sized decode before it gets here, so this
+    // is the second line of defence — and it is the one that matters, because a
+    // panic on a worker thread takes the whole process with it and this crate
+    // has no `unwrap` in non-test code for exactly that reason.
+    if sw == 0 || sh == 0 || dst_w == 0 || dst_h == 0 {
+        return egui::ColorImage::filled(
+            [dst_w.max(1) as usize, dst_h.max(1) as usize],
+            egui::Color32::TRANSPARENT,
+        );
+    }
+    let mut out =
+        egui::ColorImage::filled([dst_w as usize, dst_h as usize], egui::Color32::TRANSPARENT);
+    let dp = out.pixels.as_mut_slice();
+    // Integer edges rather than a float per pixel: the source is divided into
+    // exactly `dst_h` bands and each destination pixel averages one, so the
+    // edges cannot drift by a pixel over a 40,000-row reduction.
+    for dy in 0..dst_h {
+        let y0 = (dy as u64 * sh as u64 / dst_h as u64) as usize;
+        let y1 = (((dy as u64 + 1) * sh as u64 / dst_h as u64) as usize)
+            .max(y0 + 1)
+            .min(sh);
+        for dx in 0..dst_w {
+            let x0 = (dx as u64 * sw as u64 / dst_w as u64) as usize;
+            let x1 = (((dx as u64 + 1) * sw as u64 / dst_w as u64) as usize)
+                .max(x0 + 1)
+                .min(sw);
+            let mut acc = [0u32; 4];
+            let mut n = 0u32;
+            for y in y0..y1 {
+                let row = &src.pixels[y * sw..(y + 1) * sw];
+                for p in &row[x0..x1] {
+                    // egui's layout stores `Color32` premultiplied, so a box
+                    // average of the four channels is still premultiplied over
+                    // the average coverage — which is the right answer for
+                    // transparency, and means no demultiply/re-multiply round
+                    // trip per pixel.
+                    acc[0] += u32::from(p.r());
+                    acc[1] += u32::from(p.g());
+                    acc[2] += u32::from(p.b());
+                    acc[3] += u32::from(p.a());
+                    n += 1;
+                }
+            }
+            // `n >= 1`: `y1 > y0` and `x1 > x0` by construction, and both are
+            // clamped into range, so the division is never by zero.
+            let idx = (dy as usize) * (dst_w as usize) + dx as usize;
+            dp[idx] = egui::Color32::from_rgba_premultiplied(
+                (acc[0] / n) as u8,
+                (acc[1] / n) as u8,
+                (acc[2] / n) as u8,
+                (acc[3] / n) as u8,
+            );
+        }
+    }
+    out
 }
 
 /// Reads up to `cap` bytes, stopping early if cancelled.
@@ -870,8 +1012,13 @@ mod tests {
         fs::write(&path, &png).expect("write");
         let cancel = Arc::new(AtomicBool::new(false));
         match load(&path, true, &cancel) {
-            Loaded::Image { bytes } => {
-                assert_eq!(bytes, png.clone(), "the encoded bytes must be verbatim");
+            Loaded::Image { image, size } => {
+                assert_eq!(
+                    (image.width(), image.height()),
+                    (1, 1),
+                    "a 1x1 PNG must decode to one pixel"
+                );
+                assert_eq!(size, egui::vec2(1.0, 1.0));
             }
             other => panic!("expected Image, got {other:?}"),
         }
@@ -881,6 +1028,202 @@ mod tests {
             Loaded::Failed { reason } => assert!(reason.contains("binary"), "{reason}"),
             other => panic!("expected a binary failure, got {other:?}"),
         }
+    }
+
+    // -- image decoding is on the worker -----------------------------------
+
+    /// A large image is reduced before it is handed on, so the *upload* is
+    /// bounded and not just the decode.
+    ///
+    /// The encoded cap is 1 MiB and says nothing about the decoded size: a PNG
+    /// of flat colour is a few kilobytes and 100 megapixels. Uploading that is a
+    /// 400MB memcpy on the frame thread, which blocks exactly as surely as the
+    /// decode did.
+    #[test]
+    fn a_large_image_is_reduced_to_the_preview_edge() {
+        let (w, h) = (3000usize, 2000usize);
+        let big = egui::ColorImage::filled([w, h], egui::Color32::from_rgb(10, 20, 30));
+        // Encode it as a PNG so the test goes through the real decoder rather
+        // than through `resample` directly.
+        let png = encode_png(&big);
+        match decode_image(&png) {
+            Loaded::Image { image, size } => {
+                assert!(image.width() <= MAX_IMAGE_EDGE as usize);
+                assert!(image.height() <= MAX_IMAGE_EDGE as usize);
+                // Aspect ratio preserved, to the pixel.
+                let want_w = (w as f32 * (MAX_IMAGE_EDGE as f32 / w as f32)).round() as usize;
+                assert_eq!(image.width(), want_w, "width");
+                assert_eq!(size, egui::vec2(want_w as f32, image.height() as f32));
+                // And the colour survived, which is what distinguishes a box
+                // average from a nearest-neighbour sample of a flat image.
+                assert_eq!(image.pixels[0], egui::Color32::from_rgb(10, 20, 30));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    /// A small image is passed through **untouched** — no resample, no copy, no
+    /// re-encode — because the pane never upscales and a 64x64 icon decoded at
+    /// 64x64 is already the right size.
+    #[test]
+    fn a_small_image_is_not_touched() {
+        let small = egui::ColorImage::filled([64, 32], egui::Color32::from_rgb(1, 2, 3));
+        match decode_image(&encode_png(&small)) {
+            Loaded::Image { image, size } => {
+                assert_eq!((image.width(), image.height()), (64, 32));
+                assert_eq!(size, egui::vec2(64.0, 32.0));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    /// Bytes that are not an image fail with a reason, on the worker, rather
+    /// than reaching the paint path and being decoded a second time.
+    #[test]
+    fn undecodable_bytes_fail_on_the_worker() {
+        let got = decode_image(b"this is definitely not a png");
+        assert!(
+            matches!(got, Loaded::Failed { .. }),
+            "expected Failed, got {got:?}"
+        );
+    }
+
+    /// A zero-sized source cannot come from a real decoder, and the branch that
+    /// would divide by zero on it is here rather than in the arithmetic.
+    ///
+    /// This one is a real bug the test found, not a hypothetical: the edge
+    /// arithmetic collapsed `x1 == x0`, the pixel count stayed zero, and the
+    /// next line divided by it — on a worker thread, where a panic ends the
+    /// process rather than unwinding into a test failure.
+    #[test]
+    fn a_zero_sized_source_is_not_a_division_by_zero() {
+        let empty = egui::ColorImage::filled([0, 0], egui::Color32::WHITE);
+        let out = resample(&empty, 4, 4);
+        assert_eq!((out.width(), out.height()), (4, 4));
+        assert!(out.pixels.iter().all(|p| *p == egui::Color32::TRANSPARENT));
+        // And a zero destination, which `decode_image` also cannot produce.
+        let small = egui::ColorImage::filled([4, 4], egui::Color32::WHITE);
+        let out = resample(&small, 0, 0);
+        assert_eq!((out.width(), out.height()), (1, 1));
+    }
+
+    /// The end-to-end shape of "the decode happened on the worker".
+    ///
+    /// [`Loader::request`] then [`Loader::poll`] is the whole path, and what
+    /// lands in the channel is already a `ColorImage` — there is no second step
+    /// that could run on the frame thread, because there is no API to run one:
+    /// the encoded bytes are not in the message at all.
+    #[test]
+    fn the_loader_delivers_pixels_not_bytes() {
+        let dir = tmp();
+        let path = dir.path().join("a.png");
+        let img = egui::ColorImage::filled([8, 8], egui::Color32::from_rgb(200, 100, 50));
+        fs::write(&path, encode_png(&img)).expect("write");
+
+        let mut loader = Loader::new();
+        assert_eq!(loader.request(&path, Some(4096), true), Kind::Image);
+        // Nothing yet: the request is debounced.
+        assert!(loader.poll().is_none());
+        assert!(loader.is_pending());
+
+        let mut out = None;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Some(loaded) = loader.poll() {
+                out = Some(loaded);
+                break;
+            }
+        }
+        let out = out.expect("the worker should have answered by now");
+        match out {
+            Loaded::Image { image, size } => {
+                assert_eq!((image.width(), image.height()), (8, 8));
+                assert_eq!(image.pixels[0], egui::Color32::from_rgb(200, 100, 50));
+                assert_eq!(size, egui::vec2(8.0, 8.0));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        assert!(!loader.is_busy());
+    }
+
+    /// Encodes `image` as a PNG, for the tests above.
+    ///
+    /// A real encoder rather than a hand-built byte string, because the point of
+    /// these tests is that the *decoder* handles what a real encoder produces,
+    /// and a fixture that is 68 bytes of valid PNG exercises a 1x1 case only.
+    fn encode_png(image: &egui::ColorImage) -> Vec<u8> {
+        let [w, h] = [image.width(), image.height()];
+        let mut raw = Vec::with_capacity(h * (1 + w * 4));
+        for y in 0..h {
+            raw.push(0); // filter type: none
+            for x in 0..w {
+                let p = image.pixels[y * w + x];
+                // egui stores premultiplied; a PNG wants straight alpha, and
+                // these fixtures are opaque, so the two agree.
+                raw.extend_from_slice(&[p.r(), p.g(), p.b(), p.a()]);
+            }
+        }
+        // A stored (uncompressed) deflate block: the point is a valid zlib
+        // stream, not a small one, and a test fixture is not a file anyone
+        // ships. The 64 KiB blocks are what a real deflate encoder emits, and
+        // the final block is marked so the stream ends where the data does.
+        let mut idat = vec![0x78, 0x01];
+        let blocks: Vec<&[u8]> = raw.chunks(0xffff).collect();
+        for (i, chunk) in blocks.iter().enumerate() {
+            let last = if i + 1 == blocks.len() { 1u8 } else { 0u8 };
+            idat.push(last);
+            idat.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+            idat.extend_from_slice(&(!(chunk.len() as u16)).to_le_bytes());
+            idat.extend_from_slice(chunk);
+        }
+        idat.extend_from_slice(&adler32(&raw).to_be_bytes());
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+        png_chunk(&mut out, b"IHDR", &ihdr);
+        png_chunk(&mut out, b"IDAT", &idat);
+        png_chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    /// Appends one length-prefixed, CRC'd PNG chunk.
+    fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(kind);
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    }
+
+    /// The CRC-32 PNG uses, over `data`.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for byte in data {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// The Adler-32 a zlib stream ends with.
+    fn adler32(data: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for byte in data {
+            a = (a + u32::from(*byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
     }
 
     /// A missing file fails with a reason rather than panicking.

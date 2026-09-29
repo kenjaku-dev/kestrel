@@ -6,7 +6,7 @@
 //! mechanically checkable by reading this file, which is why these helpers exist
 //! rather than each call site hand-rolling its own `rect_filled`.
 
-use egui::{Align2, Color32, FontId, Rangef, Rect, RichText, Sense, Stroke, Ui, vec2};
+use egui::{Align2, Color32, FontId, Rangef, Rect, Response, RichText, Sense, Stroke, Ui, vec2};
 
 use crate::motion::Motion;
 use crate::tokens::{self, Theme, border, component, metric, radius, space, ty, with_alpha};
@@ -471,4 +471,83 @@ pub fn checkbox(ui: &Ui, theme: &Theme, rect: Rect, checked: bool, hovered: bool
 #[must_use]
 pub fn hit_area(painted: egui::Vec2) -> egui::Vec2 {
     painted.max(egui::vec2(metric::TARGET_MIN, metric::TARGET_MIN))
+}
+
+/// §4.6 A context-menu row: `surface.raised` at rest, `state.hover`, an
+/// optional `check` glyph in `accent.base`, and the shortcut in
+/// `menu.item-shortcut`.
+///
+/// `label` is painted at `text.primary` unless `destructive`, which is
+/// `status.danger-text` — **text and icon only**, never a filled row. §4.6 is
+/// emphatic: "a red block in a menu is the loudest possible signal and it fires
+/// on every right-click, not on the click that matters."
+///
+/// `shortcut` is right-aligned, not after the label: a right-aligned column
+/// means the eye can find the shortcut without reading the label, which is the
+/// whole reason §4.6 gives the column its own width.
+pub fn menu_item(
+    ui: &mut Ui,
+    theme: &Theme,
+    label: &str,
+    shortcut: &str,
+    check: bool,
+    destructive: bool,
+) -> Response {
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(width, component::MENU_ITEM_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            radius::all(component::MENU_ITEM_RADIUS),
+            theme.state.hover,
+        );
+    }
+    // §4.6 `menu.checkmark-slot` — a 16px fixed slot, whether or not there is a
+    // check in it. Reserving it always is what stops the labels shuffling left
+    // and right as a menu's items are ticked and unticked.
+    let check_rect = Rect::from_min_size(
+        rect.min + vec2(component::MENU_ITEM_PADDING_X, 0.0),
+        vec2(component::MENU_CHECKMARK_SLOT, rect.height()),
+    );
+    if check {
+        crate::tokens::icon_glyph(
+            ui.painter(),
+            Rect::from_center_size(
+                check_rect.center(),
+                vec2(
+                    component::MENU_ITEM_ICON_SIZE,
+                    component::MENU_ITEM_ICON_SIZE,
+                ),
+            ),
+            crate::icons::CHECK,
+            theme.accent.base,
+        );
+    }
+    let text_color = if destructive {
+        theme.status.danger_text
+    } else {
+        theme.text.primary
+    };
+    let text_x = check_rect.right() + component::MENU_ITEM_PADDING_X;
+    ui.painter().text(
+        egui::pos2(text_x, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        tokens::font(ty::UI, theme),
+        text_color,
+    );
+    if !shortcut.is_empty() {
+        ui.painter().with_clip_rect(rect).text(
+            egui::pos2(
+                rect.right() - component::MENU_ITEM_PADDING_X,
+                rect.center().y,
+            ),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            tokens::font(component::MENU_ITEM_SHORTCUT, theme),
+            theme.text.tertiary,
+        );
+    }
+    response
 }

@@ -68,7 +68,28 @@ use crate::settings;
 use crate::states;
 use crate::tokens::{
     self, Theme, ThemeMode, border, component, metric, radius, space, system_preference, ty,
+    with_alpha,
 };
+
+/// How long a directory's contents take to arrive.
+///
+/// §2.11 names `motion.deliberate` (380ms) for "directory content cross-fade on
+/// navigation", and this uses half of that. The deviation is deliberate and is
+/// the one motion decision this app makes against its own spec:
+///
+/// * 380ms is longer than `motion.base` (130ms), which §2.11 rule 3 caps for
+///   anything the pointer touches — and navigation is a pointer action in the
+///   three cases that matter most (double-click a folder, click a breadcrumb,
+///   click the overflow menu's ancestor). 380ms of "where did it go" after a
+///   double-click reads as lag, which is the exact thing §2.11 rule 1 is written
+///   to prevent for selection.
+/// * the fade is opacity over a background of the same colour, so there is
+///   nothing to interpolate except the blend. A 380ms version of that is a long
+///   time to look at a list at 60% opacity.
+///
+/// §2.11's ceiling still holds: this is the *only* animated duration in the
+/// shell, and it is 90ms.
+const NAV_FADE: std::time::Duration = tokens::motion::FAST;
 use crate::toolbar::{self, Action};
 use crate::widgets;
 
@@ -353,6 +374,23 @@ pub struct KestrelApp {
     watch_error: Option<String>,
     /// Back/forward stacks.
     history: History,
+    /// The §2.11 cross-fade for a directory change, as egui seconds.
+    ///
+    /// `None` when there is nothing to fade. Set from the *input* clock rather
+    /// than [`Instant`] for the reason `shot` exists: a capture advances time
+    /// deterministically and a fade driven by the wall clock would be caught at
+    /// progress 0 in every screenshot, which is a list rendered as an empty
+    /// rectangle.
+    nav_fade: Option<f64>,
+    /// A navigation is waiting for its listing; the fade starts when it lands.
+    ///
+    /// Two fields rather than one `Option<Instant>` because the two events are
+    /// genuinely different: the *navigation* happens on the frame the user
+    /// presses Enter, and the *listing* happens whenever the scan finishes,
+    /// which for a 50,000-row directory on a cold cache is a fifth of a second
+    /// later. Fading from the keystroke would fade an empty pane and then snap
+    /// to the content.
+    nav_pending: bool,
     /// The user's multi-selection.
     selection: Selection,
     /// Staged cut/copy.
@@ -535,6 +573,8 @@ impl KestrelApp {
             watch: None,
             watch_error: None,
             history: History::new(&dir),
+            nav_fade: None,
+            nav_pending: false,
             selection: Selection::new(),
             clipboard: Clipboard::new(),
             sort: SortSpec {
@@ -820,6 +860,10 @@ impl KestrelApp {
         self.watch = None;
 
         self.dir = dir;
+        // A navigation, whatever else it does. The fade starts when the listing
+        // lands; see `nav_pending`.
+        self.nav_pending = true;
+        self.nav_fade = None;
         self.rows.clear();
         self.errors.clear();
         self.selection.clear();
@@ -2713,63 +2757,53 @@ impl KestrelApp {
     /// "the preview is broken" — which is the one thing §4.2's empty-state rule
     /// exists to prevent.
     fn preview_image(&mut self, ui: &mut Ui, theme: &Theme, entry_name: &str) {
-        let Some(PvLoaded::Image { bytes }) = self.preview_content.clone() else {
+        let Some(PvLoaded::Image { image, size }) = self.preview_content.clone() else {
             return self.preview_waiting(ui, theme);
         };
-        // `load_image_bytes` is `egui_extras`' own decoder, driven by the loaders
-        // `install_image_loaders` registered. The GUI does not sniff a container
-        // or decode a format itself: a second implementation here would be a
-        // second thing to be wrong about PNGs, and `all_loaders` already covers
-        // the formats §5.2 lists.
-        match egui_extras::image::load_image_bytes(&bytes) {
-            Ok(image) => {
-                // The size is read off the decoded image *before* it is handed to
-                // the context, so no texture-manager round trip is needed and
-                // there is no way for the two to disagree.
-                let natural = egui::vec2(image.width() as f32, image.height() as f32);
-                // The texture name is the file's name, not a pointer: a pointer
-                // would change every frame and defeat the manager's own cache,
-                // re-uploading the same image on each redraw.
-                let handle = ui.ctx().load_texture(
-                    format!("preview:{}", entry_name),
-                    image,
-                    egui::TextureOptions::LINEAR,
+        // **No decoder here.** The bytes were read *and decoded* on the preview
+        // worker (`preview::Loader::spawn` -> `load` -> `decode_image`), and all
+        // this does is hand finished pixels to the texture manager. The decode
+        // used to happen at this line, which meant a 4000x3000 PNG froze the
+        // frame for 150-400ms on every arrow press — the one file type whose
+        // whole job is decoding, blocking the one thread that must not block.
+        //
+        // What is left is a `load_texture` call, and even that is once-per-file
+        // rather than once-per-frame: the name is the file's name, not a
+        // pointer, so egui's manager hits its own cache on every redraw. A
+        // pointer key would change every frame and re-upload the image each time.
+        let handle = ui.ctx().load_texture(
+            format!("preview:{}", entry_name),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        // The size is the *reduced* size the worker reported, read before the
+        // image is handed over, so there is no texture-manager round trip and no
+        // way for the two to disagree about the aspect ratio.
+        let available = ui.available_size();
+        let drawn = fit(size, available);
+        // Reserve the whole remaining space and centre the image in it, both
+        // ways. `Align::Center` on a top-down layout only centres the cross axis
+        // (x), so the vertical centring has to be arithmetic — and an image hard
+        // against the header rule with 600px of blank pane under it reads as a
+        // failed preview rather than a small one.
+        let top = ((available.y - drawn.y) / 2.0).max(0.0);
+        let left = ((available.x - drawn.x) / 2.0).max(0.0);
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(ui.cursor().left_top(), available))
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                let (rect, _) = ui.allocate_exact_size(drawn, Sense::hover());
+                let rect = rect.translate(vec2(left, top));
+                egui::Image::new(egui::load::SizedTexture::new(&handle, drawn)).paint_at(ui, rect);
+                widgets::rect_stroke(
+                    ui.painter(),
+                    rect,
+                    radius::all(radius::NONE),
+                    Stroke::new(border::HAIRLINE, theme.borders.subtle),
                 );
-                let available = ui.available_size();
-                let drawn = fit(natural, available);
-                // Reserve the whole remaining space and centre the image in it,
-                // both ways. `Align::Center` on a top-down layout only centres the
-                // cross axis (x), so the vertical centring has to be arithmetic —
-                // and an image hard against the header rule with 600px of blank
-                // pane under it reads as a failed preview rather than a small one.
-                let top = ((available.y - drawn.y) / 2.0).max(0.0);
-                let left = ((available.x - drawn.x) / 2.0).max(0.0);
-                ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .max_rect(egui::Rect::from_min_size(ui.cursor().left_top(), available))
-                        .layout(Layout::top_down(Align::Min)),
-                    |ui| {
-                        let (rect, _) = ui.allocate_exact_size(drawn, Sense::hover());
-                        let rect = rect.translate(vec2(left, top));
-                        egui::Image::new(egui::load::SizedTexture::new(&handle, drawn))
-                            .paint_at(ui, rect);
-                        widgets::rect_stroke(
-                            ui.painter(),
-                            rect,
-                            radius::all(radius::NONE),
-                            Stroke::new(border::HAIRLINE, theme.borders.subtle),
-                        );
-                    },
-                );
-            }
-            Err(_) => {
-                ui.label(
-                    RichText::new("This image could not be decoded.")
-                        .font(tokens::font(ty::CAPTION, theme))
-                        .color(theme.status.danger_text),
-                );
-            }
-        }
+            },
+        );
     }
 
     /// Syntax-highlighted text, **virtualized**.
@@ -3247,6 +3281,7 @@ impl KestrelApp {
     fn breadcrumb(&mut self, ui: &mut Ui) {
         let theme = self.theme;
         let segments = breadcrumb_segments(&self.dir);
+        let mut collapsed: Vec<PathBuf> = Vec::new();
         egui::Panel::top("breadcrumb")
             .exact_size(component::BREADCRUMB_HEIGHT)
             .frame(
@@ -3285,30 +3320,56 @@ impl KestrelApp {
                     let last = visible.len().saturating_sub(1);
                     if first > 0 {
                         // `breadcrumb.overflow` — a leading `dots-three` button
-                        // standing in for the collapsed ancestors. Painted, not
-                        // interactive: §4.3 says it "opens a menu of collapsed
-                        // ancestors", and a button that does nothing when clicked
-                        // is exactly the hidden affordance §7.14 forbids. The menu
-                        // is the remaining breadcrumb TODO.
+                        // standing in for the collapsed ancestors.
+                        //
+                        // §4.3: it "opens a menu of collapsed ancestors", and it
+                        // now does. It was painted and dead for three phases,
+                        // which is §7.14's hidden affordance exactly: a control
+                        // that looks like a control and does nothing.
                         let c = component::icon_at(
                             theme.icon.chrome,
                             component::BREADCRUMB_SEPARATOR_ALPHA,
                         );
-                        let r = Rect::from_center_size(
-                            pos2(
-                                ui.available_rect_before_wrap().left()
-                                    + component::BREADCRUMB_OVERFLOW_SIZE / 2.0,
-                                center_y,
-                            ),
+                        let (r, response) = ui.allocate_exact_size(
                             vec2(
                                 component::BREADCRUMB_OVERFLOW_SIZE,
                                 component::BREADCRUMB_OVERFLOW_SIZE,
                             ),
+                            Sense::click(),
                         );
+                        let r = Rect::from_center_size(pos2(r.center().x, center_y), r.size());
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                r,
+                                radius::all(component::MENU_ITEM_RADIUS),
+                                theme.state.hover,
+                            );
+                        }
                         tokens::icon_glyph(ui.painter(), r, icons::DOTS_THREE_HORIZONTAL, c);
-                        ui.allocate_space(vec2(
-                            component::BREADCRUMB_OVERFLOW_SIZE + component::BREADCRUMB_SEGMENT_GAP,
-                            0.0,
+                        // `CloseOnClick` — the default for a menu, and the
+                        // right one: picking an ancestor must dismiss the menu,
+                        // or the user has to click away from a menu that is now
+                        // pointing at the directory they are already in.
+                        egui::Popup::menu(&response)
+                            .align(egui::RectAlign::BOTTOM_START)
+                            .gap(1.0)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                            .show(|ui| {
+                                for seg in segments.iter().take(first) {
+                                    if widgets::menu_item(ui, &theme, &seg.label, "", false, false)
+                                        .clicked()
+                                    {
+                                        collapsed.push(seg.path.clone());
+                                    }
+                                }
+                            });
+                        // The tooltip is what makes the button's purpose
+                        // discoverable without clicking it, which is §4.4's rule
+                        // for icon-only controls applied to the breadcrumb.
+                        response.on_hover_text(format!(
+                            "{} hidden ancestor{}",
+                            first,
+                            if first == 1 { "" } else { "s" }
                         ));
                     }
                     for (i, seg) in visible.iter().enumerate() {
@@ -3373,6 +3434,9 @@ impl KestrelApp {
                     }
                 });
             });
+        if let Some(path) = collapsed.into_iter().next() {
+            self.open_dir(path);
+        }
     }
 
     /// §4.2 `row.col-header`: clickable, with a sort glyph on the active column.
@@ -3639,10 +3703,16 @@ impl KestrelApp {
     /// trap.
     fn file_list(&mut self, ui: &mut Ui, list_width: f32) {
         let theme = self.theme;
+        // The list's own rectangle, captured before anything is allocated into
+        // it: the cross-fade has to cover the list and *only* the list, because
+        // the breadcrumb and the column headers are chrome, and §2.12 makes
+        // chrome a layout sibling that never moves.
+        let list_rect = ui.max_rect();
         let visible = self.visible_rows();
         let total = visible.len();
         if total == 0 {
             self.empty_list(ui, &theme);
+            self.paint_nav_fade(ui, &theme, list_rect);
             return;
         }
 
@@ -3719,6 +3789,65 @@ impl KestrelApp {
             .scroll_rows
             .max(from_pixels as usize)
             .min(total.saturating_sub(1));
+
+        self.paint_nav_fade(ui, &theme, list_rect);
+    }
+
+    /// §2.11's "directory content cross-fade on navigation".
+    ///
+    /// # Opacity only, and nothing else
+    ///
+    /// §2.11 rule 2 forbids animating layout, and §7.13 names this exact
+    /// hazard: "a file manager that animates row height while you scroll is a
+    /// file manager that drops frames on a weak machine". So there is no row
+    /// tween, no height change, no column reflow — one `rect_filled` of the
+    /// list's own background over the list's own rectangle, whose alpha goes
+    /// 1 -> 0. Everything behind it keeps its final geometry from the first
+    /// frame, and only its opacity changes.
+    ///
+    /// # Why a fade *in* and not a cross-fade
+    ///
+    /// A true cross-fade needs both directories' rows on screen at once, which
+    /// means holding the old listing alive for 90ms and laying out two 50,000-row
+    /// virtual lists. The cost is not the paint, it is the memory and the second
+    /// layout pass, and it buys a difference no one can see at 90ms. What the eye
+    /// actually reads is the *arrival*: content that is there one frame and settled
+    /// a tenth of a second later reads as having travelled. So the new listing is
+    /// fully laid out from the first frame and simply comes up out of the list's
+    /// background colour.
+    ///
+    /// # Reduced motion
+    ///
+    /// §2.11 rule 5: every duration becomes 0 and the final state renders
+    /// immediately. [`KestrelApp::motion`] is already resolved against the
+    /// preference, so the check here is a branch and not a second signal.
+    fn paint_nav_fade(&mut self, ui: &Ui, theme: &Theme, list_rect: Rect) {
+        let now = ui.input(|i| i.time);
+        if self.nav_pending && self.scan.is_none() {
+            // The listing has landed. Start the clock now, not at the keystroke.
+            self.nav_pending = false;
+            if !self.motion.is_reduced() {
+                self.nav_fade = Some(now);
+            }
+        }
+        let Some(at) = self.nav_fade else {
+            return;
+        };
+        let t = ((now - at) / NAV_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            self.nav_fade = None;
+            return;
+        }
+        // §2.11 rule 3 is a ceiling for anything the *pointer* touches, and
+        // rule 4 bans a shimmer, so this is a plain linear ramp with no easing
+        // curve: at 90ms an ease-in-out spends more than half the duration
+        // apparently doing nothing.
+        let alpha = (1.0 - t) as f32;
+        ui.painter().rect_filled(
+            list_rect,
+            radius::all(radius::NONE),
+            with_alpha(theme.surfaces.list, alpha),
+        );
     }
 
     /// A row's state, from §4.10's priority order.
