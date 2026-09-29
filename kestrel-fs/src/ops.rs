@@ -539,7 +539,7 @@ fn copy_recursive(
         }
     }
 
-    copy_file_contents(src, dst)?;
+    copy_file_contents(src, dst, cancel)?;
     if options.preserve_permissions {
         let _ = std::fs::set_permissions(dst, metadata.permissions());
     }
@@ -547,11 +547,20 @@ fn copy_recursive(
 }
 
 /// Copies bytes, then best-effort timestamps.
-fn copy_file_contents(src: &Path, dst: &Path) -> Result<()> {
+///
+/// Checks `cancel` after every chunk, so a single large file is interruptible:
+/// without this the per-file check in [`copy_recursive`] only fires *between*
+/// files, and cancelling a 4 GB copy does nothing for the length of that file.
+/// The destination is left partial, per [`CopyOptions::cancel`]'s contract —
+/// cleanup is the caller's job, not this function's.
+fn copy_file_contents(src: &Path, dst: &Path, cancel: &CancellationToken) -> Result<()> {
     let mut reader = std::fs::File::open(src).map_err(|e| classify_io(src, e))?;
     let mut writer = std::fs::File::create(dst).map_err(|e| classify_io(dst, e))?;
     let mut buffer = vec![0u8; COPY_BUFFER];
     loop {
+        if cancel.is_cancelled() {
+            return Err(KestrelError::Cancelled);
+        }
         let read = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
@@ -889,6 +898,92 @@ mod tests {
         .expect_err("cancelled");
         assert!(matches!(err, KestrelError::Cancelled), "got {err}");
         assert!(!dst.exists(), "nothing should have been written");
+    }
+
+    #[test]
+    fn cancelling_mid_file_stops_the_copy_and_leaves_a_partial_destination() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc::channel};
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("big.bin");
+        let dst = tmp.path().join("big.bin.copy");
+        // 64 MiB: large enough that the copy spans many 64 KiB chunks, small
+        // enough to write in well under a second on any disk.
+        let chunk = vec![0xABu8; 1024 * 1024];
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&src).expect("create");
+            for _ in 0..64 {
+                f.write_all(&chunk).expect("write");
+            }
+        }
+        let src_len = fs::metadata(&src).expect("stat").len();
+        assert!(src_len > 0);
+
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        // Cancel as soon as the destination has started landing, so the cancel
+        // lands *inside* the chunk loop rather than before it — the pre-cancel
+        // case is already covered by `cancelled_copy_writes_nothing`.
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&started);
+        let dst_probe = dst.clone();
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                if fs::metadata(&dst_probe).is_ok_and(|m| m.len() > 0) {
+                    flag.store(true, Ordering::Relaxed);
+                    worker_token.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let (tx, rx) = channel();
+        let dst_copy = dst.clone();
+        let copier = std::thread::spawn(move || {
+            let result = copy(
+                &src,
+                &dst_copy,
+                CopyOptions {
+                    cancel: Some(token),
+                    ..CopyOptions::default()
+                },
+            );
+            let _ = tx.send(result);
+        });
+
+        // Bounded polls, not a wall clock: the copy must observe the cancel
+        // within a few chunks, never at the end of the file.
+        let mut outcome = None;
+        for _ in 0..10_000 {
+            if let Ok(result) = rx.try_recv() {
+                outcome = Some(result);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = canceller.join();
+        let _ = copier.join();
+        let result = outcome.expect("the copy must notice the cancel promptly");
+        let err = result.expect_err("a mid-file cancel is an error");
+        assert!(
+            matches!(err, KestrelError::Cancelled),
+            "cancelling mid-file must report Cancelled, got {err}"
+        );
+        assert!(
+            started.load(Ordering::Relaxed),
+            "the cancel landed mid-file, not before the copy began"
+        );
+        // The documented contract: a partial destination is left behind for the
+        // caller to clean up or report — here, strictly between empty and whole.
+        let partial = fs::metadata(&dst).expect("partial destination must exist").len();
+        assert!(
+            partial > 0 && partial < src_len,
+            "expected a partial file, got {partial} of {src_len} bytes"
+        );
     }
 
     #[test]
