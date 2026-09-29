@@ -1187,4 +1187,173 @@ What this design deliberately refuses to do. Each entry names a specific, recogn
 
 ---
 
-*End of specification. Every hex, px, ms and weight above is final and directly mappable. The only value requiring a decision at implementation time is the exact Phosphor glyph name for a handful of file-type variants (§5.2 verification note); the silhouette and colour slot are already fixed.*
+## 8. Decisions log
+
+Rulings made **after** §1–§7 were written, against the implementation. Everything above
+this section is the original specification; everything in it is still part of the
+specification; this section is the record of what changed and why. Dated, and ordered so
+the newest ruling is the one you read first when a value surprises you.
+
+**Convention:** `RULED` means the value in §2/§3 above is now the code's. `OPEN` means a
+real problem that has been found, documented, and deliberately not fixed here — because
+fixing it means changing code or changing a token that other pairings depend on, and
+that is the code lane's call to make in the open.
+
+---
+
+### D-1 · 2026-09 · `surface.raised` (dark) is `#2B2824` — RULED
+
+**Ruling.** `surface.raised`'s dark value is `#2B2824`, which is `neutral.800` (§2.1).
+§3.1 has been corrected. This is the one place where the code was right and the text was
+behind, and it is the only such exception.
+
+**What was wrong.** The spec said `#24221F`. That value is not a rung in §2.1's neutral
+ramp — the ramp runs `neutral.700` `#443F39` → `neutral.800` `#2B2824` →
+`neutral.850` `#211F1C`, and `#24221F` sits between the last two without being either.
+So §2.1 had a gap, but the gap was closed by the *existing* rung, not by adding one.
+The code (`kestrel/src/tokens.rs`, `Theme::dark()`, `Surfaces::raised`) binds it to
+`n::N800`, i.e. `#2B2824`, and a stale comment on that line still says `#24221F` — the
+value and the comment disagree with each other, which is exactly the shape of bug a
+transcription-only document can hide.
+
+**Why the code won.** `#2B2824` is what has been contrast-verified *in practice* across
+every dialog, menu, popover and tooltip the app has ever drawn. It is what every overlay
+in the running application has been looked at against, and it is the value the §6.5
+correction pass was run against.
+
+**Why not add a rung instead.** The alternative — inserting `#24221F` as a new rung
+between `neutral.800` and `neutral.850` — was rejected. Adding a rung renumbers the
+ramp, and every pairing that sits on `surface.raised` would have to be re-verified from
+scratch, for a value that is measurably the *worse* surface of the two. Adopting the
+code's value required re-verifying one column of one table (§6.2) and one audit row
+(§6.5 entry 13). The cost asymmetry is the whole argument.
+
+**Consequences, all of which are in the document above:** §3.1's dark cell changed; the
+`raised` column of §6.2 changed in 8 cells; §6.5 entry 13 was re-verified and
+**re-opened as entry 14**; the §6.2 `text.disabled` note was invalidated (**D-2**);
+§6.3 and §6.4 were re-verified and are unaffected. The `L` values and the arithmetic are
+in §6.5 so the row can be re-run by hand.
+
+### D-2 · 2026-09 · `text.disabled` on `surface.raised` (dark) is 2.86 — OPEN
+
+**Finding.** §6.2's note claims that "on every surface where a disabled label can
+actually appear, the ratio is 3.09 or better". After D-1 that is false for
+`surface.raised`, where `text.disabled` is **2.86**. It matters because §4.6 puts
+`menu.item-text-disabled` on exactly that surface, so a disabled menu item is where the
+2.86 is actually seen.
+
+**Not fixed here.** The `EXEMPT` verdict stands on its own merits — WCAG 1.4.3 exempts
+inactive components regardless — so this is a documentation-accuracy problem rather than
+a compliance one. The fix that the spec's own logic points at is a second structural
+rule, of the same shape as the first: disabled text never renders on `surface.raised`
+either, which would mean a disabled menu item uses a different, higher-contrast treatment
+than every other disabled label in the app. That is a visible design change and it
+belongs to the code lane and a design decision, not to a documentation edit. Flagged so
+the claim in §6.2 is not read as a resolved one.
+
+### D-3 · 2026-09 · `border.strong` does not clear 3:1 on `surface.raised` — OPEN
+
+**Finding.** §6.4's closing paragraph says every control boundary — naming the dialog
+outline and the menu outline among them — clears 3:1 independently. Both outlines are
+`border.strong`, and `border.strong` measures **2.62** light (`#A79F94` on `#FFFFFF`) and
+**2.70** dark (`#6F6961` on `#2B2824`; it was 2.92 against the superseded `#24221F`).
+The ten rows of the §6.4 table are all correct — none of them claimed `border.strong`,
+because it was never measured.
+
+**Not fixed here.** Two defensible readings and this document will not pick one by
+accident: either the overlay outline is legitimately found by `elev.2`'s shadow and the
+surface's own lightness step rather than by contrast — the same argument §2.10 already
+makes when shadows are unavailable — in which case §6.4's sentence should be rewritten to
+name the shadow rather than the border; or `border.strong` has to move, which is a much
+larger change because it is the dialog outline, the menu outline, the checkbox idle
+border and the sidebar resize handle all at once. Either way it is a design ruling, not
+a typo. Note this predates D-1: the claim was already wrong at 2.92.
+
+### D-4 · 2026-09 · `#24221F` is still an orphan in §2.1 — OPEN
+
+**Finding.** After D-1, `surface.raised` resolves to a real rung. But `#24221F` is still
+the value of `state.hover` (dark) in §3.4, and it is still not a rung in §2.1. It sits
+between `neutral.800` and `neutral.850` and it was measured — it is the background of
+§6.5 entry 10 — so it is a live value, not a leftover.
+
+**Not fixed here.** Adding it as a rung is one line and would close the last gap in the
+layer rule ("semantic tokens reference primitives (§2)"), but it renumbers the bottom of
+the ramp, and entry 10 — and anything else measured against `state.hover` — would want
+re-verifying at the same time. Cheaper to do once, deliberately, with the whole dark
+hover family re-measured, than to do it as a side effect of a documentation change.
+
+### D-5 · 2026-09 · The code is a faithful transcription apart from D-1 — RULED
+
+**Finding.** A mechanical diff of all 96 hex values in §2.1–§3.9 against every hex in
+`kestrel/src/tokens.rs` returns **zero** differences in both directions, and the
+non-colour tables match token for token as well: `metric` (25 constants), `space` (13),
+`radius` (8), `border` (4), `ty` (15 type tokens, all sizes/line-heights/weights/
+tracking), and `motion` (7 durations) are exact. So the three-layer transcription is
+real, not aspirational, and the single colour divergence in the whole system is D-1.
+
+**Why it is recorded.** Because a spec/code diff that finds one problem is the case
+where a future reader is most likely to assume there are more. There are not many; the
+interesting divergences are structural (below), not numeric.
+
+### D-6 · 2026-09 · Six values in the code that §4 has no token for — RULED, documented
+
+Found in `kestrel/src/tokens.rs`'s `component` module. Each is commented in the code as a
+deviation, which is the right call; the gap is that §4 does not know they exist. None of
+them is a colour, so nothing in §6 is affected.
+
+| Code constant | Value | Why it exists | Verdict |
+|---|---|---|---|
+| `ROW_SELECTED_BAR_INSET` | 1 px | §4.2 gives the selection bar "radius 0"; at a 3 px row radius a square bar pokes out of the corner. 1 px is half the bar width — the smallest possible rounding. | **good deviation, keep** — the spec's `radius 0` is unimplementable at a 3 px row radius |
+| `TREE_DISCLOSURE` | 12 px | The tree view's expand caret. Not a §2.9 metric; sized from §5.3's `caret-right` so it reads as part of the icon set. Overflows the 10 px `metric.gutter` by 1 px per side. | **spec gap** — §2.9 needs a `metric.disclosure` |
+| `DIALOG_PROGRESS_BAR_H` | 6 px | §4.7 has no progress row, but `--scene progress` exists. Derived from §4.5's free-space meter at metric height, because the meter's 4 px would be a hairline in a dialog. | **spec gap** — §4.7 needs a progress row |
+| `DIALOG_PATH_QUOTE_H` | 28 px | Derived: §4.7 gives padding 6/8 px around `type.meta`, whose line box is 16 px. | **spec gap** — the arithmetic is in the spec, the answer is not |
+| `DIALOG_BLOCK_HEIGHT` | 340 px | Gallery-only layout rectangle so the §4.7 dialog can be allocated in one call. | **correctly not-a-token** — flagged so nobody "fixes" it into the spec |
+| `DIALOG_BTN_LABEL` | `type.ui-strong` | **§4.7 contradicts itself here.** The row reads `type.ui`, 500 — but §2.8 defines `type.ui` as 13px/**400**. `type.ui-strong` is 13px/500 and matches the row's intent. The code took the one that is actually 500. | **the code is right; §4.7's row should read `type.ui-strong`** |
+
+### D-7 · 2026-09 · Two Phosphor 2.x glyph names differ from §5.2 — RULED
+
+§5.2 names `file-exe` and `dots-three-horizontal`. Both were renamed in Phosphor 2.x, and
+the pinned release vendored into `kestrel/assets/fonts/` is `@phosphor-icons/web` 2.1.2:
+`file-exe` renders as the spec's own documented `terminal` fallback, and
+`dots-three-horizontal` is `dots-three`. Silhouette and colour slot are unchanged, so
+nothing in §6 moves. §5.1's verification note anticipated exactly this; the code keeps
+`ALL.len() == 66` glyphs and asserts every one resolves in the loaded font.
+
+### D-8 · 2026-09 · The preview pane, the tree, and the job model are unspecified — OPEN
+
+`kestrel/src/preview.rs` (1,164 lines), `columns.rs`, `history.rs`, `clipboard.rs`,
+`job.rs`, `selection.rs` and `rename.rs` implement behaviour with **no §4 component
+block**. The two-pane layout is drawn in `app.rs`'s module diagram and the preview pane
+has three capture scenes (`preview-empty`, `preview-text`, `preview-image`,
+`preview-too-large`), but §4 stops at the scrollbar. The tree view has the same problem:
+`--tree` and `TREE_DISCLOSURE` exist, §4.2 mentions "tree mode" in passing
+(`row.indent-step`), and there is no tree component contract.
+
+**Why it is open rather than filed.** Writing a §4 block for the preview pane is design
+work, and this document is not the place to do it speculatively — a token table written
+after the fact from an implementation is a description, not a specification, and it would
+claim an authority it does not have. It is recorded so that "the preview pane follows the
+spec" is not something anyone believes by default. **The general rule still holds: the
+spec is the intent and the code is the defect. But where the spec is *silent*, the code
+is not a defect for deviating — it is the only source there is, and the honest response
+is to back-fill §4, not to call the code wrong.**
+
+### D-9 · 2026-09 · `text.status-bar`, `text.role.empty-state` and §4.7's `x-circle` are unwired — OPEN
+
+Three small inconsistencies between §3/§4 and the implementation, found while reading
+rather than measuring. None affects contrast.
+
+* §3.9 maps `text.role.status-bar` → `type.status`, and §4.5 says `statusbar.label` is
+  `type.status` / `text.tertiary`. `text.status-bar` itself is never defined in §3.2.
+* §3.9 maps `text.role.empty-state` → `type.display`; §4.2's empty state uses
+  `type.display` for the title and `type.dialog-body` for the body. Consistent, but the
+  role is a single token for a two-token component.
+* `dialog.rs` documents that §4.7's destructive-confirm glyph is `x-circle`, which §3.6
+  defines as the *error* glyph, while §4.7's own copy rules call for `warning`. The code
+  ships `warning` and follows the prose over the table.
+
+---
+
+*End of decisions log. The next ruling gets a `D-` number, a date, and a reason — and if
+it changes a colour, it changes the §6 rows that mention it in the same commit.*
+
