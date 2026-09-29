@@ -979,7 +979,9 @@ mod tests {
         );
         // The documented contract: a partial destination is left behind for the
         // caller to clean up or report — here, strictly between empty and whole.
-        let partial = fs::metadata(&dst).expect("partial destination must exist").len();
+        let partial = fs::metadata(&dst)
+            .expect("partial destination must exist")
+            .len();
         assert!(
             partial > 0 && partial < src_len,
             "expected a partial file, got {partial} of {src_len} bytes"
