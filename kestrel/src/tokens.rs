@@ -1782,6 +1782,56 @@ pub mod component {
     pub const DIALOG_CHECKBOX: f32 = 14.0;
     pub const DIALOG_CHECKBOX_RADIUS: f32 = radius::SM;
 
+    // ---- 4.10 Checkbox -----------------------------------------------------
+
+    /// The §4.10 checkbox cell: "14px `border.strong`".
+    ///
+    /// The same box §4.7's dialogs use, reached through a §4.10 name. Two
+    /// names for one value is normally a smell, but the spec lists the checkbox
+    /// in the *state matrix* and not in any component section, so a `DIALOG_`
+    /// name would put a settings-screen control in a dialog's namespace.
+    pub const CHECKBOX: f32 = DIALOG_CHECKBOX;
+    /// `radius.sm`, from the §4.10 row.
+    pub const CHECKBOX_RADIUS: f32 = DIALOG_CHECKBOX_RADIUS;
+    /// The §4.10 checkbox glyph, `check`, at this size inside the 14px box.
+    pub const CHECKBOX_GLYPH_SIZE: f32 = 12.0;
+
+    // ---- Settings (no §4 section; derived) --------------------------------
+
+    /// The label line's height in a settings row.
+    ///
+    /// §4 has no settings component, so this is derived: a settings row is a
+    /// `type.ui` label with a `type.caption` help line under it, and 32px is
+    /// what those two 15px line boxes need plus the 2px between them.
+    pub const SETTINGS_ROW_H: f32 = 32.0;
+    /// The whole row's height, label plus help line.
+    pub const SETTINGS_ROW_TOTAL_H: f32 = SETTINGS_ROW_H * 2.0;
+    /// The settings header band's height, matching `metric.toolbar`.
+    pub const SETTINGS_HEADER_H: f32 = metric::TOOLBAR;
+    /// The settings body's reading measure, and the horizontal row padding.
+    pub const SETTINGS_BODY_MAX_W: f32 = 560.0;
+    pub const SETTINGS_ROW_PAD_X: f32 = space::S5;
+    /// The label column's cap when there is room for a side-by-side row.
+    pub const SETTINGS_LABEL_MAX_W: f32 = 190.0;
+    /// The label column's share of a side-by-side row.
+    pub const SETTINGS_LABEL_SHARE: f32 = 0.46;
+    /// The width below which a row stacks label-above-control.
+    ///
+    /// Derived from the two things that have to fit: a 190px label column and
+    /// the widest control, which is the four-option segmented control.
+    pub const SETTINGS_STACK_BELOW_W: f32 = 400.0;
+    /// The `−`/`+` stepper's button, `metric.target-min`.
+    pub const SETTINGS_STEPPER_BTN: f32 = metric::TARGET_MIN;
+    /// The stepper's gap and its value field.
+    pub const SETTINGS_STEPPER_GAP: f32 = space::S1;
+    pub const SETTINGS_STEPPER_VALUE_W: f32 = 56.0;
+    /// How much one press changes the preview pane's width.
+    ///
+    /// 20px: nine presses cover the whole `PREVIEW_MIN`..=`PREVIEW_MAX` range,
+    /// which is a number of presses a user will actually make, where 1px would
+    /// be 180 of them.
+    pub const SETTINGS_WIDTH_STEP: f32 = 20.0;
+
     // ---- 4.8 Text input / search field ------------------------------------
 
     /// `input.height`

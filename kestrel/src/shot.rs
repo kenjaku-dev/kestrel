@@ -724,7 +724,7 @@ fn clamp_u8(v: f32) -> u8 {
 /// of this file is reviewing a theme, not shipping an image, and an
 /// uncompressed PNG needs only CRC-32 and Adler-32 — neither of which justifies
 /// a dependency. A 1200x1000 capture is a few MB on disk, which is fine.
-fn save_png(image: &ColorImage, path: &Path) -> std::io::Result<()> {
+pub(crate) fn save_png(image: &ColorImage, path: &Path) -> std::io::Result<()> {
     std::fs::write(path, encode_png(image))
 }
 

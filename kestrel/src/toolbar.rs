@@ -8,14 +8,19 @@
 //! from the path to find is a control you stop using. The sidebar is now
 //! exclusively Places, which is what §4.1 scopes it to.
 //!
-//! # Every button here is labelled
+//! # Every button here is labelled, until there is no room to
 //!
 //! §7.14: "No icon-only toolbar button without a tooltip **and** an accessible
-//! name." The spec's own `toolbar.btn` variants are *icon* and *icon + label*;
-//! this build uses icon + label throughout, which satisfies §7.14 in the
-//! strongest available way — the name is on screen, not behind a hover. The
-//! tooltip still carries the shortcut, as §4.11 requires ("Every one of these
-//! appears in its tooltip as text, in the form `Rename · F2`").
+//! name." §4.4 defines *two* button variants — icon, and icon + label — and at
+//! full width this build uses icon + label throughout, which satisfies §7.14 in
+//! the strongest available way: the name is on screen, not behind a hover. The
+//! tooltip carries the shortcut either way, as §4.11 requires ("Every one of
+//! these appears in its tooltip as text, in the form `Rename · F2`").
+//!
+//! Below [`DENSITY_ICONS_BELOW`] the labels go and the *specified* icon variant
+//! takes over. That is a variant rather than a degradation, and §7.14 stays
+//! whole because the tooltip carries the name and the shortcut in this variant
+//! too. See [`plan`].
 
 use egui::{Align2, Rect, Response, Sense, Stroke, Ui, vec2};
 
@@ -43,6 +48,47 @@ pub enum Action {
     Filter,
     /// Cycle Light → Dark → System.
     Theme,
+    /// `Ctrl+,` — the settings screen.
+    Settings,
+    /// `F1` — the keyboard shortcut list.
+    Help,
+}
+
+/// The filter field's preferred width, at full width.
+const FILTER_PREF_W: f32 = 220.0;
+
+/// The filter field's floor, below which the field is left out entirely.
+///
+/// 120px is the narrowest a `Filter…` field with a leading glyph and a clear
+/// button is still usable, and it is the point past which the field is a
+/// sliver: 90px of it is the placeholder, and typing replaces the placeholder
+/// immediately so the query is never visible. Below the floor the field goes
+/// away and the `Filter` toolbar button — which keeps its name in *both*
+/// densities — is the way in, so nothing becomes unreachable.
+const FILTER_MIN_W: f32 = 120.0;
+
+/// How much of each button the toolbar shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Density {
+    /// Icon + label. §4.4's second variant; the name is on screen.
+    Labelled,
+    /// Icon only, centred in `toolbar.btn-width`. §4.4's default variant; the
+    /// tooltip is the name.
+    Icons,
+}
+
+/// What the toolbar decided to do at a given width.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Plan {
+    /// How much of each button to paint.
+    pub density: Density,
+    /// The filter field's width, or `None` to leave the field out of the row.
+    pub filter: Option<f32>,
+    /// Whether the row fits at all. `false` means the buttons alone overflow,
+    /// which cannot be fixed by dropping labels — the app is narrower than its
+    /// own minimum, and the status bar says so rather than the toolbar
+    /// silently clipping.
+    pub fits: bool,
 }
 
 /// A control in the toolbar, with everything needed to paint and describe it.
@@ -180,7 +226,121 @@ pub fn buttons(
             true,
             false,
         ),
+        Button::new(
+            Action::Settings,
+            icons::GEAR,
+            "Settings",
+            "Ctrl+,",
+            true,
+            false,
+        ),
+        Button::new(Action::Help, icons::KEYBOARD, "Help", "F1", true, false),
     ]
+}
+
+/// Whether a separator is drawn before button `i`.
+///
+/// §4.4: "Proximity does the grouping, so separators are only between *groups*,
+/// never between adjacent buttons." The groups are navigation (Back, Forward,
+/// Up), the view switcher (List, Tree), and the app-level controls (Sort,
+/// Filter, Theme, Settings, Help). Four separators, fixed by position, so
+/// adding a button to a group does not move the rules.
+#[must_use]
+pub fn separator_before(i: usize) -> bool {
+    matches!(i, 3 | 5 | 6)
+}
+
+/// How wide one button is in a given density.
+///
+/// Pure, so the layout decision can be tested without a window — a toolbar that
+/// overflows is exactly the defect a screenshot of the *default* size cannot
+/// show, and it was found at 760px only because someone asked.
+#[must_use]
+pub fn button_width(ui: &Ui, theme: &Theme, b: &Button, density: Density) -> f32 {
+    match density {
+        Density::Icons => component::TOOLBAR_BTN_WIDTH,
+        Density::Labelled => {
+            let font = if b.active {
+                tokens::font(component::TOOLBAR_BTN_LABEL_ACTIVE, theme)
+            } else {
+                tokens::font(component::TOOLBAR_BTN_LABEL, theme)
+            };
+            let text_w = crate::widgets::text_width(ui, b.label, font);
+            (text_w
+                + component::TOOLBAR_BTN_ICON_SIZE
+                + component::TOOLBAR_BTN_LABEL_GAP * 2.0
+                + component::TOOLBAR_BTN_LABEL_GAP)
+                .max(component::TOOLBAR_BTN_WIDTH)
+        }
+    }
+}
+
+/// The total width of every separator in the row.
+const SEPARATOR_W: f32 = (border::HAIRLINE + component::TOOLBAR_BTN_SEPARATOR_MARGIN * 2.0) * 3.0;
+
+/// The toolbar's own inner padding, both sides.
+const FRAME_PAD_X: f32 = space::S2 * 2.0;
+
+/// The space the filter field needs beyond its own width: a separator and the
+/// gap before it.
+const FILTER_CHROME: f32 = border::HAIRLINE + component::TOOLBAR_BTN_SEPARATOR_MARGIN * 2.0;
+
+/// Decides the toolbar's density and filter width for the space it has.
+///
+/// # Why a decision function and not a `clamp`
+///
+/// The two defects this replaces were both "clamp and hope": a filter field
+/// that took `min(220, available)` and so rendered a 91px field with its right
+/// half outside the panel, and a button row that ran past the window's edge
+/// with no indication that it had. Neither is fixed by shrinking things; both
+/// are fixed by *choosing a layout*.
+///
+/// The choice is §4.4's own two variants, in priority order:
+///
+/// 1. Labels on, filter at [`FILTER_PREF_W`] — the wide layout.
+/// 2. Labels off, filter at [`FILTER_PREF_W`] — §4.4's icon variant. This is
+///    what happens at 820px, which is where the labelled row stops fitting.
+/// 3. Labels off, filter at whatever is left, down to [`FILTER_MIN_W`].
+/// 4. Labels off, no filter field — the `Filter` button is the way in.
+///
+/// The filter field is the thing that gives way, not the buttons: a button that
+/// is not there cannot be pressed, while a narrow filter still filters.
+#[must_use]
+pub fn plan(ui: &Ui, theme: &Theme, available: f32, btns: &[Button]) -> Plan {
+    let mut labelled = FRAME_PAD_X;
+    let mut icons = FRAME_PAD_X;
+    for (i, b) in btns.iter().enumerate() {
+        if separator_before(i) {
+            labelled += SEPARATOR_W / 3.0;
+            icons += SEPARATOR_W / 3.0;
+        }
+        labelled += button_width(ui, theme, b, Density::Labelled);
+        icons += button_width(ui, theme, b, Density::Icons);
+    }
+    // The last group is followed by a separator before the filter field, in
+    // every density, because the field is chrome rather than a control group.
+    let with_filter = |row: f32| row + FILTER_CHROME + FILTER_PREF_W;
+    if with_filter(labelled) <= available {
+        return Plan {
+            density: Density::Labelled,
+            filter: Some(FILTER_PREF_W),
+            fits: true,
+        };
+    }
+    if with_filter(icons) <= available {
+        return Plan {
+            density: Density::Icons,
+            filter: Some(FILTER_PREF_W),
+            fits: true,
+        };
+    }
+    let fits = icons <= available;
+    let left = available - icons - FILTER_CHROME;
+    Plan {
+        density: Density::Icons,
+        filter: (left >= FILTER_MIN_W).then_some(left.min(FILTER_PREF_W)),
+        fits,
+    }
 }
 
 /// Draws one control and returns whether it was clicked.
@@ -189,22 +349,23 @@ pub fn buttons(
 /// tooltip so the button advertises what it will actually do, which is §7.14's
 /// "no control without a name" taken one step further.
 ///
+/// `density` selects §4.4's two variants. The icon variant is not a stripped
+/// version of the labelled one: it centres the glyph in `toolbar.btn-width`,
+/// paints no label at all, and carries the name **and** the shortcut in the
+/// tooltip — which is exactly what §4.4 specifies for it and what keeps §7.14
+/// whole at narrow widths.
+///
 /// §4.4: 28px tall, 4px radius, transparent at rest, `state.hover`,
 /// `state.pressed`, `accent.subtle-bg` when on. The `Fill`-weight glyph on an
 /// active button is one of exactly two places §5.1 allows Fill.
-pub fn draw(ui: &mut Ui, theme: &Theme, b: Button, ahead: usize) -> Response {
+pub fn draw(ui: &mut Ui, theme: &Theme, b: Button, ahead: usize, density: Density) -> Response {
     let height = component::TOOLBAR_BTN_HEIGHT;
     let font = if b.active {
         tokens::font(component::TOOLBAR_BTN_LABEL_ACTIVE, theme)
     } else {
         tokens::font(component::TOOLBAR_BTN_LABEL, theme)
     };
-    let text_w = crate::widgets::text_width(ui, b.label, font.clone());
-    let width = (text_w
-        + component::TOOLBAR_BTN_ICON_SIZE
-        + component::TOOLBAR_BTN_LABEL_GAP * 2.0
-        + component::TOOLBAR_BTN_LABEL_GAP)
-        .max(component::TOOLBAR_BTN_WIDTH);
+    let width = button_width(ui, theme, &b, density);
 
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
 
@@ -219,7 +380,7 @@ pub fn draw(ui: &mut Ui, theme: &Theme, b: Button, ahead: usize) -> Response {
             },
             0.4,
         );
-        paint_content(ui, rect, theme, b, font, c, c, false);
+        paint_content(ui, rect, theme, b, font, c, c, false, density);
         return response.on_hover_text(b.tooltip());
     }
 
@@ -238,7 +399,7 @@ pub fn draw(ui: &mut Ui, theme: &Theme, b: Button, ahead: usize) -> Response {
         (theme.text.secondary, theme.icon.chrome)
     };
 
-    paint_content(ui, rect, theme, b, font, icon_color, fg, b.active);
+    paint_content(ui, rect, theme, b, font, icon_color, fg, b.active, density);
     response.on_hover_text(if b.action == Action::Forward && ahead > 0 {
         format!("{} · {ahead} ahead", b.tooltip())
     } else {
@@ -275,9 +436,17 @@ fn paint_content(
     icon_color: egui::Color32,
     fg: egui::Color32,
     fill: bool,
+    density: Density,
 ) {
     let icon_size = component::TOOLBAR_BTN_ICON_SIZE;
-    let left = rect.left() + component::TOOLBAR_BTN_LABEL_GAP;
+    // In the icon variant the glyph is *centred* in `toolbar.btn-width`; in
+    // the labelled one it sits at the left padding. Two different origins, and
+    // using the labelled one for both is what leaves a 28px button with a
+    // glyph hanging off its left edge.
+    let left = match density {
+        Density::Labelled => rect.left() + component::TOOLBAR_BTN_LABEL_GAP,
+        Density::Icons => rect.center().x - icon_size / 2.0,
+    };
     let icon_rect = Rect::from_center_size(
         egui::pos2(left + icon_size / 2.0, rect.center().y),
         vec2(icon_size, icon_size),
@@ -298,14 +467,16 @@ fn paint_content(
             icon_color,
         );
     }
-    let text_x = icon_rect.right() + component::TOOLBAR_BTN_LABEL_GAP;
-    ui.painter().text(
-        egui::pos2(text_x, rect.center().y),
-        Align2::LEFT_CENTER,
-        b.label,
-        font,
-        fg,
-    );
+    if density == Density::Labelled {
+        let text_x = icon_rect.right() + component::TOOLBAR_BTN_LABEL_GAP;
+        ui.painter().text(
+            egui::pos2(text_x, rect.center().y),
+            Align2::LEFT_CENTER,
+            b.label,
+            font,
+            fg,
+        );
+    }
 }
 
 /// A 1px `border.subtle` vertical rule between functional groups.
@@ -347,6 +518,211 @@ pub fn frame(theme: &Theme) -> egui::Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real `Ui` with the real fonts, so [`plan`]'s text measurement is the
+    /// measurement the app will make.
+    ///
+    /// A `Ui` per width rather than a `Context` per width, because `Context`
+    /// creation is the expensive part and `plan` only needs a painter with a
+    /// font atlas.
+    fn with_ui(width: f32, body: impl FnOnce(&Ui, &Theme)) {
+        let ctx = crate::shot::ctx_with_fonts();
+        let mut body = Some(body);
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(width, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                if let Some(body) = body.take() {
+                    body(ui, &Theme::dark());
+                }
+            },
+        );
+        // The first pass builds the font atlas; dropping the delta unapplied
+        // makes egui panic, and a test about widths should not die on fonts.
+        out.drop_without_applying_deltas();
+    }
+
+    /// Every button row at a given width, and the plan for it.
+    fn plan_at(width: f32) -> Plan {
+        let mut out = Plan {
+            density: Density::Labelled,
+            filter: Some(FILTER_PREF_W),
+            fits: true,
+        };
+        with_ui(width, |ui, theme| {
+            out = plan(ui, theme, width, &buttons(true, true, true, false, false));
+        });
+        out
+    }
+
+    // -- the two regressions this function exists to prevent ---------------
+
+    /// At 760px the filter field used to lose its right half, because the
+    /// field took `min(220, available)` and then drew a 220px-wide field's
+    /// worth of chrome — clear button, text inset and all — into the space it
+    /// had. The plan has to give the field a width it can actually paint in.
+    #[test]
+    fn the_filter_field_is_never_wider_than_the_space_left_for_it() {
+        for width in [
+            1600.0, 1200.0, 1060.0, 1000.0, 900.0, 820.0, 760.0, 640.0, 560.0, 520.0,
+        ] {
+            let p = plan_at(width);
+            let Some(field) = p.filter else {
+                panic!("{width}px dropped the filter field; the icon row fits easily there");
+            };
+            // The buttons, at whichever density, plus the field's own chrome
+            // plus the frame padding, must fit.
+            with_ui(width, |ui, theme| {
+                let btns = buttons(true, true, true, false, false);
+                let used: f32 = btns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        let sep = if separator_before(i) {
+                            SEPARATOR_W / 3.0
+                        } else {
+                            0.0
+                        };
+                        sep + button_width(ui, theme, b, p.density)
+                    })
+                    .sum::<f32>()
+                    + FRAME_PAD_X
+                    + FILTER_CHROME;
+                assert!(
+                    used + field <= width + 0.5,
+                    "{width}px: buttons {used} + filter {field} overflows"
+                );
+            });
+        }
+    }
+
+    /// The labelled row used to overflow the window and the buttons ran off the
+    /// right edge with nothing saying so.
+    ///
+    /// The breakpoint is 1060px rather than the ~820px that was reported
+    /// before: adding the Settings and Help buttons made the row wider, and a
+    /// test that asserted the old number would be asserting a bug. What is
+    /// pinned here is the *behaviour* — labels exactly when the labelled row
+    /// fits, icons exactly when it does not — and the number falls out of the
+    /// font, which is the right place for it to live.
+    #[test]
+    fn the_labelled_row_is_used_exactly_when_it_fits() {
+        for width in [1600.0, 1400.0, 1200.0, 1100.0] {
+            assert_eq!(plan_at(width).density, Density::Labelled, "{width}px");
+        }
+        for width in [1000.0, 900.0, 820.0, 760.0, 700.0, 640.0] {
+            let p = plan_at(width);
+            assert_eq!(p.density, Density::Icons, "{width}px");
+            assert!(p.fits, "{width}px fits the icon row");
+        }
+    }
+
+    /// The invariant behind the numbers: labels are used **iff** the labelled row
+    /// fits beside the filter field, at every width.
+    ///
+    /// The table above pins the widths anyone will actually try — 1200, 820,
+    /// 760 — because those are the ones that were reported broken. This pins the
+    /// rule, because a rule that only holds at three widths is a coincidence.
+    #[test]
+    fn labels_are_used_exactly_when_the_labelled_row_fits() {
+        for width in (360..=1600).step_by(4) {
+            let w = width as f32;
+            with_ui(w, |ui, theme| {
+                let btns = buttons(true, true, true, false, false);
+                let row = |density: Density| -> f32 {
+                    btns.iter()
+                        .enumerate()
+                        .map(|(i, b)| {
+                            (if separator_before(i) {
+                                SEPARATOR_W / 3.0
+                            } else {
+                                0.0
+                            }) + button_width(ui, theme, b, density)
+                        })
+                        .sum::<f32>()
+                        + FRAME_PAD_X
+                        + FILTER_CHROME
+                };
+                let p = plan(ui, theme, w, &btns);
+                if row(Density::Labelled) + FILTER_PREF_W <= w {
+                    assert_eq!(p.density, Density::Labelled, "{w}px: it fits");
+                } else {
+                    assert_eq!(p.density, Density::Icons, "{w}px: it does not fit");
+                }
+            });
+        }
+    }
+
+    /// The icon row is 10 * 28px plus four separators; a window narrower than
+    /// that cannot show the toolbar at all, and the plan says so rather than
+    /// letting the buttons be clipped without comment.
+    #[test]
+    fn a_window_narrower_than_the_icon_row_is_reported() {
+        with_ui(200.0, |ui, theme| {
+            let p = plan(ui, theme, 200.0, &buttons(true, true, true, false, false));
+            assert!(!p.fits, "200px cannot fit ten 28px buttons and four rules");
+            assert_eq!(p.density, Density::Icons, "icons are already the floor");
+            assert_eq!(p.filter, None, "and the field is the first thing to go");
+        });
+    }
+
+    /// The filter field gives way before the buttons do, and only after
+    /// `FILTER_MIN_W` — below that it is a sliver with no visible query.
+    #[test]
+    fn the_filter_field_gives_way_in_stages() {
+        with_ui(1000.0, |ui, theme| {
+            let btns = buttons(true, true, true, false, false);
+            assert_eq!(
+                plan(ui, theme, 1000.0, &btns).filter,
+                Some(FILTER_PREF_W),
+                "there is room for the preferred width"
+            );
+            // Somewhere between the icon row and `FILTER_PREF_W`.
+            let icons: f32 = btns
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    // The icon row's width does not depend on which button it
+                    // is: every one is `toolbar.btn-width`.
+                    (if separator_before(i) {
+                        SEPARATOR_W / 3.0
+                    } else {
+                        0.0
+                    }) + component::TOOLBAR_BTN_WIDTH
+                })
+                .sum();
+            let chrome = FRAME_PAD_X + icons + FILTER_CHROME;
+            let narrow = chrome + FILTER_MIN_W;
+            let p = plan(ui, theme, narrow, &btns);
+            assert_eq!(p.density, Density::Icons);
+            assert_eq!(
+                p.filter,
+                Some(FILTER_MIN_W),
+                "exactly at the floor the field is still there"
+            );
+            let p = plan(ui, theme, narrow - 1.0, &btns);
+            assert_eq!(p.filter, None, "one pixel below the floor it is gone");
+        });
+    }
+
+    /// The plan never proposes a density the spec does not define, and never a
+    /// filter width outside the field's own range.
+    #[test]
+    fn every_plan_is_inside_the_tokens() {
+        for width in (240..=1400).step_by(7) {
+            let w = width as f32;
+            let p = plan_at(w);
+            assert!(matches!(p.density, Density::Icons | Density::Labelled));
+            if let Some(f) = p.filter {
+                assert!(f > 0.0 && f <= FILTER_PREF_W, "{w}px: field {f}");
+            }
+        }
+    }
 
     #[test]
     fn back_and_forward_are_disabled_when_there_is_nowhere_to_go() {

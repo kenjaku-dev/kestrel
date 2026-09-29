@@ -1898,7 +1898,9 @@ dependencies = [
  "env_logger",
  "kestrel-fs",
  "log",
+ "ron",
  "rustix 0.38.44",
+ "serde",
  "tempfile",
  "winit",
 ]

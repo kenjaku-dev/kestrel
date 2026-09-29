@@ -195,6 +195,21 @@ pub const MOON: Glyph = Glyph(0x0e330);
 pub const CIRCLE_HALF: Glyph = Glyph(0x0e18c);
 /// `keyboard`
 pub const KEYBOARD: Glyph = Glyph(0x0e2d8);
+/// `gear`
+///
+/// §5.3 has no settings or help row, so this is a spec *extension* rather than a
+/// transcription: the settings screen and the shortcut list are Phase 5's
+/// additions and §5.3 was written before either existed. `gear` and `keyboard`
+/// are the two glyphs the conventions of §5.3 itself point at — chrome
+/// actions are 18px `icon.chrome`, and `keyboard` was already vendored and
+/// named for exactly this.
+///
+/// The codepoint was **not** copied from the CSS list. Phosphor assigns private
+/// codepoints sequentially in name order, so `gear` is somewhere between
+/// `funnel` (0xE266) and `git-branch` (0xE276) and there is no way to derive
+/// which slot without rendering the candidates; this one was read off a
+/// render of that range.
+pub const GEAR: Glyph = Glyph(0x0e26e);
 /// `text-aa`
 pub const TEXT_AA: Glyph = Glyph(0x0e6ee);
 /// `funnel`
@@ -285,6 +300,7 @@ pub fn codepoint(spec_name: &str) -> Option<Glyph> {
         "moon" => MOON,
         "circle-half" => CIRCLE_HALF,
         "keyboard" => KEYBOARD,
+        "gear" => GEAR,
         "text-aa" => TEXT_AA,
         "funnel" => FUNNEL,
         "caret-up" => CARET_UP,
@@ -360,6 +376,7 @@ pub const ALL: &[(&str, Glyph)] = &[
     ("moon", MOON),
     ("circle-half", CIRCLE_HALF),
     ("keyboard", KEYBOARD),
+    ("gear", GEAR),
     ("text-aa", TEXT_AA),
     ("funnel", FUNNEL),
     ("caret-up", CARET_UP),
@@ -391,7 +408,7 @@ mod tests {
                 "{name} is in ALL but codepoint() cannot find it"
             );
         }
-        assert_eq!(ALL.len(), 66, "glyph count changed; re-run the generator");
+        assert_eq!(ALL.len(), 67, "glyph count changed; re-run the generator");
     }
 
     /// The two names Phosphor 2.x spells differently resolve to the substitutes

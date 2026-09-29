@@ -60,6 +60,7 @@ mod disk;
 mod filetype;
 mod format;
 mod gallery;
+mod help;
 mod history;
 mod icons;
 mod job;
@@ -68,7 +69,9 @@ mod places;
 mod preview;
 mod rename;
 mod selection;
+mod settings;
 mod shot;
+mod states;
 mod tokens;
 mod toolbar;
 mod widgets;
@@ -128,7 +131,8 @@ OPTIONS:
                        drive the app into a state, then capture it. One of:
                        browser, confirm-permanent, confirm-trash, collision,
                        progress, failed, preview-empty, preview-text,
-                       preview-image, preview-too-large
+                       preview-image, preview-too-large, settings, help,
+                       empty, denied, gone, nowatch
         --size WxH     capture at an explicit size, e.g. 900x700
 
 ARGS:
@@ -156,6 +160,12 @@ const SCENES: &[(&str, app::Scene)] = &[
     ("preview-text", app::Scene::PreviewText),
     ("preview-image", app::Scene::PreviewImage),
     ("preview-too-large", app::Scene::PreviewTooLarge),
+    ("settings", app::Scene::Settings),
+    ("help", app::Scene::Help),
+    ("empty", app::Scene::Empty),
+    ("denied", app::Scene::Denied),
+    ("gone", app::Scene::Gone),
+    ("nowatch", app::Scene::NoWatch),
 ];
 
 /// `None` for a name no scene answers to, with the list of the ones that do.

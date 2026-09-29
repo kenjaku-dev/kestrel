@@ -106,16 +106,18 @@ pub const BTN_HEIGHT: f32 = component::DIALOG_BTN_HEIGHT;
 /// sidebar and three panes need to coexist. They are not variants of each
 /// other.
 pub mod preview_metrics {
-    /// The pane's default width — between [`crate::tokens::metric::SIDEBAR_MIN`]
-    /// (160) and the 400 px dialog, so the three panes stay balanced.
-    pub const WIDTH: f32 = 280.0;
     /// Narrowest the pane may be dragged. Matches the sidebar's floor, so no
     /// pane can be squeezed to nothing while another stays wide.
-    pub const MIN_WIDTH: f32 = 180.0;
+    ///
+    /// The same number as [`crate::settings::PREVIEW_MIN`], which is the value
+    /// the settings stepper clamps to. Two names for one bound is deliberate:
+    /// this module is about the *pane* and that one is about the *setting*, and
+    /// the normalisation on load is what keeps them from drifting.
+    pub const MIN_WIDTH: f32 = crate::settings::PREVIEW_MIN;
     /// Widest the pane may be dragged — deliberately *narrower* than
     /// [`crate::tokens::metric::SIDEBAR_MAX`] (340) is wide, because the pane
     /// holds a filename column that stops being readable well before 340.
-    pub const MAX_WIDTH: f32 = 360.0;
+    pub const MAX_WIDTH: f32 = crate::settings::PREVIEW_MAX;
     /// Inner margin — `space::S2`, the same rung the path-quote uses.
     pub const PADDING: f32 = crate::tokens::space::S2;
     /// One text row — `ty::META`'s line height, so the code view and the

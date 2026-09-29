@@ -206,6 +206,93 @@ pub fn status_error(ui: &mut Ui, theme: &Theme, text: &str) {
 ///
 /// §7.16: "The app never blocks input and never shows a spinner with no
 /// words." The label is therefore mandatory, not optional.
+/// A permanent warning chip with a clickable remedy, for §7.16's "never a
+/// silent status change".
+///
+/// §3.6 requires a status colour to always be accompanied by a glyph, so the
+/// chip carries `warning-circle` in `status.warning-text`. The text is the
+/// *fact* and the button is the *only* action that fixes it, and both are on
+/// screen at once: a chip that only appeared on hover would be §7.14's hidden
+/// affordance with extra steps.
+///
+/// `label` is the whole sentence — this is not a tooltip, and the status bar is
+/// the last place that has room for a sentence without eating the list.
+pub fn status_notice(ui: &mut Ui, theme: &Theme, label: &str, button: &str, tip: &str) -> bool {
+    let (chip, response) = ui.allocate_exact_size(
+        vec2(
+            crate::widgets::text_width(ui, button, tokens::font(ty::META_STRONG, theme))
+                + space::S3
+                + space::S2
+                + 14.0
+                + space::S2
+                + crate::widgets::text_width(
+                    ui,
+                    label,
+                    tokens::font(component::STATUSBAR_LABEL, theme),
+                ),
+            component::STATUSBAR_HEIGHT - border::HAIRLINE * 2.0 - 6.0,
+        ),
+        Sense::hover(),
+    );
+    let painter = ui.painter();
+    let bg = if response.hovered() {
+        theme.status.warning_bg
+    } else {
+        theme.surfaces.panel
+    };
+    painter.rect_filled(chip, radius::all(radius::SM), bg);
+    rect_stroke(
+        painter,
+        chip,
+        radius::all(radius::SM),
+        Stroke::new(border::HAIRLINE, theme.status.warning_border),
+    );
+    let icon = Rect::from_center_size(
+        chip.left_center() + vec2(space::S2 + 7.0, 0.0),
+        vec2(14.0, 14.0),
+    );
+    crate::tokens::icon_glyph(
+        painter,
+        icon,
+        crate::icons::WARNING_CIRCLE,
+        theme.status.warning_text,
+    );
+    let text_x = icon.right() + space::S2;
+    painter.text(
+        egui::pos2(text_x, chip.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        tokens::font(component::STATUSBAR_LABEL, theme),
+        theme.text.secondary,
+    );
+    let button_rect = Rect::from_min_size(
+        egui::pos2(chip.right() - space::S2, chip.center().y - 8.0),
+        vec2(
+            crate::widgets::text_width(ui, button, tokens::font(ty::META_STRONG, theme))
+                + space::S2,
+            16.0,
+        ),
+    );
+    let button_id = ui.make_persistent_id("status-notice-button");
+    let button_response = ui.interact(button_rect, button_id, Sense::click());
+    if button_response.hovered() {
+        painter.rect_filled(button_rect, radius::all(radius::XS), theme.state.hover);
+    }
+    painter.text(
+        button_rect.center(),
+        Align2::CENTER_CENTER,
+        button,
+        tokens::font(ty::META_STRONG, theme),
+        theme.accent.text,
+    );
+    if button_response.clicked() {
+        response.on_hover_text(tip);
+        return true;
+    }
+    response.on_hover_text(tip);
+    false
+}
+
 pub fn status_busy(ui: &mut Ui, theme: &Theme, label: &str, detail: &str, motion: Motion) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = vec2(space::S1_5, 0.0);
@@ -323,6 +410,59 @@ pub fn swatch(ui: &mut Ui, theme: &Theme, color: Color32, size: f32) -> egui::Re
         Stroke::new(border::HAIRLINE, theme.borders.strong),
     );
     response
+}
+
+/// §4.10's checkbox cell, painted into `rect`.
+///
+/// "14px `border.strong` · `border.accent` on hover · `accent.base` + `check`".
+/// The check is the Phosphor `check` glyph from the icon font rather than a
+/// text `✓`, for §7.10's reason: a text checkmark is a font's idea of a tick
+/// and this app has already decided its ticks come from one set (§5.1).
+///
+/// Pure paint — the caller owns the hit area, because the hit area is the
+/// caller's layout and not the checkbox's. §6.6 requires 24px and
+/// [`hit_area`] is the one implementation of that.
+///
+/// `hovered` is passed rather than read, for the same reason every other painter
+/// in this file takes it: the rect is only known after allocation.
+pub fn checkbox(ui: &Ui, theme: &Theme, rect: Rect, checked: bool, hovered: bool) {
+    // §4.10's disabled cell is not reachable here: a disabled checkbox is not a
+    // thing this app has, and inventing the state would be a state nobody can
+    // get to.
+    let border = if checked {
+        theme.accent.base
+    } else if hovered {
+        theme.borders.accent
+    } else {
+        theme.borders.strong
+    };
+    if checked {
+        ui.painter().rect_filled(
+            rect,
+            radius::all(component::CHECKBOX_RADIUS),
+            theme.accent.base,
+        );
+    }
+    rect_stroke(
+        ui.painter(),
+        rect,
+        radius::all(component::CHECKBOX_RADIUS),
+        Stroke::new(border::HAIRLINE, border),
+    );
+    if checked {
+        tokens::icon_glyph_fill(
+            ui.painter(),
+            Rect::from_center_size(
+                rect.center(),
+                vec2(
+                    component::CHECKBOX_GLYPH_SIZE,
+                    component::CHECKBOX_GLYPH_SIZE,
+                ),
+            ),
+            crate::icons::CHECK,
+            theme.accent.on,
+        );
+    }
 }
 
 /// The `metric.target-min` hit area around a smaller painted control.

@@ -64,6 +64,8 @@ use crate::places::{self, Place};
 use crate::preview::{self as pv, Kind as PvKind, Loaded as PvLoaded, Loader as PvLoader};
 use crate::rename::Inline as RenameInline;
 use crate::selection::Selection;
+use crate::settings;
+use crate::states;
 use crate::tokens::{
     self, Theme, ThemeMode, border, component, metric, radius, space, system_preference, ty,
 };
@@ -77,6 +79,11 @@ pub enum Screen {
     Browser,
     /// `--gallery`: every §4 component at every state, for design review.
     Gallery,
+    /// The settings screen. A *screen*, not a modal: it replaces the browser
+    /// rather than covering it, so the browser behind it keeps its scroll
+    /// position and its selection, and coming back is instant rather than a
+    /// redraw of a window that was there all along.
+    Settings,
 }
 
 /// A starting state for a headless `--screenshot` capture.
@@ -120,6 +127,22 @@ pub enum Scene {
     PreviewImage,
     /// The preview pane's "too large" degradation.
     PreviewTooLarge,
+    /// The settings screen, at its default state.
+    Settings,
+    /// The keyboard shortcut overlay over the browser.
+    Help,
+    /// An empty directory: §4.2's three-part empty state.
+    Empty,
+    /// A directory the process may not read.
+    Denied,
+    /// A directory that is no longer there.
+    Gone,
+    /// A directory that lists fine, with the watcher off.
+    ///
+    /// The degradation the engine documents: `KestrelError::Watch` happens when
+    /// inotify's per-user watch limit is hit on a large tree, and it must show
+    /// as a *visible* manual-refresh affordance rather than a log line.
+    NoWatch,
 }
 
 /// What the preview pane needs about the focused row.
@@ -318,6 +341,16 @@ pub struct KestrelApp {
     scan: Option<ScanHandle>,
     /// The debounced watcher for [`Self::dir`].
     watch: Option<WatchSubscription>,
+    /// Why the watcher is not running, when it is not.
+    ///
+    /// `KestrelError::Watch` is what the engine returns when the platform's
+    /// watch limit is hit — a real outcome on a large tree, and one the user
+    /// has to be able to see, because a file manager whose list silently stops
+    /// updating is *lying* about the directory. The status bar carries it as a
+    /// permanent section with a Refresh button beside it, which is §7.16's
+    /// "never a silent status change" and the engine's documented degradation
+    /// to manual refresh.
+    watch_error: Option<String>,
     /// Back/forward stacks.
     history: History,
     /// The user's multi-selection.
@@ -368,12 +401,43 @@ pub struct KestrelApp {
     preview: PvLoader,
     /// Whether the preview pane is shown.
     show_preview: bool,
+    /// The preview pane's width, from the settings screen.
+    ///
+    /// The panel's `default_size` only, and re-asserted every frame for the
+    /// reason `preview_panel` documents: a non-resizable egui panel keeps
+    /// whatever width its content last had, and the content is a column that
+    /// changes shape with the selection.
+    preview_width: f32,
+    /// Whether the Places sidebar is shown.
+    show_sidebar: bool,
+    /// Whether dotfiles are listed.
+    show_hidden: bool,
     /// The preview's last content, so it survives a redraw.
     preview_content: Option<PvLoaded>,
     /// Rolling frame-time average in ms, for the status bar.
     frame_ms: f32,
     /// Frames observed so far, used to seed the average.
     frames: u32,
+    /// What the settings screen persists, and what it edits live.
+    ///
+    /// One value, not a copy: the screen writes straight into the field the
+    /// app reads, so "the setting on screen" and "the setting the app is
+    /// using" cannot be two numbers that drift.
+    settings: settings::Stored,
+    /// `true` when the toolbar could not fit the icon row, so the window is
+    /// narrower than the app's own minimum and buttons are being clipped.
+    ///
+    /// Read by the status bar. Not a dialog: the user did not do anything wrong
+    /// and there is nothing to decide, so it is a fact, and §4.5 is where facts
+    /// live.
+    toolbar_narrow: bool,
+    /// `true` when [`Self::settings`] has been edited since the last save.
+    ///
+    /// Only affects *when* the state is written, never *whether*: `save` runs
+    /// on eframe's interval and on exit either way.
+    settings_dirty: bool,
+    /// The keyboard shortcut overlay, per §4.11's discoverability contract.
+    help: bool,
 }
 
 impl KestrelApp {
@@ -397,7 +461,24 @@ impl KestrelApp {
         };
         let theme = Theme::resolve(opts.theme, system_dark);
         theme.apply(&cc.egui_ctx);
-        Self::assemble(opts, theme)
+        // Read the stored preferences *before* `assemble`, because the theme is
+        // one of them and getting the first frame wrong means a window that
+        // flashes the wrong theme before settling. `storage()` is an in-memory
+        // map eframe loaded before the first frame, so this is not I/O.
+        let stored = settings::load(cc.storage);
+        let mut opts = opts;
+        if stored.theme != settings::Mode::System {
+            // A stored preference beats a `--light`/`--dark` flag: the flag is a
+            // one-off for a screenshot or a bug report, the preference is what
+            // the user chose. A `--light` flag on a machine whose saved
+            // preference is dark therefore *loses*, and `--light` alone on a
+            // machine with no saved preference still wins over the stored
+            // `System`.
+            opts.theme = stored.theme.to_theme();
+        }
+        let theme = Theme::resolve(opts.theme, system_dark.or(Some(theme.is_dark)));
+        theme.apply(&cc.egui_ctx);
+        Self::assemble(opts, theme, stored)
     }
 
     /// Builds the app against a bare [`egui::Context`], for the headless
@@ -413,11 +494,23 @@ impl KestrelApp {
         // screenshot that changes colour with the hour is not reviewable.
         let theme = Theme::resolve(opts.theme, Some(true));
         theme.apply(&ctx);
-        Self::assemble(opts, theme)
+        // Defaults, never the stored state: a capture must be reproducible, and
+        // a screenshot that changed colour because a preferences file did is
+        // not reviewable. `--light`/`--dark` is how a capture picks a theme.
+        let theme_pref = match opts.theme {
+            ThemeMode::Light => settings::Mode::Light,
+            ThemeMode::Dark => settings::Mode::Dark,
+            ThemeMode::System => settings::Mode::System,
+        };
+        let stored = settings::Stored {
+            theme: theme_pref,
+            ..Default::default()
+        };
+        Self::assemble(opts, theme, stored)
     }
 
     /// The shared construction path, once the theme is settled.
-    fn assemble(opts: Options, theme: Theme) -> Self {
+    fn assemble(opts: Options, theme: Theme, settings: settings::Stored) -> Self {
         let dir = opts.start_dir.clone().unwrap_or_else(places::start_dir);
         let view = if opts.tree {
             ViewMode::Tree
@@ -440,6 +533,7 @@ impl KestrelApp {
             errors: Vec::new(),
             scan: None,
             watch: None,
+            watch_error: None,
             history: History::new(&dir),
             selection: Selection::new(),
             clipboard: Clipboard::new(),
@@ -464,14 +558,46 @@ impl KestrelApp {
             mkdir_result: None,
             preview: PvLoader::new(),
             show_preview: true,
+            preview_width: settings::PREVIEW_DEFAULT,
+            show_sidebar: true,
+            show_hidden: true,
             preview_content: None,
             filter: String::new(),
             filter_focused: false,
             frame_ms: 0.0,
             frames: 0,
+            toolbar_narrow: false,
+            settings,
+            settings_dirty: false,
+            help: false,
         };
+        app.apply_settings();
         app.open_dir(dir);
         app
+    }
+
+    /// Pushes [`Self::settings`] into the fields the app actually reads.
+    ///
+    /// Called once at construction and again whenever the settings screen
+    /// closes. The indirection exists because a setting has two homes — the
+    /// persisted struct and the live field — and the moment there are two homes
+    /// is the moment something has to say which way the copy goes. Here it is
+    /// the settings, always: the app never writes into `self.settings`, so a
+    /// live change the app makes (cycling the theme with `Ctrl+T`, say) is
+    /// picked up the next time the screen opens rather than being silently
+    /// discarded.
+    fn apply_settings(&mut self) {
+        self.mode = self.settings.theme.to_theme();
+        self.show_hidden = self.settings.show_hidden;
+        self.show_preview = self.settings.show_preview;
+        self.preview_width = self.settings.preview_width;
+        self.show_sidebar = self.settings.show_sidebar;
+        self.sort = self.settings.sort_spec();
+        self.sort_column = self.settings.sort.to_sort_key();
+        self.view = match self.settings.view {
+            settings::View::List => ViewMode::List,
+            settings::View::Tree => ViewMode::Tree,
+        };
     }
 
     // -- Capture scenes -----------------------------------------------------
@@ -537,6 +663,48 @@ impl KestrelApp {
             }
             Scene::PreviewTooLarge => {
                 self.focus_named("archive.tar");
+            }
+            Scene::Settings => {
+                // Through the real entry point, so a capture cannot show a
+                // screen the app would never actually reach.
+                self.open_settings();
+            }
+            Scene::Help => {
+                self.help = true;
+            }
+            // The next four are states the filesystem decides, not keystrokes:
+            // reproducing a permission-denied directory or a dead watcher for
+            // real would mean chmod-ing a fixture and filling an inotify quota
+            // on the reviewer's machine to look at a PNG. The errors are
+            // constructed from the engine's own types, so the scene exercises
+            // the same `states::State::for_listing` the live path does.
+            Scene::Empty => {
+                // The fixture already has rows; an empty state is a listing with
+                // none, which is the same app with a different answer from the
+                // scanner. Simulated rather than faked: the scene clears the
+                // delivered rows and marks the scan finished.
+                self.rows.clear();
+                self.scan = None;
+            }
+            Scene::Denied | Scene::Gone => {
+                self.rows.clear();
+                self.scan = None;
+                let err = if scene == Scene::Denied {
+                    kestrel_fs::error::KestrelError::PermissionDenied {
+                        path: self.dir.clone(),
+                        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    }
+                } else {
+                    kestrel_fs::error::KestrelError::not_found(&self.dir)
+                };
+                self.errors = vec![ScanError::new(self.dir.clone(), err)];
+            }
+            Scene::NoWatch => {
+                self.watch = None;
+                self.watch_error = Some(
+                    "The filesystem watcher could not be started, so changes here will not appear on their own."
+                        .to_string(),
+                );
             }
         }
     }
@@ -624,6 +792,8 @@ impl KestrelApp {
             ThemeMode::Dark => ThemeMode::System,
             ThemeMode::System => ThemeMode::Light,
         };
+        self.settings.theme = settings::Mode::from_theme(self.mode);
+        self.settings_dirty = true;
     }
 
     // -- Navigation --------------------------------------------------------
@@ -670,11 +840,18 @@ impl KestrelApp {
             }
         }
 
-        // A watcher that cannot start degrades to a manual refresh affordance,
-        // not an error dialog (§6.6, requirement 7). `F5` is in the toolbar.
+        // A watcher that cannot start degrades to a **visible** manual-refresh
+        // affordance, not an error dialog and not a log line. `F5` is in the
+        // toolbar; the status bar says *why* it is the only way the list will
+        // change, and offers the button, because a silently stale list is worse
+        // than a visible degraded one.
+        self.watch_error = None;
         match kestrel_fs::watcher::watch(&self.dir) {
             Ok(sub) => self.watch = Some(sub),
-            Err(err) => log::warn!("watch: {err}; falling back to manual refresh"),
+            Err(err) => {
+                log::warn!("watch: {err}; falling back to manual refresh");
+                self.watch_error = Some(format!("{err}"));
+            }
         }
 
         self.history.push(&self.dir);
@@ -702,8 +879,12 @@ impl KestrelApp {
         ScanOptions {
             sort: Some(self.sort),
             // §5.2's hidden-file discussion presumes hidden entries are visible
-            // and *marked*; the eye toggle is Phase 4.
-            show_hidden: true,
+            // and *marked*, which is why the settings default is `true` and why
+            // the hidden-file dot exists at all. This is the only place the
+            // setting reaches the filesystem: hiding an entry is a scan option,
+            // never a filter, so it costs no post-processing on a 50,000-row
+            // directory and a rescan is the only correct way to apply it.
+            show_hidden: self.show_hidden,
             // Tree mode reads exactly one level deeper than it shows at first.
             //
             // Depth 1 is a deliberate ceiling for two reasons. It bounds the work
@@ -1315,6 +1496,8 @@ impl KestrelApp {
     /// Sets the sort from a header click, flipping direction if the column is
     /// already active.
     fn sort_by_column(&mut self, key: SortKey) {
+        self.settings.sort = settings::Column::from_sort_key(key);
+        self.settings_dirty = true;
         if self.sort_column == key {
             self.sort.ascending = !self.sort.ascending;
         } else {
@@ -1416,6 +1599,9 @@ impl KestrelApp {
             NewFolder,
             QuickLook,
             TogglePreview,
+            Help,
+            Settings,
+            Filter,
             /// Arrow-key movement. `true` means Shift was held, which extends the
             /// anchored range instead of collapsing onto one row.
             Move(isize, bool),
@@ -1477,6 +1663,17 @@ impl KestrelApp {
                 Act::QuickLook
             } else if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 Act::TogglePreview
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::F1)
+                || i.consume_key(egui::Modifiers::NONE, Key::F1)
+            {
+                // Both spellings because `consume_key` compares modifiers
+                // *logically*: `Ctrl+F1` with Ctrl held is also a plain `F1`
+                // press, so the two arms cannot be separate branches.
+                Act::Help
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::Comma) {
+                Act::Settings
+            } else if i.consume_key(egui::Modifiers::NONE, Key::Slash) {
+                Act::Filter
             } else if i.consume_key(egui::Modifiers::NONE, Key::F5) {
                 Act::Refresh
             } else if i.consume_key(egui::Modifiers::NONE, Key::Enter) {
@@ -1526,7 +1723,14 @@ impl KestrelApp {
             Act::Paste => self.paste(),
             Act::NewFolder => self.new_folder(),
             Act::QuickLook => self.show_preview = true,
-            Act::TogglePreview => self.show_preview = !self.show_preview,
+            Act::TogglePreview => {
+                self.show_preview = !self.show_preview;
+                self.settings.show_preview = self.show_preview;
+                self.settings_dirty = true;
+            }
+            Act::Help => self.help = true,
+            Act::Settings => self.open_settings(),
+            Act::Filter => self.filter_focused = true,
             Act::Move(d, extend) => {
                 if extend {
                     self.selection.extend_by(d, count);
@@ -1567,10 +1771,25 @@ impl KestrelApp {
             Act::ClearSelection => self.selection.clear(),
             Act::Cut => self.stage(Op::Cut),
             Act::Copy => self.stage(Op::Copy),
-            Act::ViewList => self.view = ViewMode::List,
-            Act::ViewTree => self.view = ViewMode::Tree,
+            Act::ViewList => self.set_view(ViewMode::List),
+            Act::ViewTree => self.set_view(ViewMode::Tree),
             Act::ToggleTheme => self.cycle_theme(),
         }
+    }
+
+    /// Switches the list view, and records the choice as a setting.
+    ///
+    /// One method for both the keyboard and the toolbar, so the two cannot
+    /// disagree about what "change the view" means — and so neither can change
+    /// the view without the setting following, which is the bug a second
+    /// assignment would introduce.
+    fn set_view(&mut self, view: ViewMode) {
+        self.view = view;
+        self.settings.view = match view {
+            ViewMode::List => settings::View::List,
+            ViewMode::Tree => settings::View::Tree,
+        };
+        self.settings_dirty = true;
     }
 
     /// Keyboard handling while a dialog is up.
@@ -1725,6 +1944,19 @@ impl eframe::App for KestrelApp {
         }
         self.draw(ui);
     }
+
+    /// Writes the settings to `eframe`'s storage.
+    ///
+    /// Called on eframe's auto-save interval and once on exit, which is why
+    /// there is no `write` anywhere in this crate: the storage is an in-memory
+    /// map, and eframe's own writer thread does the file I/O off the frame.
+    /// A `std::fs::write` on the way out of a settings toggle would have been a
+    /// blocking call in the UI path, which is the one thing this crate does not
+    /// do.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.normalise();
+        eframe::set_value(storage, settings::KEY, &self.settings);
+    }
 }
 
 impl KestrelApp {
@@ -1734,6 +1966,7 @@ impl KestrelApp {
         let start = Instant::now();
         match self.screen {
             Screen::Gallery => crate::gallery::show(ui, &mut self.theme, &mut self.mode),
+            Screen::Settings => self.settings_screen(ui),
             Screen::Browser => {
                 // Non-blocking pumps, before any widget reads the row vector.
                 self.pump();
@@ -1742,6 +1975,17 @@ impl KestrelApp {
                 self.keyboard(ui);
                 self.panels(ui);
             }
+        }
+
+        // The shortcut overlay is drawn last, over everything including the
+        // dialog scrim, and is *not* part of `Screen`: it is a layer, and a
+        // layer that replaced the browser would mean F1 destroyed the selection
+        // you were about to act on.
+        if self.help && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F1)) {
+            self.help = false;
+        }
+        if self.help && crate::help::draw(ui, &self.theme) {
+            self.help = false;
         }
 
         self.frames = self.frames.wrapping_add(1);
@@ -1761,6 +2005,56 @@ impl KestrelApp {
 // ----------------------------------------------------------------------------
 
 impl KestrelApp {
+    /// The settings screen.
+    ///
+    /// A replacement for the browser rather than a window on top of it: the
+    /// browser's scroll offset, selection and staged clipboard are untouched
+    /// underneath, so closing the screen is instant and nothing is lost by
+    /// having looked at the settings.
+    fn settings_screen(&mut self, ui: &mut Ui) {
+        // `Escape` closes, and only `Escape` — a settings screen has no
+        // unsaved state to lose (every change is already in `self.settings`,
+        // which is what gets saved), so there is nothing to confirm and a
+        // confirm would be §4.7's rule applied to a non-destructive action.
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.close_settings();
+            return;
+        }
+        let theme = self.theme;
+        let motion = self.motion;
+        let before = self.settings;
+        if settings::draw(ui, &theme, &mut self.settings, motion) == settings::Action::Close {
+            self.close_settings();
+            return;
+        }
+        if self.settings != before {
+            // A changed setting that needs a rescan applies immediately rather
+            // than on close: `show_hidden` is a scan option, so waiting for the
+            // Close button would show a setting the app is not honouring.
+            self.settings_dirty = true;
+            if self.settings.show_hidden != before.show_hidden {
+                let dir = self.dir.clone();
+                self.open_dir(dir);
+            }
+        }
+    }
+
+    /// Leaves the settings screen, folding the edits into the live app.
+    fn close_settings(&mut self) {
+        self.apply_settings();
+        self.screen = Screen::Browser;
+    }
+
+    /// Opens the settings screen.
+    fn open_settings(&mut self) {
+        // The other direction of `apply_settings`'s rule: the app may have
+        // changed a setting since the screen was last closed (`Ctrl+T` cycles
+        // the theme, `Ctrl+2` the view), and reopening must show what is true
+        // now rather than what was true then.
+        self.apply_settings();
+        self.screen = Screen::Settings;
+    }
+
     /// Builds the whole shell. Panels before the `CentralPanel`, always.
     fn panels(&mut self, ui: &mut Ui) {
         // Panel order is not cosmetic: an egui panel is sized against whatever
@@ -1781,7 +2075,9 @@ impl KestrelApp {
             // manager: places, list, detail.
             self.preview_panel(ui);
         }
-        self.sidebar(ui);
+        if self.show_sidebar {
+            self.sidebar(ui);
+        }
         self.breadcrumb(ui);
         // The list's width is measured **once**, here, and handed to both the
         // header and the rows.
@@ -2115,7 +2411,11 @@ impl KestrelApp {
     /// time — and only the body is conditional.
     fn preview_panel(&mut self, ui: &mut Ui) {
         let theme = self.theme;
-        let width = dialog::preview_metrics::WIDTH;
+        // `default_size` is only ever the *first* frame's guess — see the note
+        // below about non-resizable panels keeping their last width — so the
+        // settings value is re-asserted every frame, normalised on load, and
+        // the panel's own min/max still bound it.
+        let width = self.preview_width;
         egui::Panel::right("preview")
             .default_size(width)
             .min_size(dialog::preview_metrics::MIN_WIDTH)
@@ -2631,6 +2931,12 @@ impl KestrelApp {
 
         let ahead = self.history.forward_len();
         let mut pending: Option<Action> = None;
+        // Measured **outside** the panel, against the root `Ui`: a `Panel` sized
+        // against its own content has no idea how much room it is being given,
+        // so deciding the density inside one would be deciding it against the
+        // number of pixels the previous frame happened to paint.
+        let plan = toolbar::plan(ui, &theme, ui.available_width(), &btns);
+        let mut filter_rect: Option<Rect> = None;
         egui::Panel::top("toolbar")
             .exact_size(metric::TOOLBAR)
             .frame(toolbar::frame(&theme))
@@ -2639,17 +2945,26 @@ impl KestrelApp {
                     // §4.4: proximity does the grouping, so separators sit only
                     // between functional groups, never between adjacent buttons.
                     for (i, b) in btns.iter().enumerate() {
-                        if matches!(i, 4 | 5) {
+                        if toolbar::separator_before(i) {
                             toolbar::separator(ui, &theme);
                         }
-                        if toolbar::draw(ui, &theme, *b, ahead).clicked() {
+                        if toolbar::draw(ui, &theme, *b, ahead, plan.density).clicked() {
                             pending = Some(b.action);
                         }
                     }
-                    toolbar::separator(ui, &theme);
-                    self.filter_field(ui, &theme);
+                    if let Some(width) = plan.filter {
+                        toolbar::separator(ui, &theme);
+                        filter_rect = Some(self.filter_field(ui, &theme, width));
+                    }
                 });
             });
+
+        // §7.14 and the narrow-window contract: a window too small for even the
+        // icon row says so, rather than letting buttons run off the right edge
+        // with no indication that the toolbar has been cut. The status bar is
+        // where a permanent condition belongs (§4.5), and it is the only band
+        // that is not the thing being clipped.
+        self.toolbar_narrow = plan.filter.is_none();
 
         if let Some(action) = pending {
             self.apply(action);
@@ -2663,20 +2978,26 @@ impl KestrelApp {
             Action::Forward => self.go_forward(),
             Action::Up => self.go_up(),
             Action::Refresh => self.refresh(),
-            Action::ViewList => self.view = ViewMode::List,
-            Action::ViewTree => self.view = ViewMode::Tree,
+            Action::ViewList => self.set_view(ViewMode::List),
+            Action::ViewTree => self.set_view(ViewMode::Tree),
             Action::Sort => self.cycle_sort(),
             Action::Filter => self.filter_focused = true,
             Action::Theme => self.cycle_theme(),
+            Action::Settings => self.open_settings(),
+            Action::Help => self.help = true,
         }
     }
 
     /// §4.8 The search field: `Filter…` placeholder, leading glyph, a live
     /// match count *outside* the field, and a clear button that appears only
     /// when the query is non-empty.
-    fn filter_field(&mut self, ui: &mut Ui, theme: &Theme) {
+    fn filter_field(&mut self, ui: &mut Ui, theme: &Theme, width: f32) -> Rect {
         let height = component::INPUT_HEIGHT;
-        let width = 220.0_f32.min(ui.available_width());
+        // The width is [`toolbar::plan`]'s, never `min(pref, available)`. The
+        // old `min` is what produced a 91px field whose right half sat outside
+        // the window: it answered "how much is left" with a number and then
+        // drew a field of that width anyway, including the clear button and the
+        // text inset that assume there is room for them.
         let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
 
         let focused = self.filter_focused || response.has_focus();
@@ -2792,6 +3113,7 @@ impl KestrelApp {
                 self.filter.clear();
             }
         }
+        rect
     }
 
     /// §4.1 Sidebar: the Places list, and nothing else.
@@ -3245,6 +3567,23 @@ impl KestrelApp {
                         );
                     }
 
+                    // §7.16: never a silent status change. The watcher's absence
+                    // is a permanent change to how the list behaves, so it gets
+                    // a permanent chip with the one action that fixes it — not a
+                    // log line, and not a `log::warn!` the user never sees.
+                    if self.watch_error.is_some() {
+                        widgets::status_divider(ui, &theme);
+                        if widgets::status_notice(
+                            ui,
+                            &theme,
+                            "Not watching for changes",
+                            "Refresh",
+                            "The filesystem watcher could not be started, so this folder will not update on its own. Press F5, or click Refresh, to re-read it.",
+                        ) {
+                            self.refresh();
+                        }
+                    }
+
                     // §7.16: "A long operation always reports itself in the status
                     // bar with a spinner and a text label." A running file
                     // operation outranks both the item count and the clipboard
@@ -3686,50 +4025,31 @@ impl KestrelApp {
     ///
     /// "The empty state is a real design moment, not an afterthought… No
     /// illustration, no illustration-adjacent illustration."
+    /// §4.2's empty state, and every other way a listing can have nothing to
+    /// show. See [`crate::states`] for why the decision is a pure function and
+    /// what each state says.
     fn empty_list(&mut self, ui: &mut Ui, theme: &Theme) {
         let dir_name = self.dir.file_name().map_or_else(
             || self.dir.to_string_lossy().into_owned(),
             |n| n.to_string_lossy().into_owned(),
         );
-        let (body, icon) = if self.filter.is_empty() {
-            ("This folder is empty.", icons::FOLDER_OPEN)
-        } else {
-            ("Nothing matches this filter.", icons::MAGNIFYING_GLASS)
-        };
-
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.25);
-
-            // `row.empty-icon` — `folder-open`, 48px, `icon.chrome` at 40%.
-            let (rect, _) = ui.allocate_exact_size(
-                vec2(
-                    component::ROW_EMPTY_ICON_SIZE,
-                    component::ROW_EMPTY_ICON_SIZE,
-                ),
-                Sense::hover(),
-            );
-            tokens::icon_glyph(
-                ui.painter(),
-                rect,
-                icon,
-                component::icon_at(theme.icon.chrome, component::ROW_EMPTY_ICON_ALPHA),
-            );
-
-            ui.add_space(space::S3);
-            // `row.empty-title` — `type.display`, `text.primary`.
-            ui.label(
-                RichText::new(&dir_name)
-                    .font(tokens::font(component::ROW_EMPTY_TITLE, theme))
-                    .color(theme.text.primary),
-            );
-            ui.add_space(space::S1);
-            // `row.empty-body` — `type.dialog-body`, `text.secondary`, max 44ch.
-            ui.label(
-                RichText::new(body)
-                    .font(tokens::font(component::ROW_EMPTY_BODY, theme))
-                    .color(theme.text.secondary),
-            );
-        });
+        let state = states::State::for_listing(
+            &self.dir,
+            self.rows.len(),
+            &self.filter,
+            self.scan.is_some(),
+            &self.errors,
+        );
+        let motion = self.motion;
+        let pressed = states::draw(ui, theme, &state, &dir_name, motion);
+        if let Some(action) = pressed {
+            match action {
+                states::Action::NewFolder => self.new_folder(),
+                states::Action::ClearFilter => self.filter.clear(),
+                states::Action::Retry => self.refresh(),
+                states::Action::GoUp => self.go_up(),
+            }
+        }
     }
 }
 
@@ -3950,419 +4270,15 @@ fn depth_of(root: &Path, path: &Path) -> usize {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+//
+// Split into its own file because `app.rs` had grown past 4,500 lines and the
+// test module was a fifth of it. `#[path]` rather than a new `mod` in
+// `main.rs` because these are `app`'s own private fields: a sibling module can
+// see them, a crate-root module cannot, and the tests are worth the awkwardness
+// precisely because they can reach in.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A `KestrelApp` with no window, no scan and no watcher behind it.
-    ///
-    /// `assemble` is deliberately not used: it starts a scan and a watcher, which
-    /// is real I/O on real threads for tests that only want three fields set.
-    fn minimal_app() -> KestrelApp {
-        KestrelApp {
-            screen: Screen::Browser,
-            mode: ThemeMode::Dark,
-            theme: Theme::dark(),
-            motion: Motion::Full,
-            places: Vec::new(),
-            dir: PathBuf::from("/r"),
-            rows: Vec::new(),
-            expanded: BTreeSet::new(),
-            errors: Vec::new(),
-            scan: None,
-            watch: None,
-            history: History::new(Path::new("/r")),
-            selection: Selection::new(),
-            clipboard: Clipboard::new(),
-            sort: SortSpec::default(),
-            sort_column: SortKey::Name,
-            view: ViewMode::List,
-            show_kind_column: false,
-            scroll_rows: 0,
-            viewport_rows: 1,
-            space: SpaceProbe::new(),
-            job: None,
-            job_progress: None,
-            pending: None,
-            modal: None,
-            modal_focus: 0,
-            renaming: None,
-            creating: false,
-            mkdir_result: None,
-            preview: PvLoader::new(),
-            show_preview: true,
-            preview_content: None,
-            filter: String::new(),
-            filter_focused: false,
-            frame_ms: 0.0,
-            frames: 0,
-        }
-    }
-
-    fn row_at(root: &str, path: &str) -> Row {
-        Row {
-            depth: depth_of(Path::new(root), Path::new(path)),
-            entry: FileEntry {
-                name: Path::new(path)
-                    .file_name()
-                    .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned()),
-                path: PathBuf::from(path),
-                kind: EntryKind::File,
-                size: None,
-                modified: None,
-                hidden: false,
-                is_dir_target: None,
-            },
-        }
-    }
-
-    fn dir_entry(path: &str) -> FileEntry {
-        FileEntry {
-            name: Path::new(path)
-                .file_name()
-                .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned()),
-            path: PathBuf::from(path),
-            kind: EntryKind::Directory,
-            size: Some(4096),
-            modified: None,
-            hidden: false,
-            is_dir_target: None,
-        }
-    }
-
-    /// Depth comes from the path, so a nested child is genuinely two levels down.
-    ///
-    /// The Phase 3 stub returned `1` for every row past the first, which rendered
-    /// a 3-deep tree as a 2-deep one — a "feature" that was a lie. This is the
-    /// test that says a grandchild is a grandchild.
-    #[test]
-    fn depth_counts_components_below_the_root() {
-        assert_eq!(depth_of(Path::new("/r"), Path::new("/r/a.txt")), 0);
-        assert_eq!(depth_of(Path::new("/r"), Path::new("/r/d/a.txt")), 1);
-        assert_eq!(depth_of(Path::new("/r"), Path::new("/r/d/e/a.txt")), 2);
-        assert_eq!(depth_of(Path::new("/r"), Path::new("/r/d/e/f/a.txt")), 3);
-        // The root itself is not below the root.
-        assert_eq!(depth_of(Path::new("/r"), Path::new("/r")), 0);
-        // A path outside the root must not wrap `usize` around in `saturating_sub`.
-        assert_eq!(depth_of(Path::new("/r"), Path::new("/other/a.txt")), 0);
-    }
-
-    /// Expanding is a pure filter: a collapsed parent hides exactly its subtree.
-    #[test]
-    fn a_collapsed_parent_hides_its_children() {
-        let rows = [
-            row_at("/r", "/r/top.txt"),
-            row_at("/r", "/r/d/child.txt"),
-            row_at("/r", "/r/d/sub/grand.txt"),
-        ];
-        let mut app = minimal_app();
-        app.view = ViewMode::Tree;
-        assert!(app.tree_is_visible(&rows[0]));
-        assert!(!app.tree_is_visible(&rows[1]), "d is collapsed");
-        assert!(!app.tree_is_visible(&rows[2]), "d is collapsed");
-
-        // Expanding `d` reveals its direct children but not `d`'s grandchildren:
-        // `d/sub` is a different directory and is still collapsed.
-        app.toggle_expand(Path::new("/r/d"));
-        assert!(app.tree_is_visible(&rows[0]));
-        assert!(app.tree_is_visible(&rows[1]));
-        assert!(!app.tree_is_visible(&rows[2]));
-
-        app.toggle_expand(Path::new("/r/d/sub"));
-        assert!(app.tree_is_visible(&rows[2]));
-
-        // Collapsing `d` hides the whole subtree, grandchild included.
-        app.toggle_expand(Path::new("/r/d"));
-        assert!(!app.tree_is_visible(&rows[1]));
-        assert!(!app.tree_is_visible(&rows[2]));
-    }
-
-    /// In list mode the expansion set is irrelevant: every row is top level.
-    #[test]
-    fn list_mode_shows_every_row_regardless_of_expansion() {
-        let child = row_at("/r", "/r/d/child.txt");
-        let mut app = minimal_app();
-        app.view = ViewMode::List;
-        assert!(app.tree_is_visible(&child));
-    }
-
-    #[test]
-    fn toggling_reports_the_new_state() {
-        let mut app = minimal_app();
-        assert!(app.toggle_expand(Path::new("/r/d")), "first toggle expands");
-        assert!(!app.toggle_expand(Path::new("/r/d")), "second toggles back");
-        assert!(app.toggle_expand(Path::new("/r/d")));
-        assert_eq!(app.expanded.len(), 1, "no duplicate entries");
-    }
-
-    /// The tree scan reads exactly one level deeper than it shows, and never
-    /// more. An unbounded recursive scan behind a view toggle is how a file
-    /// manager hangs on a directory with many subdirectories — and depth 1 is
-    /// precisely what makes expanding free of I/O.
-    #[test]
-    fn the_tree_scan_is_bounded_at_one_level() {
-        let mut app = minimal_app();
-        app.view = ViewMode::List;
-        let list = app.scan_options();
-        assert!(!list.recursive, "list mode must not recurse at all");
-        assert_eq!(list.max_depth, 0);
-
-        app.view = ViewMode::Tree;
-        let tree = app.scan_options();
-        assert!(tree.recursive);
-        assert_eq!(tree.max_depth, 1, "depth 1 is what makes expand I/O-free");
-    }
-
-    /// Descending needs no I/O, because the scanner resolved the link.
-    #[test]
-    fn descendability_comes_from_the_scanner_not_from_a_stat() {
-        let real = dir_entry("/r/d");
-        assert!(descendable(&real).is_some());
-
-        let mut link = real.clone();
-        link.kind = EntryKind::Symlink;
-        link.is_dir_target = None;
-        assert!(
-            descendable(&link).is_none(),
-            "an unresolved link must not be entered"
-        );
-        link.is_dir_target = Some(true);
-        assert!(
-            descendable(&link).is_some(),
-            "a link to a directory is entered"
-        );
-        link.is_dir_target = Some(false);
-        assert!(descendable(&link).is_none(), "a link to a file is not");
-    }
-
-    /// The breadcrumb always ends with the current directory, whatever the path.
-    #[test]
-    fn the_breadcrumb_is_root_first_and_ends_at_the_leaf() {
-        let segs = breadcrumb_segments(Path::new("/tmp/opencode/p3"));
-        let labels: Vec<&str> = segs.iter().map(|s| s.label.as_str()).collect();
-        assert_eq!(labels, vec!["/", "tmp", "opencode", "p3"]);
-        // Every segment's path is the directory it navigates to.
-        assert_eq!(
-            segs.last().map(|s| s.path.as_path()),
-            Some(Path::new("/tmp/opencode/p3"))
-        );
-        assert_eq!(segs[1].path, PathBuf::from("/tmp"));
-    }
-
-    #[test]
-    fn the_root_breadcrumb_is_just_the_root() {
-        let segs = breadcrumb_segments(Path::new("/"));
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].label, "/");
-    }
-
-    /// §4.3: the last two segments always stay visible, so "where am I" and
-    /// "what's in here" survive any width.
-    #[test]
-    fn the_breadcrumb_never_collapses_past_the_last_two_segments() {
-        let deep = breadcrumb_segments(Path::new(
-            "/a/very/long/segment/name/that/alone/exceeds/the/whole/pane/width/quite/easily",
-        ));
-        for width in [0.0_f32, 10.0, 80.0, 200.0, 2000.0] {
-            let (visible, _) = trailing_segments(&deep, width);
-            assert!(
-                visible.len() >= 2.min(deep.len()),
-                "width {width} kept only {} of {} segments",
-                visible.len(),
-                deep.len()
-            );
-        }
-    }
-
-    /// A wider pane collapses fewer ancestors, monotonically.
-    #[test]
-    fn a_wider_pane_shows_more_ancestors() {
-        let deep = breadcrumb_segments(Path::new("/a/bb/ccc/dddd/eeeee/ffffff"));
-        let narrow = trailing_segments(&deep, 60.0).1;
-        let wide = trailing_segments(&deep, 2000.0).1;
-        assert!(wide < narrow, "wide kept {wide}, narrow kept {narrow}");
-        assert_eq!(wide, 0, "a wide pane shows the root too");
-    }
-
-    /// A `Ui` with one frame's worth of input, for driving the keyboard handler.
-    ///
-    /// egui delivers key events through `RawInput::events`, and a *modifier-free*
-    /// `Key` event with the default `KeyState::Pressed` is what a real keypress
-    /// looks like to `consume_key`. The handler is given a `Ui` from a headless
-    /// context so the test can call it directly — which is the only way to ask
-    /// "does Delete reach the app while a rename field is open?" without a
-    /// window.
-    fn with_keys(keys: &[Key], mut body: impl FnMut(&mut KestrelApp, &mut Ui)) {
-        let ctx = crate::shot::ctx_with_fonts();
-        let raw = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0))),
-            events: keys
-                .iter()
-                .map(|k| egui::Event::Key {
-                    key: *k,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::default(),
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let output = ctx.run_ui(raw, |ui| body(&mut minimal_app(), ui));
-        output.drop_without_applying_deltas();
-    }
-
-    /// §4.11: while the rename field is open, the global bindings must not fire.
-    ///
-    /// `Delete` is the case that matters. A row is selected, the user presses
-    /// `F2`, and the field is open — if `Delete` still reached the app, a
-    /// keystroke aimed at the *field* would open a confirm dialog to destroy the
-    /// selected file. The field is where the user's attention is; the app is not.
-    ///
-    /// `consume_key` removes the event from the input state, so the same key
-    /// cannot also reach the `TextEdit`. The test asserts the app did not act,
-    /// which is the half that would be a data-loss bug.
-    #[test]
-    fn a_rename_field_owns_the_keyboard() {
-        with_keys(&[Key::Delete], |app, ui| {
-            app.rows = vec![row_at("/r", "/r/a.txt")];
-            app.selection.click(0);
-            app.begin_rename();
-            assert!(app.renaming.is_some(), "the rename field is open");
-
-            app.keyboard(ui);
-
-            assert!(
-                app.modal.is_none(),
-                "Delete reached the app while the rename field had focus, and \
-                 opened {:?}",
-                app.modal
-            );
-            assert!(app.renaming.is_some(), "the field is still open");
-        });
-    }
-
-    /// The same for the filter field, and for every other global binding.
-    ///
-    /// `Ctrl+A` is the sharp one: while it belongs to the text editor it means
-    /// "select this query". Leaked to the app it would select every row in the
-    /// directory, which is the sort of mistake a user makes once and then stops
-    /// trusting the keyboard in.
-    #[test]
-    fn a_filter_field_owns_the_keyboard() {
-        with_keys(&[Key::A], |app, ui| {
-            app.rows = (0..5)
-                .map(|i| row_at("/r", &format!("/r/f{i}.txt")))
-                .collect();
-            app.selection.click(0);
-            app.filter_focused = true;
-            assert_eq!(app.selection.len(), 1);
-
-            ui.input_mut(|i| {
-                i.consume_key(egui::Modifiers::CTRL, Key::A);
-            });
-            // `keyboard()` runs *after* the Ctrl modifier has been consumed above
-            // in the real frame, because `TextEdit` handles it first. What the
-            // app's own handler must not do is reach for a bare `A` and type it
-            // into the query either.
-            app.keyboard(ui);
-            assert_eq!(app.selection.len(), 1, "Ctrl+A selected rows");
-            assert!(app.filter.is_empty(), "a stray A reached the query");
-        });
-    }
-
-    /// And with no field open, the same key does what §4.11 says.
-    ///
-    /// The other half of the two tests above: a guard that swallows everything
-    /// would pass both of them, and a shortcut that never fires is a different
-    /// bug with the same symptom.
-    #[test]
-    fn a_rename_field_does_not_swallow_the_keyboard_forever() {
-        with_keys(&[Key::Delete], |app, ui| {
-            app.rows = vec![row_at("/r", "/r/a.txt")];
-            app.selection.click(0);
-            app.keyboard(ui);
-            assert!(
-                app.modal.is_some(),
-                "with no field open, Delete must open the trash confirm"
-            );
-        });
-    }
-
-    /// The preview pane's `meta` line drops a field rather than cutting a
-    /// timestamp in half.
-    ///
-    /// A `middle_truncate` on "Text · 2026-09-29 01:52 · 248 B" at 220px gives
-    /// "Text · 2026-09-29 0… · 248 B": a date that is *wrong* rather than
-    /// short. The fix is to drop the least useful field instead, and the order
-    /// is asserted here because it is a design decision and not an accident.
-    #[test]
-    fn the_meta_line_drops_a_field_rather_than_a_timestamp() {
-        let ctx = crate::shot::ctx_with_fonts();
-        // A `Painter` is only useful with a font collection behind it, so it is
-        // borrowed out of a real frame rather than constructed: `Painter` holds
-        // an `Arc` to the context's fonts, so the clone outlives the frame.
-        let mut painter = None;
-        let output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0))),
-                ..Default::default()
-            },
-            |ui| painter = Some(ui.painter().clone()),
-        );
-        output.drop_without_applying_deltas();
-        let painter = painter.expect("a frame ran");
-        let font = tokens::font(ty::META, &Theme::dark());
-        let parts = ["Text", "2026-09-29 01:52", "248 B"];
-
-        let full = "Text · 2026-09-29 01:52 · 248 B";
-        let width_of = |s: &str| {
-            painter
-                .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
-                .size()
-                .x
-        };
-
-        assert_eq!(
-            meta_line(&painter, &font, width_of(full), &parts),
-            full,
-            "a line that fits must be the whole line"
-        );
-        // One field short: the size goes, because the file list has a size
-        // column and the pane does not.
-        let two = "Text · 2026-09-29 01:52";
-        assert_eq!(
-            meta_line(&painter, &font, width_of(two), &parts),
-            two,
-            "the size is the first field to go"
-        );
-        // Down to the kind alone. Never a truncated timestamp, at any width.
-        for width in [0.0_f32, 12.0, 40.0, width_of(two) - 1.0] {
-            let line = meta_line(&painter, &font, width, &parts);
-            assert!(
-                !line.contains("2026-09-29 0"),
-                "at {width}px the line is a wrong date: {line:?}"
-            );
-        }
-        assert_eq!(
-            meta_line(&painter, &font, 0.0, &parts),
-            "Text",
-            "one field always survives"
-        );
-    }
-
-    /// A 1px margin helper that rounds rather than truncating.
-    ///
-    /// `egui::Margin` is `i8` in epaint 0.36, so a half-pixel spacing token has
-    /// to round somewhere. Truncating `0.5` to `0` would silently remove a
-    /// margin; rounding keeps it.
-    #[test]
-    fn margin_rounds_rather_than_truncates() {
-        assert_eq!(egui::Margin::same(0).left, 0);
-        assert_eq!(egui::Margin::same(1).left, 1);
-        // Out-of-range values are clamped, not wrapped into a negative margin.
-        let big = margin(1000.0);
-        assert!(big.left >= 0, "a huge margin must not wrap negative");
-        assert_eq!(margin(-5.0).left, 0, "a negative margin clamps to 0");
-    }
-}
+#[path = "app_tests.rs"]
+mod tests;

@@ -11,6 +11,12 @@ name = "kestrel"
 path = "src/main.rs"
 
 [dependencies]
+# Already in the graph through `eframe/persistence`, and the persistence
+# feature is on because settings have to survive a restart. Deriving `Serialize`
+# on the settings struct is the only reason this is a direct dependency, and it
+# adds no packages.
+serde = { version = "1", features = ["derive"] }
+
 # The headless filesystem engine. Zero UI dependencies by design.
 kestrel-fs = { path = "../kestrel-fs" }
 
@@ -62,3 +68,8 @@ all = "warn"
 # need an actual filesystem to happen on, not a mock. Same reason kestrel-fs has
 # it, and it is a dev-dependency so it never reaches a shipped binary.
 tempfile = "3.23.0"
+
+# `ron` for the settings round-trip test, which writes and reads a real file in
+# the format `eframe` itself uses. Already in the graph via `eframe/persistence`;
+# listed here so the test's dependency is visible rather than inherited.
+ron = "0.12"
