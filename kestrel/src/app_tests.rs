@@ -79,6 +79,7 @@ fn minimal_app() -> KestrelApp {
         settings: settings::Stored::default(),
         settings_dirty: false,
         help: false,
+        pane_too_narrow: false,
     }
 }
 
@@ -552,4 +553,122 @@ fn a_fade_does_not_move_anything() {
         before,
         "the settled frame differs from the unfaded one"
     );
+}
+
+/// The pane policy at a given window width.
+///
+/// A file manager with three panes in a 640px window is a file manager showing
+/// 160px of a name column. The list is the reason the app exists, so it is the
+/// last pane to give up space — and this is the rule, as a pure function so it
+/// can be checked at every width rather than at the three that were screenshotted.
+mod pane_policy {
+    use super::LIST_MIN_W;
+    use crate::dialog::preview_metrics;
+    use crate::tokens::metric;
+
+    /// What a window of `width` shows.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Plan {
+        sidebar: bool,
+        /// `None` when the pane does not fit at any width.
+        preview: Option<bool>,
+    }
+
+    /// The policy, mirroring `KestrelApp::panels`.
+    fn plan(width: f32, want_sidebar: bool, want_preview: bool, preview_w: f32) -> Plan {
+        let sidebar = want_sidebar && (width - metric::SIDEBAR_WIDTH >= LIST_MIN_W);
+        let after = width - if sidebar { metric::SIDEBAR_WIDTH } else { 0.0 };
+        let room = after - LIST_MIN_W;
+        let preview = if !want_preview {
+            Some(false)
+        } else if room < preview_metrics::MIN_WIDTH {
+            None
+        } else {
+            Some(preview_w <= room)
+        };
+        Plan { sidebar, preview }
+    }
+
+    #[test]
+    fn a_wide_window_shows_everything_at_the_size_the_user_asked_for() {
+        for w in [1200.0, 1000.0, 800.0] {
+            let p = plan(w, true, true, 280.0);
+            assert!(p.sidebar, "{w}");
+            assert_eq!(p.preview, Some(true), "{w}");
+        }
+    }
+
+    #[test]
+    fn the_preview_shrinks_before_it_disappears() {
+        // 640px: sidebar 200 + list 220 leaves 220 for the preview, which is
+        // more than its 180 floor, so it shrinks rather than going.
+        let p = plan(640.0, true, true, 280.0);
+        assert!(p.sidebar);
+        assert_eq!(p.preview, Some(false), "it shrinks rather than vanishing");
+        // 500px: 500 - 200 = 300, minus the list's 220 is 80, which is under
+        // the pane's own floor, so it cannot be shown at any width.
+        let p = plan(500.0, true, true, 280.0);
+        assert_eq!(p.preview, None);
+    }
+
+    #[test]
+    fn the_sidebar_goes_before_the_preview_does() {
+        // 420px is the exact crossing: 420 - 200 (the sidebar) leaves the
+        // list's 220 and nothing for the preview, so the sidebar stays and the
+        // preview cannot. The list is the reason the app exists.
+        let p = plan(420.0, true, true, 280.0);
+        assert!(p.sidebar);
+        assert_eq!(p.preview, None);
+        // 419px: the sidebar no longer fits beside a usable list, so it goes —
+        // and the room it vacates is enough for the preview at 199px, which is
+        // above its 180 floor. The panes trade places rather than both
+        // disappearing, which is the whole point of the order.
+        let p = plan(419.0, true, true, 280.0);
+        assert!(!p.sidebar);
+        assert_eq!(
+            p.preview,
+            Some(false),
+            "it comes back, shrunk, in the sidebar's place"
+        );
+        // 400px: 400 - 220 leaves 180, exactly the preview's floor.
+        assert_eq!(plan(400.0, true, true, 280.0).preview, Some(false));
+        // 399px: under it, so the preview goes as well and the list has the lot.
+        assert_eq!(plan(399.0, true, true, 280.0).preview, None);
+    }
+
+    #[test]
+    fn the_list_always_gets_its_minimum() {
+        for w in (320..=1600).step_by(4) {
+            let w = w as f32;
+            let p = plan(w, true, true, 280.0);
+            let used = if p.sidebar {
+                metric::SIDEBAR_WIDTH
+            } else {
+                0.0
+            } + match p.preview {
+                None => 0.0,
+                Some(true) => 280.0,
+                Some(false) => {
+                    w - if p.sidebar {
+                        metric::SIDEBAR_WIDTH
+                    } else {
+                        0.0
+                    } - LIST_MIN_W
+                }
+            };
+            assert!(
+                w - used >= LIST_MIN_W - 0.5,
+                "{w}px: panes take {used}, leaving the list {}",
+                w - used
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_the_user_turned_off_stays_off() {
+        for w in [1200.0, 640.0, 420.0] {
+            assert!(!plan(w, false, true, 280.0).sidebar, "{w}");
+            assert_eq!(plan(w, true, false, 280.0).preview, Some(false), "{w}");
+        }
+    }
 }

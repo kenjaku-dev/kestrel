@@ -71,6 +71,50 @@ use crate::tokens::{
     with_alpha,
 };
 
+/// The width the status bar's trailing section needs, for the path to avoid it.
+///
+/// The free-space meter's `metric.scrollbar`-plus-label, measured with the fonts
+/// that will draw it. Measured here rather than counted because the label is a
+/// formatted byte count whose length depends on the disk, and a fixed reserve
+/// either wastes 40px on a small disk or overlaps on a full one.
+fn trailing_status_width(ui: &Ui, theme: &Theme, space: Option<crate::disk::FreeSpace>) -> f32 {
+    // No reading yet: the section is absent rather than showing a fabricated
+    // number, so nothing is reserved for it.
+    let Some(space) = space else {
+        return 0.0;
+    };
+    let label = format!("{} free", space.format_free());
+    component::STATUSBAR_METER_W
+        + space::S2
+        + widgets::text_width(ui, &label, tokens::font(component::STATUSBAR_LABEL, theme))
+}
+
+/// The path, middle-truncated to the width left after the trailing section.
+///
+/// `0` when the trailing section has the whole bar, and a single `…` rather
+/// than nothing: a path that is not shown at all is a status bar with no
+/// position in it, which is the thing §4.5 says the bar is for.
+fn truncate_path(ui: &Ui, path: &str, reserved: f32) -> String {
+    let budget = (ui.available_width() - reserved - space::S3).max(0.0);
+    if budget <= 0.0 {
+        return "\u{2026}".to_string();
+    }
+    // `type.meta` is 12px in Plex **Mono**, whose advance is a fixed 7.2px, so
+    // the column count is exact here — the same property that makes the
+    // preview's code lines right and the file list's names slightly wrong.
+    let cols = (budget / 7.2).floor().max(1.0) as usize;
+    format::middle_truncate(path, cols)
+}
+
+/// The file list's own minimum width, in logical pixels.
+///
+/// `metric.column-name-min` (160) plus `metric.gutter` (10) plus a size column
+/// that the header can still show an ellipsis in (50). The list is the reason
+/// the app exists — a sidebar and a preview pane are both optional views of
+/// what is in it — so it is the last thing to give up space and the first to
+/// get it back.
+const LIST_MIN_W: f32 = 220.0;
+
 /// How long a directory's contents take to arrive.
 ///
 /// §2.11 names `motion.deliberate` (380ms) for "directory content cross-fade on
@@ -476,6 +520,12 @@ pub struct KestrelApp {
     settings_dirty: bool,
     /// The keyboard shortcut overlay, per §4.11's discoverability contract.
     help: bool,
+    /// A pane the settings asked for did not fit and was dropped this frame.
+    ///
+    /// §7.16: a change in what the app is showing is a status change, and a
+    /// status change that is not announced is the same defect as the watcher's
+    /// failure being a log line.
+    pane_too_narrow: bool,
 }
 
 impl KestrelApp {
@@ -610,6 +660,7 @@ impl KestrelApp {
             settings,
             settings_dirty: false,
             help: false,
+            pane_too_narrow: false,
         };
         app.apply_settings();
         app.open_dir(dir);
@@ -2114,13 +2165,37 @@ impl KestrelApp {
         // go first, and every side panel after them.
         self.top_toolbar(ui);
         self.status_bar(ui);
+        // `pane_too_narrow` is cleared **here**, immediately after the band that
+        // reads it and before the panes that set it. The status bar is drawn
+        // second and the panes that decide whether they fit are drawn after it,
+        // so a flag cleared at the top of this function is read as `false` every
+        // frame and the notice never appears — which is the exact bug the flag
+        // was added to fix. Cleared here, it survives from the frame the pane
+        // made the decision to the frame the status bar reports it, which at
+        // 16ms is not a thing anyone can see. Reordering the bands would fix it
+        // too, and §2.12 and the note below make their order load-bearing.
+        self.pane_too_narrow = false;
+        // Places first, then the detail pane, then the list.
+        //
+        // The *order* the two side panels are shown in is load-bearing and the
+        // positions are not: a left and a right panel both measure themselves
+        // against the central rectangle whatever order they appear in, so
+        // showing the sidebar first is free — and it is the only way the
+        // preview pane can ask "how much is left?" and get an answer that
+        // accounts for a sidebar the user has *dragged* to a width this code
+        // has never heard of. `metric::SIDEBAR_WIDTH` is a default, not a fact.
+        if self.show_sidebar && self.sidebar_fits(ui.available_width()) {
+            self.sidebar(ui);
+        } else if self.show_sidebar {
+            // The setting says show the sidebar and the window says there is no
+            // room for it *and* a list. Said so in the status bar rather than
+            // silently overridden.
+            self.pane_too_narrow = true;
+        }
         if self.show_preview {
             // Right, so the list keeps the left-to-right reading order of a file
             // manager: places, list, detail.
             self.preview_panel(ui);
-        }
-        if self.show_sidebar {
-            self.sidebar(ui);
         }
         self.breadcrumb(ui);
         // The list's width is measured **once**, here, and handed to both the
@@ -2453,13 +2528,46 @@ impl KestrelApp {
     /// preview pane that shows nothing is indistinguishable from a broken one, so
     /// every path renders *something* — the icon, the type, the size, the modified
     /// time — and only the body is conditional.
+    /// `true` when a sidebar and a usable list both fit in `width`.
+    ///
+    /// Measured against [`metric::SIDEBAR_WIDTH`] rather than
+    /// [`metric::SIDEBAR_MIN`], and the difference is a real limit: the sidebar
+    /// is resizable, so a user who drags it to `SIDEBAR_MAX` (340) in a 640px
+    /// window *will* leave the list short. The check cannot see that — egui
+    /// keeps the dragged width in panel state and exposes no getter — and the
+    /// honest options are to be conservative to the point of hiding the sidebar
+    /// at 500px for a reason that is not the user's fault, or to answer for the
+    /// width the sidebar actually has on first run and let a user who drags it
+    /// very wide know they have. The second is what this does.
+    fn sidebar_fits(&self, width: f32) -> bool {
+        width - metric::SIDEBAR_WIDTH >= LIST_MIN_W
+    }
+
     fn preview_panel(&mut self, ui: &mut Ui) {
         let theme = self.theme;
+        // The pane gives way before the list does, and only after it has been
+        // asked to. Three panes in a 640px window leave the list 160px — one
+        // name column with no room for a size, which is not a file manager, it
+        // is a column of truncated names.
+        //
+        // The order of the two questions is the design: first, can the preview
+        // be *shrunk* to what is left after reserving the list's minimum? If
+        // yes, shrink it. If not, it does not fit at all, and a setting that
+        // says "show the preview" is overridden by a window that cannot hold
+        // one — with a line in the status bar saying so, because a pane that
+        // silently stops appearing is the same hidden-affordance bug as a
+        // button that silently stops working.
+        let available = ui.available_width();
+        let room = available - LIST_MIN_W;
+        if room < dialog::preview_metrics::MIN_WIDTH {
+            self.pane_too_narrow = true;
+            return;
+        }
         // `default_size` is only ever the *first* frame's guess — see the note
         // below about non-resizable panels keeping their last width — so the
         // settings value is re-asserted every frame, normalised on load, and
         // the panel's own min/max still bound it.
-        let width = self.preview_width;
+        let width = self.preview_width.min(room);
         egui::Panel::right("preview")
             .default_size(width)
             .min_size(dialog::preview_metrics::MIN_WIDTH)
@@ -3631,6 +3739,15 @@ impl KestrelApp {
                         );
                     }
 
+                    if self.pane_too_narrow {
+                        widgets::status_divider(ui, &theme);
+                        // Short, because the status bar at 500px is already
+                        // carrying an item count, a path and a free-space
+                        // meter. A sentence here is the one string that pushes
+                        // something off the end.
+                        widgets::status_label(ui, &theme, "pane hidden: window too narrow");
+                    }
+
                     // §7.16: never a silent status change. The watcher's absence
                     // is a permanent change to how the list behaves, so it gets
                     // a permanent chip with the one action that fixes it — not a
@@ -3663,10 +3780,20 @@ impl KestrelApp {
 
                     // `statusbar.path` — `type.meta`, `text.secondary`, left,
                     // middle-truncate, flex.
+                    //
+                    // "Flex" is the part that was missing, and it is the whole
+                    // reason the trailing free-space block ends up painted on
+                    // top of it: the path reported its full 64-column width, the
+                    // cursor advanced past the middle of the bar, and the
+                    // `right_to_left` section then drew from there. The fix is
+                    // to spend only what is left after the trailing section has
+                    // had its width, which means measuring it *before* the path
+                    // rather than after.
+                    let trailing = trailing_status_width(ui, &theme, self.space.get());
                     widgets::status_value(
                         ui,
                         &theme,
-                        &format::middle_truncate(&self.dir.to_string_lossy(), 64),
+                        &truncate_path(ui, &self.dir.to_string_lossy(), trailing),
                     );
 
                     // `statusbar.selection-count-idle` when nothing is selected
