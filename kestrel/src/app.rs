@@ -184,6 +184,11 @@ pub enum Scene {
     Progress,
     /// §4.7 A job that stopped halfway.
     Failed,
+    /// `Enter` on a file with no registered application.
+    ///
+    /// The state that was a dead end until the open path existed: the key was
+    /// consumed, nothing happened, and there was no message explaining why.
+    CannotOpen,
     /// The preview pane's empty state, centred.
     PreviewEmpty,
     /// The preview pane on a text file, syntax-highlighted.
@@ -526,6 +531,12 @@ pub struct KestrelApp {
     /// status change that is not announced is the same defect as the watcher's
     /// failure being a log line.
     pane_too_narrow: bool,
+    /// An `Enter`-on-a-file in flight, if any.
+    ///
+    /// `None` for the overwhelming majority of frames, which is why this is a
+    /// handle and not a state: the launch runs on a worker and the only work
+    /// per frame is one non-blocking [`kestrel_fs::open::Opening::poll`].
+    opening: Option<kestrel_fs::open::Opening>,
 }
 
 impl KestrelApp {
@@ -661,6 +672,7 @@ impl KestrelApp {
             settings_dirty: false,
             help: false,
             pane_too_narrow: false,
+            opening: None,
         };
         app.apply_settings();
         app.open_dir(dir);
@@ -744,6 +756,20 @@ impl KestrelApp {
                     path: self.dir.join("locked"),
                     reason: "Permission denied (os error 13)".to_string(),
                 });
+                self.modal_focus = 0;
+            }
+            // The message a user gets for pressing Enter on a file nothing is
+            // registered to open. Built from the real error type rather than
+            // written as a literal, so the capture cannot drift from what the
+            // app says.
+            Scene::CannotOpen => {
+                let path = self.dir.join("archive.kfx");
+                let reason = kestrel_fs::open::OpenError::NoHandler {
+                    path: path.clone(),
+                    mime: "application/x-kestrel-fixture".to_string(),
+                }
+                .sentence();
+                self.modal = Some(DlgKind::CannotOpen { path, reason });
                 self.modal_focus = 0;
             }
             Scene::PreviewText => {
@@ -1538,15 +1564,23 @@ impl KestrelApp {
         self.open_dir(dir);
     }
 
-    /// Descends into the focused row, if the scanner proved it is a directory.
+    /// Acts on the focused row: navigate into a directory, or open a file.
     ///
-    /// In tree mode this **expands or collapses in place** instead: the whole
-    /// point of the view is to see a hierarchy, and navigating away from under
-    /// the user to show one folder is a list view with extra steps.
+    /// In tree mode a directory **expands or collapses in place** instead: the
+    /// whole point of the view is to see a hierarchy, and navigating away from
+    /// under the user to show one folder is a list view with extra steps.
     ///
-    /// Zero I/O: the answer is [`kestrel_fs::model::FileEntry::is_descendable`],
-    /// which the scanner filled in on its own thread, and toggling expansion
-    /// re-filters rows that are already in memory.
+    /// Zero I/O for the *decision*: the answer is
+    /// [`kestrel_fs::model::FileEntry::is_descendable`], which the scanner
+    /// filled in on its own thread, and toggling expansion re-filters rows that
+    /// are already in memory.
+    ///
+    /// Opening a **file** used to be a dead end — the key was consumed and
+    /// nothing happened, in the app's most-used action. It now goes through
+    /// [`kestrel_fs::open`], which resolves the type, finds the registered
+    /// handler and runs it on a worker thread. A directory never reaches that
+    /// path: navigating into it is the whole point of the key, and a folder with
+    /// a registered handler is something you browse, not something you launch.
     fn enter(&mut self) {
         let Some(at) = self.selection.focus() else {
             return;
@@ -1554,22 +1588,79 @@ impl KestrelApp {
         let Some(entry) = self.visible_row(at) else {
             return;
         };
-        if !entry.is_descendable() {
-            return;
+        // The two fields the branch needs are copied out before anything takes
+        // `&mut self`, so the decision can be made without holding a borrow
+        // across the call.
+        let action = kestrel_fs::open::enter_action(entry);
+        let path = entry.path.clone();
+        let kind = entry.kind;
+        match action {
+            Some(kestrel_fs::open::Enter::Open) => self.open_path(&path),
+            Some(kestrel_fs::open::Enter::Descend) => self.descend(&path, kind),
+            None => {}
         }
+    }
+
+    /// Navigates into a directory the scanner proved is one.
+    fn descend(&mut self, path: &Path, kind: EntryKind) {
         if self.view == ViewMode::Tree {
-            let path = entry.path.clone();
-            self.toggle_expand(&path);
+            let target = path.to_path_buf();
+            self.toggle_expand(&target);
             return;
         }
-        let target = entry.path.clone();
         // A symlink resolves to its own path, which the history may already
         // hold under a different name; record it as the same place.
-        if entry.kind == EntryKind::Symlink {
-            self.open_dir(target.clone());
-            self.note_same_place(target);
+        if kind == EntryKind::Symlink {
+            self.open_dir(path.to_path_buf());
+            self.note_same_place(path.to_path_buf());
         } else {
-            self.open_dir(target);
+            self.open_dir(path.to_path_buf());
+        }
+    }
+
+    /// Opens a file with the user's default application.
+    ///
+    /// Returns immediately: [`kestrel_fs::open::open`] does the resolution and
+    /// the spawn on a worker thread, and the only thing this frame does with
+    /// the answer is store it. A double-click's second click, or a second
+    /// `Enter` while the first is still in flight, replaces the handle rather
+    /// than queueing a second launch — the first attempt is still running and
+    /// will report its own outcome, and two applications opening at once
+    /// because the key was pressed twice is not what anybody meant.
+    fn open_path(&mut self, path: &Path) {
+        let attempt = kestrel_fs::open::open(path);
+        log::info!("open: {}", path.display());
+        self.opening = Some(attempt);
+    }
+
+    /// Collects a finished open attempt, if there is one.
+    ///
+    /// Called once per frame next to [`Self::pump_job`]. `poll` cannot block,
+    /// so this is safe to run unconditionally; the handle is cleared the frame
+    /// the answer arrives, so the dialog is raised once and not every frame
+    /// after.
+    fn pump_open(&mut self) {
+        let Some(mut attempt) = self.opening.take() else {
+            return;
+        };
+        match attempt.poll() {
+            Some(Ok(app)) => {
+                log::info!("open: handed to {app}");
+            }
+            Some(Err(err)) => {
+                log::warn!("open: {err}");
+                // A dialog already up is not replaced: the user is in the middle
+                // of answering a question that matters more than this one, and
+                // swapping it out loses their answer.
+                if self.modal.is_none() {
+                    self.modal = Some(DlgKind::CannotOpen {
+                        path: err.path().to_path_buf(),
+                        reason: err.sentence(),
+                    });
+                    self.modal_focus = 0;
+                }
+            }
+            None => self.opening = Some(attempt),
         }
     }
 
@@ -1912,6 +2003,12 @@ impl KestrelApp {
                 self.modal = None;
                 self.answer_confirm(button)
             }
+            // A report, not a question: every button on it dismisses it, and
+            // `answer_confirm` would otherwise look for a pending job and do
+            // nothing — which is right, but by accident rather than by decision.
+            DlgKind::CannotOpen { .. } => {
+                self.modal = None;
+            }
             DlgKind::Progress { .. } => {
                 if let Some(job) = self.job.as_ref() {
                     job.cancel();
@@ -2067,6 +2164,7 @@ impl KestrelApp {
                 self.pump();
                 self.pump_job();
                 self.pump_mkdir();
+                self.pump_open();
                 self.keyboard(ui);
                 self.panels(ui);
             }
@@ -2453,6 +2551,9 @@ impl KestrelApp {
                 DlgKind::Confirm { .. } | DlgKind::Failed { .. } => {
                     self.modal = None;
                     self.answer_confirm(b)
+                }
+                DlgKind::CannotOpen { .. } => {
+                    self.modal = None;
                 }
                 DlgKind::Progress { .. } => {
                     // Stop.

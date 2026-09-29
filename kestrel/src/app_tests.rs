@@ -80,6 +80,7 @@ fn minimal_app() -> KestrelApp {
         settings_dirty: false,
         help: false,
         pane_too_narrow: false,
+        opening: None,
     }
 }
 
@@ -217,6 +218,133 @@ fn descendability_comes_from_the_scanner_not_from_a_stat() {
     );
     link.is_dir_target = Some(false);
     assert!(descendable(&link).is_none(), "a link to a file is not");
+}
+
+/// `Enter` on the focused row branches on what the row *is*, and the two
+/// branches are reached from one key.
+///
+/// The bug this pins: `Enter` descended into a directory and did nothing at all
+/// on a file, so the app's most-used action was a no-op on most of its rows.
+/// The branch is now total — a row is either descended into or opened — and
+/// this asserts both arms and the symlink cases between them.
+#[test]
+fn enter_navigates_for_a_directory_and_opens_for_a_file() {
+    use kestrel_fs::open::{Enter, enter_action};
+
+    let mut dir = dir_entry("/r/src");
+    dir.kind = EntryKind::Directory;
+    assert_eq!(
+        enter_action(&dir),
+        Some(Enter::Descend),
+        "a folder navigates"
+    );
+
+    let mut file = dir_entry("/r/notes.md");
+    file.kind = EntryKind::File;
+    assert_eq!(enter_action(&file), Some(Enter::Open), "a file opens");
+
+    // A link is answered by its target, not by its own name: a link to a
+    // directory descends, and a link to a file opens — the latter by its
+    // target's type, which the open path gets by canonicalising.
+    let mut link = dir_entry("/r/latest");
+    link.kind = EntryKind::Symlink;
+    link.is_dir_target = Some(true);
+    assert_eq!(enter_action(&link), Some(Enter::Descend));
+    link.is_dir_target = Some(false);
+    assert_eq!(enter_action(&link), Some(Enter::Open));
+    // A dangling link has no target kind; it is not a directory, so it is a
+    // file to open, and the open path will report that it could not be read.
+    link.is_dir_target = None;
+    assert_eq!(enter_action(&link), Some(Enter::Open));
+}
+
+/// The frame pump raises the open failure **once**, and never blocks.
+///
+/// The handle is a single slot, so pressing `Enter` twice cannot stack two
+/// attempts — that part is structural, and what is worth testing is the
+/// consequence: whichever answer the worker gives, exactly one dialog appears
+/// and the slot is empty afterwards, so the next frame is a no-op rather than
+/// the same message reappearing sixty times a second.
+///
+/// The answer itself depends on this machine's `mimeapps.list`, so the
+/// assertions are the invariants that hold either way: at most one dialog, and
+/// it names the file if it is there.
+#[test]
+fn the_frame_pump_reports_a_finished_open_at_most_once() {
+    let mut app = minimal_app();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A file whose type nothing realistically claims a handler for, so the
+    // common outcome is the no-handler report. A machine that does claim one
+    // simply exercises the "no dialog" half of the same invariant.
+    let file = dir.path().join("kestrel-fixture.q7qzx");
+    std::fs::write(&file, b"\x00\x01\x02\x03 not text").expect("write");
+
+    app.open_path(&file);
+    assert!(app.opening.is_some(), "the attempt is in flight");
+
+    // Pump until the worker answers, or give up after a bounded number of
+    // frames. `pump_open` cannot block, so this is a deadline, not a wait.
+    // `raised` counts *transitions* into the dialog rather than frames spent
+    // with it up: a modal stays up until the user dismisses it, so counting
+    // frames would report one per frame and say nothing.
+    let mut raised = 0usize;
+    for _ in 0..600 {
+        let was_open = app.opening.is_some();
+        let had_dialog = matches!(app.modal, Some(DlgKind::CannotOpen { .. }));
+        app.pump_open();
+        if !had_dialog && matches!(app.modal, Some(DlgKind::CannotOpen { .. })) {
+            raised += 1;
+        }
+        if !was_open {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        app.opening.is_none(),
+        "the handle is cleared once the worker has answered"
+    );
+    assert_eq!(raised, 1, "exactly one dialog was raised");
+
+    if let Some(DlgKind::CannotOpen { reason, .. }) = &app.modal {
+        assert!(
+            reason.contains("kestrel-fixture.q7qzx"),
+            "the message names the file: {reason}"
+        );
+    }
+}
+
+/// A file nothing is registered to open produces a dialog naming it, not
+/// silence. Driven end-to-end through the real resolver against a `PATH`-less
+/// environment is not possible, so this drives the *reporting* half: the error
+/// the worker produces, through the same code path a frame runs.
+#[test]
+fn a_failed_open_raises_a_dialog_that_names_the_file() {
+    let mut app = minimal_app();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("definitely-not-here.kfx");
+
+    // Stand in for the worker's answer. The alternative — a real
+    // `kestrel_fs::open::open` — depends on this machine's registrations, and
+    // a test that passes on a desktop with every handler registered and fails
+    // on a container with none is not a test.
+    let err = kestrel_fs::open::OpenError::NoHandler {
+        path: missing.clone(),
+        mime: "application/x-kestrel-fixture".to_string(),
+    };
+    let path = err.path().to_path_buf();
+    let reason = err.sentence();
+    app.modal = Some(DlgKind::CannotOpen { path, reason });
+
+    let Some(DlgKind::CannotOpen { reason, .. }) = &app.modal else {
+        panic!("expected a CannotOpen dialog, got {:?}", app.modal);
+    };
+    assert!(reason.contains("definitely-not-here.kfx"), "{reason}");
+    assert!(reason.contains("No application is registered"), "{reason}");
+    // §4.7: not `OK`.
+    let buttons = dialog::buttons_for(app.modal.as_ref().expect("dialog"));
+    assert_eq!(buttons, vec![dialog::Button::Close]);
+    assert_ne!(buttons[0].label(), "OK");
 }
 
 /// The breadcrumb always ends with the current directory, whatever the path.

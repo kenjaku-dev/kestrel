@@ -132,9 +132,9 @@ OPTIONS:
         --scene NAME
                        drive the app into a state, then capture it. One of:
                        browser, confirm-permanent, confirm-trash, collision,
-                       progress, failed, preview-empty, preview-text,
-                       preview-image, preview-too-large, settings, help,
-                       empty, denied, gone, nowatch
+                       progress, failed, cannot-open, preview-empty,
+                       preview-text, preview-image, preview-too-large, settings,
+                       help, empty, denied, gone, nowatch
         --size WxH     capture at an explicit size, e.g. 900x700
 
 ARGS:
@@ -171,6 +171,7 @@ const SCENES: &[(&str, app::Scene)] = &[
     ("collision", app::Scene::Collision),
     ("progress", app::Scene::Progress),
     ("failed", app::Scene::Failed),
+    ("cannot-open", app::Scene::CannotOpen),
     ("preview-empty", app::Scene::PreviewEmpty),
     ("preview-text", app::Scene::PreviewText),
     ("preview-image", app::Scene::PreviewImage),

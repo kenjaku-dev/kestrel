@@ -836,6 +836,7 @@ mod tests {
             Scene::Collision,
             Scene::Progress,
             Scene::Failed,
+            Scene::CannotOpen,
             Scene::PreviewEmpty,
             Scene::PreviewText,
             Scene::PreviewImage,

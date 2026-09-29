@@ -97,7 +97,11 @@ pub const BINDINGS: &[Binding] = &[
     // Navigation
     Binding {
         group: Group::Navigation,
-        action: "Open folder",
+        // Both, because both happen: a directory is entered, and a file is
+        // handed to its registered application. The old label said "folder",
+        // which was true of the only case that worked and silent about the one
+        // that did nothing.
+        action: "Open folder or file",
         keys: "Enter",
         also: "double-click",
     },

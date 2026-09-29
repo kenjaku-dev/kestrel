@@ -204,6 +204,21 @@ pub enum Kind {
         /// What went wrong, already run through [`crate::job::describe`].
         reason: String,
     },
+    /// Opening a file with its default application did not work.
+    ///
+    /// Separate from [`Kind::Failed`] because a failed *job* is about work this
+    /// app started, and this is about work it declined to start: nothing was
+    /// copied, nothing was destroyed, and the `op: Op` a failed job carries has
+    /// no meaning here. Collapsing the two would give this dialog a title of
+    /// "Operation Failed" and a body beginning "Copy could not finish" for a
+    /// file nobody asked to copy.
+    CannotOpen {
+        /// The file `Enter` was pressed on.
+        path: PathBuf,
+        /// The sentence, already run through
+        /// [`kestrel_fs::open::OpenError::sentence`].
+        reason: String,
+    },
     /// A running job with enough items to be worth interrupting for.
     Progress {
         /// The running op.
@@ -236,6 +251,9 @@ impl Kind {
             Self::Confirm { op, .. } => op.verb().to_string(),
             Self::Collision { .. } => "Name Already Exists".to_string(),
             Self::Failed { .. } => "Operation Failed".to_string(),
+            // The situation, not the key: the user pressed Enter and nothing
+            // happened, and "Cannot Open" is what happened.
+            Self::CannotOpen { .. } => "Cannot Open".to_string(),
             Self::Progress { op, .. } => op.verb().to_string(),
         }
     }
@@ -306,6 +324,10 @@ impl Kind {
                 // where "permission denied" turns into "something went wrong".
                 format!("{} could not finish. {reason}", op.verb())
             }
+            // Already a complete sentence, built by the module that knows what
+            // went wrong. Prefixing a verb here would be the paraphrase the
+            // `Failed` arm above exists to avoid.
+            Self::CannotOpen { reason, .. } => reason.clone(),
             Self::Progress {
                 done,
                 total,
@@ -340,8 +362,10 @@ impl Kind {
             Self::Confirm { .. } => icons::INFO,
             Self::Collision { .. } => icons::WARNING_CIRCLE,
             // A failure is not a warning: nothing is about to happen, something
-            // already did.
-            Self::Failed { .. } => icons::X_CIRCLE,
+            // already did. Same for an open that did not happen — §3.6's
+            // `x-circle` is the "this did not work" glyph, and the two cases
+            // are the same shape.
+            Self::Failed { .. } | Self::CannotOpen { .. } => icons::X_CIRCLE,
             Self::Progress { .. } => icons::ARROWS_CLOCKWISE,
         }
     }
@@ -356,7 +380,10 @@ impl Kind {
     pub fn op(&self) -> Op {
         match self {
             Self::Confirm { op, .. } | Self::Failed { op, .. } | Self::Progress { op, .. } => *op,
-            Self::Collision { .. } => Op::Copy,
+            // `Copy` is the "no op of my own" answer, as it is for `Collision`.
+            // Nothing here is destructive, so `is_icon_dangerous` and
+            // `irreversibility_line` both read this harmlessly.
+            Self::Collision { .. } | Self::CannotOpen { .. } => Op::Copy,
         }
     }
 
@@ -370,6 +397,9 @@ impl Kind {
         match self {
             Self::Confirm { sample, .. } => sample.clone(),
             Self::Failed { path, .. } => Some(path.clone()),
+            // The sentence names the file, and the quote gives the full path,
+            // which is the part the sentence elides as too long to read.
+            Self::CannotOpen { path, .. } => Some(path.clone()),
             Self::Collision { .. } | Self::Progress { .. } => None,
         }
     }
@@ -407,7 +437,7 @@ impl Kind {
     pub fn is_icon_dangerous(&self) -> bool {
         match self {
             Self::Confirm { op, .. } => op.is_destructive(),
-            Self::Failed { .. } | Self::Collision { .. } => true,
+            Self::Failed { .. } | Self::Collision { .. } | Self::CannotOpen { .. } => true,
             Self::Progress { .. } => false,
         }
     }
@@ -630,7 +660,12 @@ pub fn buttons_for(kind: &Kind) -> Vec<Button> {
         // A failure report is not a question. One button, and it says what it
         // does. §4.7's "Cancel is always the leftmost button" governs the dialogs
         // that *offer* a choice; a one-button dialog trivially satisfies it.
-        Kind::Failed { .. } => vec![Button::Close],
+        //
+        // `CannotOpen` is the same shape and for the same reason: nothing is on
+        // offer. The next step — installing a handler, or setting a default —
+        // is outside the app, and a button labelled with something the app
+        // cannot do would be a lie. `Close` says exactly what the button does.
+        Kind::Failed { .. } | Kind::CannotOpen { .. } => vec![Button::Close],
         // §4.7's "one of exactly two or five buttons": a collision is the only
         // kind with a real question in it, so it is the only one that offers
         // both strategies and both scopes.
@@ -676,6 +711,8 @@ pub fn buttons_for(kind: &Kind) -> Vec<Button> {
 /// * `Delete Permanently` — never. §4.7 names it, and a stray Enter must not be
 ///   one keystroke away from unrecoverable.
 /// * A failure report — `Close`, the only button.
+/// * A file that would not open — `Close`, the only button, for the same reason:
+///   there is nothing on offer.
 /// * A collision — no button *decides* anything. `Scope::All` is sticky for the
 ///   rest of the job, so a user's Enter on a dialog they have not read must not
 ///   pick a scope for them. `Cancel` stops the job, which is the only answer
@@ -686,7 +723,7 @@ pub fn enter_default(kind: &Kind) -> Button {
     match kind {
         Kind::Confirm { op, .. } if *op == Op::Trash => Button::Confirm(Op::Trash),
         Kind::Confirm { .. } => Button::Cancel,
-        Kind::Failed { .. } => Button::Close,
+        Kind::Failed { .. } | Kind::CannotOpen { .. } => Button::Close,
         Kind::Collision { .. } => Button::Cancel,
         Kind::Progress { .. } => Button::Stop,
     }
@@ -1387,6 +1424,89 @@ mod tests {
     #[test]
     fn display_name_falls_back_for_a_root() {
         assert_eq!(display_name(&PathBuf::from("/")), "/");
+    }
+
+    /// A file nothing is registered to open gets a real message, not a shrug.
+    ///
+    /// §4.7 forbids a generic `OK`; the failure report here is `Close`, and the
+    /// sentence names the file and says what is missing. The button count is
+    /// one because there is nothing to choose — installing a handler or setting
+    /// a default happens outside this app, and a button labelled with something
+    /// the app cannot do would be a lie.
+    #[test]
+    fn cannot_open_is_a_named_report_with_one_named_button() {
+        let kind = Kind::CannotOpen {
+            path: PathBuf::from("/home/achraf/notes.kfx"),
+            reason: "No application is registered to open \u{201c}notes.kfx\u{201d} \
+                     as application/x-kestrel-fixture. Set a default for that \
+                     type, then press Enter again."
+                .to_string(),
+        };
+        assert_eq!(kind.title(), "Cannot Open");
+        assert!(kind.body().contains("notes.kfx"), "{}", kind.body());
+        assert!(
+            kind.body().contains("No application is registered"),
+            "{}",
+            kind.body()
+        );
+        let buttons = buttons_for(&kind);
+        assert_eq!(buttons, vec![Button::Close], "one button, and it is named");
+        assert_ne!(buttons[0].label(), "OK");
+        assert_eq!(enter_default(&kind), Button::Close);
+        assert_eq!(
+            kind.quoted_path(),
+            Some(PathBuf::from("/home/achraf/notes.kfx")),
+            "the full path is quoted under the sentence"
+        );
+        assert!(kind.is_icon_dangerous(), "an x-circle needs danger-text");
+        // Nothing was destroyed, so there is no irreversibility line to render.
+        assert_eq!(kind.extra_warning(), None);
+    }
+
+    /// Every kind renders a title, a body and at least one button — a dialog
+    /// variant added later cannot be half-built.
+    #[test]
+    fn every_kind_is_a_complete_dialog() {
+        let kinds = [
+            Kind::Confirm {
+                op: Op::Delete,
+                count: 1,
+                sample: None,
+                warning: None,
+            },
+            Kind::Collision {
+                src: PathBuf::from("/a"),
+                dst: PathBuf::from("/b"),
+                remaining: 0,
+            },
+            Kind::Failed {
+                op: Op::Move,
+                path: PathBuf::from("/a"),
+                reason: "Permission denied".to_string(),
+            },
+            Kind::CannotOpen {
+                path: PathBuf::from("/a"),
+                reason: "No application is registered.".to_string(),
+            },
+            Kind::Progress {
+                op: Op::Copy,
+                done: 1,
+                total: 2,
+                bytes: 0,
+                total_bytes: None,
+                current: PathBuf::from("/a"),
+                rate: String::new(),
+            },
+        ];
+        for kind in &kinds {
+            assert!(!kind.title().is_empty(), "{kind:?}");
+            assert!(!kind.body().is_empty(), "{kind:?}");
+            assert!(!buttons_for(kind).is_empty(), "{kind:?}");
+            for b in buttons_for(kind) {
+                assert_ne!(b.label(), "OK", "{kind:?}");
+                assert!(b.label().split(' ').count() >= 1);
+            }
+        }
     }
 
     /// The body sentence pluralises, and thousands are separated.
