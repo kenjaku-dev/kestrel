@@ -126,6 +126,19 @@ Chroma rises toward the mid-tones and falls off at both ends, which is what keep
 | `neutral.950` | `#100F0E` | |
 | `neutral.1000` | `#0A0A09` | near-black, dark theme canvas base |
 
+**Correction 2026-09 (§8, D-1).** This table used to have a gap: `surface.raised`'s dark
+value was `#24221F`, and `#24221F` is not a rung here. The rung the code actually used is
+**`neutral.800` = `#2B2824`**, and it is the one that survives — it is the value every
+dialog, menu and popover has been contrast-verified against in practice. `#2B2824` is
+therefore a *real* rung at its proper position in the ramp (between `neutral.700`
+`#443F39` and `neutral.850` `#211F1C`), and the table above already says so; §3.1 is what
+was wrong, and has been corrected to point at it.
+
+One orphan remains, deliberately left in place rather than quietly fixed: **`#24221F`**
+is still the value of `state.hover` (dark) in §3.4, and it is still not a rung in §2.1.
+It sits between `neutral.800` and `neutral.850`. It was measured in the §6.5 correction
+pass (entry 10) and re-measuring it is a separate job — see §8, D-4.
+
 ### 2.2 Accent ramp — "pine teal"
 
 The only hue in the UI chrome. Blue is refused by policy (see §7).
@@ -359,10 +372,18 @@ Components consume only these. Every role is defined for **light** and **dark**.
 | `surface.panel` | `#EFECE7` | `#191817` | sidebar background, breadcrumb bar, status bar |
 | `surface.chrome` | `#F7F5F2` | `#131211` | toolbar background |
 | `surface.list` | `#FCFBF9` | `#1E1C1A` | file list rows (default) |
-| `surface.raised` | `#FFFFFF` | `#24221F` | menus, dialogs, popovers, tooltips |
+| `surface.raised` | `#FFFFFF` | `#2B2824` | menus, dialogs, popovers, tooltips |
 | `surface.input` | `#FCFBF9` | `#1E1C1A` | search field, rename field |
 | `surface.input-disabled` | `#EFECE7` | `#191817` | |
 | `surface.scrim` | `#1C1A17` @ 38% | `#000000` @ 58% | modal backdrop |
+
+**Correction 2026-09 (§8, D-1).** `surface.raised` (dark) was `#24221F`. It is now
+`#2B2824`, which is `neutral.800` — a real rung in §2.1, where the old value was not.
+The change is not cosmetic: it is a lighter surface, so every ratio measured against
+`surface.raised` in dark drops. The `raised` column of §6.2 and correction entry 13 of
+§6.5 have been recomputed against it; §6.3 was recomputed and its minimums are
+unaffected; §6.4 does not name this surface. Entry 13 re-opens as a result and is
+recorded as such rather than quietly re-passed.
 
 ### 3.2 Text
 
@@ -967,16 +988,29 @@ Status chips: danger `#8F1D17` on `#FBE9E7` = 7.60 · success `#286A2A` on `#E4F
 
 ### 6.2 Text roles — DARK
 
+**Method (recomputed 2026-09, §8 D-1).** The `raised` column is the only one that
+changed: `surface.raised` is now `#2B2824` instead of `#24221F`, and `#2B2824` is a
+*lighter* surface, so every ratio against it falls. Each cell is
+`(L_lighter + 0.05) / (L_darker + 0.05)`, where `L` is
+`0.2126·R + 0.7152·G + 0.0722·B` over the sRGB channels linearised by
+`c ≤ 0.04045 ? c/12.92 : ((c+0.055)/1.055)^2.4`, rounded to 2dp. The minimum column is
+unchanged in all eight rows because **`selected-hover` `#1A3A34` is darker than
+`surface.raised` in both the old and the new value**, so it remains the binding surface
+for every text role in dark — the same conclusion the original audit reached, now
+re-derived rather than assumed. `row-hover` is a separate surface at `#24221F` (§3.4
+`state.hover`) and is deliberately **not** moved with `surface.raised`; that is why
+`row-hover` and `raised` no longer agree, where they used to.
+
 | Role | Value | app | panel | list | raised | row-hover | selected | sel-hover | input | **min** | |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| `text.primary` | `#F0EDE8` | 16.02 | 15.18 | 14.55 | 13.59 | 13.59 | 11.61 | 10.59 | 14.55 | **10.59** | PASS |
-| `text.secondary` | `#B8B2A9` | 8.89 | 8.43 | 8.07 | 7.54 | 7.54 | 6.44 | 5.87 | 8.07 | **5.87** | PASS |
-| `text.tertiary` | `#A6A099` | 7.23 | 6.85 | 6.56 | 6.13 | 6.13 | 5.24 | 4.77 | 6.56 | **4.77** | PASS |
-| `text.disabled` | `#726D66` | 3.65 | 3.46 | 3.31 | 3.09 | 3.09 | 2.64 | 2.41 | 3.31 | **2.41** | EXEMPT — §6.2 |
-| `accent.text` | `#6BD9C4` | 11.00 | 10.43 | 9.99 | 9.33 | 9.33 | 7.97 | 7.27 | 9.99 | **7.27** | PASS |
-| `status.danger-text` | `#F2837C` | 7.41 | 7.02 | 6.72 | 6.28 | 6.28 | 5.37 | 4.89 | 6.72 | **4.89** | PASS |
-| `status.success-text` | `#7FCE85` | 9.86 | 9.35 | 8.95 | 8.36 | 8.36 | 7.15 | 6.52 | 8.95 | **6.52** | PASS |
-| `status.warning-text` | `#E0B461` | 9.69 | 9.18 | 8.79 | 8.21 | 8.21 | 7.02 | 6.40 | 8.79 | **6.40** | PASS |
+| `text.primary` | `#F0EDE8` | 16.02 | 15.18 | 14.55 | 12.56 | 13.59 | 11.61 | 10.59 | 14.55 | **10.59** | PASS |
+| `text.secondary` | `#B8B2A9` | 8.89 | 8.43 | 8.07 | 6.97 | 7.54 | 6.44 | 5.87 | 8.07 | **5.87** | PASS |
+| `text.tertiary` | `#A6A099` | 7.23 | 6.85 | 6.56 | 5.66 | 6.13 | 5.24 | 4.77 | 6.56 | **4.77** | PASS |
+| `text.disabled` | `#726D66` | 3.65 | 3.46 | 3.31 | 2.86 | 3.09 | 2.64 | 2.41 | 3.31 | **2.41** | EXEMPT — §6.2 |
+| `accent.text` | `#6BD9C4` | 11.00 | 10.43 | 9.99 | 8.62 | 9.33 | 7.97 | 7.27 | 9.99 | **7.27** | PASS |
+| `status.danger-text` | `#F2837C` | 7.41 | 7.02 | 6.72 | 5.81 | 6.28 | 5.37 | 4.89 | 6.72 | **4.89** | PASS |
+| `status.success-text` | `#7FCE85` | 9.86 | 9.35 | 8.95 | 7.73 | 8.36 | 7.15 | 6.52 | 8.95 | **6.52** | PASS |
+| `status.warning-text` | `#E0B461` | 9.69 | 9.18 | 8.79 | 7.59 | 8.21 | 7.02 | 6.40 | 8.79 | **6.40** | PASS |
 
 `text.on-accent` `#08221D` on `accent.base` `#4FC7B1` = **8.06** PASS. `text.on-danger` `#F0EDE8` on `status.danger-solid` `#5A1512` = **11.60** PASS (this pairing was a real failure until corrected — see §6.5 entry 9).
 
@@ -984,9 +1018,29 @@ Status chips: danger `#F2837C` on `#331614` = 6.57 · success `#7FCE85` on `#182
 
 **On `text.disabled`:** WCAG 1.4.3 explicitly exempts inactive/disabled user-interface components from contrast minimums, so 2.53 / 2.41 against a *selected-hover* row is not a failure. It is documented rather than hidden, and one structural rule removes the worst case: **disabled text never renders on a selected or selected-hover row.** Disabled items are not selectable, and if an item is both, the selection is dropped. On every surface where a disabled label can actually appear, the ratio is 3.09 or better, which clears 3:1 anyway.
 
+**Correction 2026-09 (§8, D-1).** The sentence above was true and is now false in one
+place, and the failure is in the sentence's own logic rather than in the numbers.
+`surface.raised` moved from `#24221F` to the lighter `#2B2824`, which takes
+`text.disabled` from 3.09 to **2.86** on that surface. `surface.raised` is where §4.6
+puts `menu.item-text-disabled` — a disabled menu item *does* render there. So the
+structural rule above removes the selected-row worst case but not this one, and the
+"3.09 or better" escape no longer holds. The row stays `EXEMPT` (1.4.3 still exempts it
+and the number is unchanged in kind), but the surface list is wrong and is recorded as
+an open item in §8, D-2 rather than left to look resolved.
+
 ### 6.3 Icon hues — 3:1 in both themes
 
 Tested against all ten surfaces in each theme. The binding constraint for every slot is the **selected-hover** background, which is the closest a coloured icon ever sits to the surface it is drawn on.
+
+**Re-verified 2026-09 (§8, D-1).** All twelve dark slots were recomputed against the
+corrected `surface.raised` `#2B2824`; the minimum column is **unchanged in all twelve
+rows**, because `selected-hover` `#1A3A34` is darker than `surface.raised` in the dark
+theme, so no icon's worst case is an overlay surface. The per-slot ratios against the
+new `surface.raised` are, for the record: folder 6.56 · text/binary 6.97 · code 5.73 ·
+image 6.09 · video 6.36 · audio 7.73 · archive 6.71 · executable 6.60 · symlink 7.08 ·
+hidden 4.52 · error 5.81 — all clear 3:1 with the same margin as before. Same method as
+§6.2. The light column is untouched: `surface.raised` is `#FFFFFF` in both the old and
+the new value.
 
 | Slot | Light | min | Dark | min | |
 |---|---|---|---|---|---|
@@ -1026,6 +1080,18 @@ The three deliberately neutral slots (`text`, `binary`, and by extension `hidden
 
 **Borders `subtle` (1.36 light / 1.19 dark) and `default` (1.59 / 1.50) are intentionally below 3:1.** They are decorative separators between already-distinguishable regions, not the sole means of identifying a control. Every *control boundary* — input border, checkbox, dialog outline, menu outline, focus ring, scrollbar thumb — clears 3:1 independently. This is the distinction the 3:1 requirement actually draws, and it is why separators can be hairlines without becoming invisible structure.
 
+**Correction 2026-09 (§8, D-3).** That paragraph's list is one item too long, and the
+error predates the D-1 correction rather than being caused by it. The `dialog outline`
+and `menu outline` are both `border.strong`, and `border.strong` does **not** clear 3:1
+against `surface.raised`, which is the surface it is drawn on: `#A79F94` on `#FFFFFF` is
+**2.62** (light) and `#6F6961` on `#2B2824` is **2.70** (dark) — it was 2.92 against the
+superseded `#24221F`. The ten rows of the table above are all accurate; none of them
+claims `border.strong`, because `border.strong` was never measured. Two readings are
+available and this document does not pick one silently: either the outline is meant to
+be found by the dialog's `elev.2` shadow and its own lightness step rather than by
+contrast, which is the same argument §2.10 already makes for overlays, or `border.strong`
+needs to move. Filed as D-3; not fixed here.
+
 ### 6.5 Corrections made during the audit
 
 Every one of these was a real failure found by measurement, then fixed. Recording them because a spec with no failures in it was not actually measured. "Background" is the surface the pairing was measured against.
@@ -1044,9 +1110,47 @@ Every one of these was a real failure found by measurement, then fixed. Recordin
 | 10 | dark `text.disabled` on `state.hover` | `#6B6660` on `#24221F` | **2.79** — missed by 0.21 | `#726D66` | 3.09 |
 | 11 | dark `icon.hidden` on `state.selected` | `#8C8579` on `#1E4640` | **2.87** — under 3:1 | `#948E85` (and the tint fix in #3) | 3.81 |
 | 12 | light `hue.folder` on `state.selected-hover` | `#A0741A` on `#BCDED5` | **2.94** — under 3:1 | `#9A6510` | 3.43 |
-| 13 | dark `accent.border` on `surface.raised` | `#2A5A51` on `#24221F` | **2.02** — under 3:1 | `#3A7A6E` | 3.16 |
+| 13 | dark `accent.border` on `surface.raised` | `#2A5A51` on `#24221F` | **2.02** — under 3:1 | `#3A7A6E` | 3.16 — **superseded by 14** |
+| 14 | dark `accent.border` on `surface.raised` (re-verified 2026-09 after §8 D-1 moved the surface to `#2B2824`) | `#3A7A6E` on `#2B2824` | **2.93** — under 3:1, **re-opened by the surface change, not a new defect** | **OPEN** — must be ≥ `#3C7F73` (3.13); `#3F8478` gives 3.34 | **OPEN** |
+
+**Entry 13 — how to reproduce, and why 14 exists.** Entry 13 is the one row in this
+table that depends on `surface.raised`, and it is the row that the §8 D-1 correction
+invalidated. Reproduce it in three lines of arithmetic: linearise `#3A7A6E` and
+`#2B2824` to relative luminance with
+`L = 0.2126·R + 0.7152·G + 0.0722·B` over sRGB channels expanded by
+`c ≤ 0.04045 ? c/12.92 : ((c+0.055)/1.055)^2.4`, then take
+`(L_lighter + 0.05) / (L_darker + 0.05)`, rounding to 2dp.
+
+| background | `L` | `#3A7A6E` against it |
+|---|---|---|
+| `#24221F` (the old, superseded `surface.raised`) | 0.01618 | **3.16** PASS — this is what entry 13 recorded |
+| `#2B2824` (the corrected `surface.raised`, = `neutral.800`) | 0.02159 | **2.93** FAIL — this is what entry 14 records |
+
+The two backgrounds differ by 0.0054 of luminance — a rounding error in the design's
+terms, and 0.23 of a contrast ratio at the 3:1 boundary. That is the whole reason entry
+14 exists and the reason it is filed as **OPEN** rather than quietly re-passed: the
+corrected surface is *lighter*, every ratio against it falls, and `accent.border` dark
+`#3A7A6E` did not survive. It is a small step — `#3C7F73` is 3.13 and `#3F8478` is
+3.34, both still unambiguously pine teal and both still well clear of `border.default` —
+but it is a step, and it belongs to the code lane, not to a documentation edit. Until
+it is taken, entry 14 is a live accessibility failure in dark dialogs and menus, and
+this document says so.
 
 Entries 3, 4, 5 and 11 are all consequences of the same root cause: the dark selection tints were originally too light, which compressed the available contrast range for everything drawn on top of a selected row. Fixing the tints (3) exposed a second failure (4), which fixed the tint differently. The `selected-hover` state is the worst surface in the entire system — darker than `selected` in light mode is a mistake, lighter is a mistake in dark mode, and every value here was chosen by measurement rather than by eye.
+
+**Row-by-row status against `surface.raised`, for anyone re-running this audit.** Only
+three rows in §6 name or depend on `surface.raised`, and the other two tables in §6
+mention it as a column or a candidate surface. All of them were recomputed:
+
+| Row | Depends on `surface.raised`? | Verdict |
+|---|---|---|
+| §6.1 `raised` column (light) | yes, but `surface.raised` light is `#FFFFFF` before and after | **no change** — recomputed and identical |
+| §6.2 `raised` column (dark), 8 rows | yes, directly | **8 cells changed**, all downward; `min` column unchanged in all 8 because `selected-hover` is darker |
+| §6.2 `text.disabled` note | yes, and it is the note that breaks | **one prose claim invalidated** — see §8 D-2 |
+| §6.3 dark `min` column, 12 slots | yes, as one of ten candidate surfaces | **no change** — `selected-hover` is the binding surface for all 12; per-slot `raised` ratios recorded above |
+| §6.4 all 10 rows | **no** — the worst surfaces are `state.selected-hover` ×2, `surface.panel` ×3, `surface.list` ×3, `surface.input` ×2 | **no change** |
+| §6.5 entry 13 | yes, directly | **re-opened as entry 14** |
+| §6.5 entries 1–12 | no — `state.selected`, `state.selected-hover`, `status.danger-solid`, `surface.panel`, `surface.list`, `state.hover` | **no change** — entry 10 in particular is against `state.hover` `#24221F`, which D-1 did not move |
 
 ### 6.6 Beyond contrast
 
