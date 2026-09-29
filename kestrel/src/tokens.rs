@@ -2220,19 +2220,6 @@ pub mod fonts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn probe_theme() {
-        for (name, t) in [("dark", Theme::dark()), ("light", Theme::light())] {
-            eprintln!(
-                "PROBE {name} raised={:?} scrim={:?} hover={:?} app={:?} strong={:?}",
-                t.surfaces.raised.to_array(),
-                t.surfaces.scrim.to_array(),
-                t.state.hover.to_array(),
-                t.surfaces.app.to_array(),
-                t.borders.strong.to_array(),
-            );
-        }
-    }
 
     #[test]
     fn probe_glyphs() {
