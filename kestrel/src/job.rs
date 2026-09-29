@@ -397,6 +397,9 @@ pub struct JobHandle {
     cancel: CancellationToken,
     slot: Arc<DecisionSlot>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Set once [`JobHandle::drain_into`] has seen a terminal event. See
+    /// [`JobHandle::is_finished`] for why this is not a peek at the channel.
+    finished: bool,
 }
 
 impl JobHandle {
@@ -407,6 +410,7 @@ impl JobHandle {
     /// silently truncates a job. Callers that need to stop early count events.
     pub fn drain_into(&mut self, mut sink: impl FnMut(JobEvent)) {
         while let Ok(event) = self.rx.try_recv() {
+            self.finished |= is_terminal(&event);
             sink(event);
         }
     }
@@ -436,16 +440,30 @@ impl JobHandle {
         &self.slot
     }
 
-    /// `true` when the worker has sent its terminal event.
+    /// `true` once a terminal event has been seen by [`JobHandle::drain_into`].
+    ///
+    /// This does **not** peek at the channel, because `std`'s `Receiver` cannot
+    /// be peeked. Two obvious-looking attempts both eat the event:
+    ///
+    /// * `try_recv` takes the event, and the caller has to put it back.
+    /// * `rx.try_iter().peekable().peek()` *looks* like a peek and is not one:
+    ///   `Peekable::peek` calls `next`, and `try_iter`'s `next` is a
+    ///   `try_recv`, so the message leaves the channel and is dropped with the
+    ///   iterator.
+    ///
+    /// Either way the next `drain_into` silently never sees the event that was
+    /// inspected — a `Collided`, a `Failed`, an `Item` — and a file manager
+    /// that swallowed the failure of a copy is worse than one with no such
+    /// method. So the answer is recorded as events are drained, which cannot
+    /// lose them.
+    ///
+    /// The honest limit: this reports what has been *observed*. A caller that
+    /// never drains will keep seeing `false`, which is the correct answer to
+    /// the question it is actually being asked.
     #[must_use]
     #[allow(dead_code)]
     pub fn is_finished(&self) -> bool {
-        self.rx.try_recv().map_or(true, |e| {
-            matches!(
-                e,
-                JobEvent::Done { .. } | JobEvent::Cancelled { .. } | JobEvent::Failed { .. }
-            )
-        })
+        self.finished
     }
 
     /// Joins the worker thread.
@@ -528,7 +546,16 @@ pub fn start(
         cancel,
         slot,
         thread: Some(thread),
+        finished: false,
     })
+}
+
+/// `true` for the three events that end a job.
+fn is_terminal(event: &JobEvent) -> bool {
+    matches!(
+        event,
+        JobEvent::Done { .. } | JobEvent::Cancelled { .. } | JobEvent::Failed { .. }
+    )
 }
 
 /// The worker body.
@@ -687,43 +714,58 @@ fn perform(
             // `Collision::Fail` does the check and returns before writing, so
             // this loop cannot disagree with it.
             let sticky = slot.sticky();
-            let mut strategy = sticky.map(|s| s.to_collision()).unwrap_or(Collision::Fail);
-            let mut attempt = 0u8;
+            let mut strategy = sticky.map_or(Collision::Fail, |s| s.to_collision());
+            // Was the destination there before this item started? Only a
+            // destination this job *created* may be removed again — rolling back
+            // onto one that was already there would destroy the file the user
+            // asked to keep, which is the one case where cleaning up is worse
+            // than the mess.
+            let dst_existed = ops::path_entry_exists(dst);
+            // Collisions the user has answered for this item, by destination.
+            // A `Scope::ThisOne` answer is recorded here and *only* here: the
+            // blanket `strategy` would apply it to every remaining colliding
+            // child of a directory, which is how "overwrite this one" came to
+            // mean "overwrite all of them without asking".
+            let mut answered = ops::AnsweredCollisions::new();
+            let mut asked = 0u32;
             loop {
                 if cancel.is_cancelled() {
+                    let _ = cleanup_partial(dst, dst_existed);
                     return Outcome::Cancelled;
                 }
+                let options = CopyOptions {
+                    collision: strategy,
+                    answered: answered.clone(),
+                    cancel: Some(cancel.clone()),
+                    ..CopyOptions::default()
+                };
                 let result = match op {
-                    Op::Copy => ops::copy(
-                        src,
-                        dst,
-                        CopyOptions {
-                            collision: strategy,
-                            cancel: Some(cancel.clone()),
-                            ..CopyOptions::default()
-                        },
-                    ),
-                    _ => ops::move_(
-                        src,
-                        dst,
-                        CopyOptions {
-                            collision: strategy,
-                            cancel: Some(cancel.clone()),
-                            ..CopyOptions::default()
-                        },
-                        MoveStrategy::Auto,
-                    ),
+                    Op::Copy => ops::copy(src, dst, options),
+                    _ => ops::move_(src, dst, options, MoveStrategy::Auto),
                 };
                 match result {
                     Ok(()) => {
-                        return if strategy == Collision::Skip {
+                        // `Skip` that actually skipped something is a skip; a
+                        // `Skip` the user gave for an *earlier* item's collision
+                        // and that then wrote this one is not. The engine, not
+                        // the strategy, is the authority: the effective policy
+                        // for this destination is what decided the outcome.
+                        let effective = answered.get(dst).unwrap_or(strategy);
+                        return if effective == Collision::Skip && dst_existed {
                             Outcome::Skipped
                         } else {
                             Outcome::Done
                         };
                     }
-                    Err(KestrelError::AlreadyExists { .. }) if attempt == 0 => {
-                        attempt += 1;
+                    Err(KestrelError::AlreadyExists { path })
+                        if asked < MAX_COLLISIONS_PER_ITEM =>
+                    {
+                        // The failed probe may have written siblings that sorted
+                        // before the collision. Undo them, so the retry does not
+                        // copy on top of its own leftovers and so a `Skip` of the
+                        // colliding file does not leave its neighbours behind.
+                        let _ = cleanup_partial(dst, dst_existed);
+                        asked += 1;
                         // No sticky answer yet: ask.
                         if slot.sticky().is_none() {
                             let remaining = total - index;
@@ -739,11 +781,43 @@ fn perform(
                             }
                         }
                         let Some(answer) = slot.ask() else {
+                            let _ = cleanup_partial(dst, dst_existed);
                             return Outcome::Cancelled;
                         };
-                        strategy = answer.strategy.to_collision();
+                        let decided = answer.strategy.to_collision();
+                        if answer.scope == Scope::ThisOne {
+                            // Settle exactly this destination...
+                            answered.answer(path, decided);
+                            // ...and nothing else. Going back to the `Fail` probe
+                            // is what raises the *next* collision; the answered
+                            // path no longer raises, so the loop makes progress
+                            // instead of asking about the same file forever.
+                            strategy = Collision::Fail;
+                        } else {
+                            strategy = decided;
+                        }
                     }
-                    Err(err) => return fail(src, err),
+                    // Cancellation is a status, not a failure. Reporting it as
+                    // `Failed` showed the user a failure dialog whose body read
+                    // "cancelled" — two different claims, and the wrong one.
+                    Err(KestrelError::Cancelled) => {
+                        let _ = cleanup_partial(dst, dst_existed);
+                        return Outcome::Cancelled;
+                    }
+                    Err(err) => {
+                        let message = describe(&err);
+                        return Outcome::Failed(match cleanup_partial(dst, dst_existed) {
+                            Ok(()) => message,
+                            // The partial destination is the engine's documented
+                            // debt to the caller ("which the caller is expected
+                            // to clean up or report"). Reporting it by name is
+                            // the last resort; the user is the one who can act.
+                            Err(_) => format!(
+                                "{message}; {} was left partly written and may be incomplete",
+                                dst.display()
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -757,6 +831,36 @@ fn perform(
 fn fail(path: &Path, err: KestrelError) -> Outcome {
     let _ = path;
     Outcome::Failed(describe(&err))
+}
+
+/// How many collisions one item may raise before the worker stops asking.
+///
+/// A runaway guard, not a policy: each round either settles a destination or
+/// reaches a new one, so the loop terminates on its own. The ceiling exists so
+/// that if that ever stops being true the job ends with a message instead of
+/// asking the same question forever.
+const MAX_COLLISIONS_PER_ITEM: u32 = 10_000;
+
+/// Removes a destination this job created, so a cancelled or failed copy does
+/// not leave a half-written tree in the user's directory.
+///
+/// The engine documents the partial destination as the caller's problem —
+/// "leaving a partial destination behind (which the caller is expected to clean
+/// up or report)" — and a caller that does neither is how a user ends up with a
+/// truncated tree and no idea how it got there.
+///
+/// Only a destination that did **not** exist when the item started is removed.
+/// A destination that was already there is the file the user asked to keep;
+/// deleting it to tidy up would be the worst possible outcome.
+///
+/// A failure here is not fatal: the caller decides whether to report it, because
+/// "it failed and here is the mess" and "it failed and the mess is gone" are
+/// both acceptable endings and only the second is worth a sentence.
+fn cleanup_partial(dst: &Path, dst_existed: bool) -> kestrel_fs::error::Result<()> {
+    if dst_existed || !ops::path_entry_exists(dst) {
+        return Ok(());
+    }
+    ops::delete_recursive(dst, None)
 }
 
 /// A one-line, user-facing description of an engine error.
@@ -1035,6 +1139,12 @@ mod tests {
 
     // -- jobs ---------------------------------------------------------------
 
+    /// The path a directory item lands at: the destination joined with the
+    /// source's own name, which is how `run` computes it.
+    fn lands_at(dst: &Path, src: &Path) -> PathBuf {
+        dst.join(file_name_of(src))
+    }
+
     fn drain_all(h: &mut JobHandle) -> Vec<JobEvent> {
         let mut out = Vec::new();
         // Bounded: a test must not hang if the worker wedges.
@@ -1236,6 +1346,289 @@ mod tests {
             b"old",
             "a cancelled collision must leave the destination alone"
         );
+    }
+
+    /// A cancelled copy is a cancellation, not a failure.
+    ///
+    /// The engine returns `KestrelError::Cancelled` and every other error was
+    /// funnelled into `Outcome::Failed`, so a cancelled copy raised a *failure*
+    /// dialog whose body read "cancelled" — and the half-copied tree it left in
+    /// the destination was never mentioned. §7.16: a long operation reports
+    /// itself honestly, and a user who is told "failed" goes looking for
+    /// something that broke.
+    ///
+    /// The cancel is timed against the first file actually landing in the
+    /// destination, so it lands *inside* the copy rather than before it — the
+    /// engine's per-file cancellation check is what returns the error, and that
+    /// is the branch under test.
+    #[test]
+    fn a_cancelled_job_reports_cancelled_not_failed() {
+        let src = tmp();
+        let dst = tmp();
+        let mut items = Vec::new();
+        for i in 0..600 {
+            fs::write(src.path().join(format!("f{i:04}")), b"payload").expect("write");
+            items.push(Item::file(src.path().join(format!("f{i:04}")), Some(7)));
+        }
+        // A directory source, so one item is a whole tree and the copy is
+        // genuinely in flight when the cancel arrives.
+        let tree = tmp();
+        let mut names = Vec::new();
+        for i in 0..600 {
+            let name = format!("f{i:04}");
+            fs::write(tree.path().join(&name), b"payload").expect("write");
+            names.push(name);
+        }
+
+        let destination = lands_at(dst.path(), tree.path());
+        let mut h = start(
+            Op::Copy,
+            vec![Item::dir(tree.path().to_path_buf())],
+            Some(dst.path().to_path_buf()),
+        )
+        .expect("start");
+
+        // Wait for the copy to be demonstrably under way, then cancel.
+        let mut started = false;
+        for _ in 0..200_000 {
+            if names.iter().any(|n| destination.join(n).exists()) {
+                started = true;
+                break;
+            }
+            h.drain_into(|_| {});
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        h.cancel();
+        assert!(
+            started,
+            "the copy should have been under way before cancelling"
+        );
+
+        let events = drain_all(&mut h);
+        h.finish();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, JobEvent::Cancelled { .. })),
+            "a cancelled copy must report Cancelled: {events:?}"
+        );
+        let failures: Vec<&JobEvent> = events
+            .iter()
+            .filter(|e| matches!(e, JobEvent::Failed { .. }))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "a cancellation must never be reported as a failure: {failures:?}"
+        );
+        // The engine's contract is that it leaves a partial destination for the
+        // caller to clean up or report. This caller cleans up, so the user is
+        // not left with a truncated tree.
+        assert!(
+            !ops::path_entry_exists(&destination),
+            "a cancelled copy must not leave a partial destination behind"
+        );
+        // Silence the unused warning for the file fixture built above; it keeps
+        // the two source shapes interchangeable in this test.
+        assert_eq!(items.len(), 600);
+    }
+
+    /// `Scope::ThisOne` means *this one collision*, not "this one directory".
+    ///
+    /// A directory holding two colliding files raises one collision per file.
+    /// Answering "overwrite this one" and then retrying with a blanket
+    /// `Overwrite` silently overwrote the second file too, without a second
+    /// question — the exact opposite of what the button said. The fix records
+    /// the answer against that one destination and goes back to probing, so the
+    /// next collision is asked about.
+    #[test]
+    fn a_second_collision_in_one_item_asks_again() {
+        let dst = tmp();
+        let source = tmp();
+        let destination = lands_at(dst.path(), source.path());
+        fs::create_dir_all(&destination).expect("mkdir");
+        for name in ["a.txt", "b.txt"] {
+            fs::write(source.path().join(name), b"new").expect("write");
+            fs::write(destination.join(name), b"old").expect("write");
+        }
+
+        let mut h = start(
+            Op::Copy,
+            vec![Item::dir(source.path().to_path_buf())],
+            Some(dst.path().to_path_buf()),
+        )
+        .expect("start");
+
+        let mut events = Vec::new();
+        let mut collisions = 0usize;
+        for _ in 0..4000 {
+            let mut collided = false;
+            let mut finished = false;
+            h.drain_into(|e| {
+                match e {
+                    JobEvent::Collided { .. } => collided = true,
+                    JobEvent::Done { .. }
+                    | JobEvent::Failed { .. }
+                    | JobEvent::Cancelled { .. } => {
+                        finished = true;
+                    }
+                    _ => {}
+                }
+                events.push(e);
+            });
+            // One answer per question asked, and no re-answering of a question
+            // already answered: the worker only parks again when it has a *new*
+            // collision to raise.
+            if collided {
+                collisions += 1;
+                h.decisions()
+                    .answer(Some(decide(Strategy::Overwrite, Scope::ThisOne)));
+                continue;
+            }
+            if finished {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let rest = drain_all(&mut h);
+        h.finish();
+        events.extend(rest);
+
+        // One question for the destination directory, then one per colliding
+        // file. Before the fix the whole directory was one question and both
+        // files were overwritten on the strength of the first answer.
+        assert_eq!(
+            collisions, 3,
+            "each colliding destination is its own question: {events:?}"
+        );
+        assert_eq!(
+            fs::read(destination.join("a.txt")).expect("read"),
+            b"new",
+            "the first answer was obeyed"
+        );
+        assert_eq!(
+            fs::read(destination.join("b.txt")).expect("read"),
+            b"new",
+            "the second answer was obeyed too, after being asked for"
+        );
+    }
+
+    /// A Move answered "Skip" leaves the source on disk.
+    ///
+    /// The button says "leave the destination alone". For a move that has to
+    /// include the source, or the operation has quietly deleted a tree.
+    #[test]
+    fn a_move_answered_skip_leaves_the_source_on_disk() {
+        let dst = tmp();
+        let source = tmp();
+        fs::write(source.path().join("a.txt"), b"new").expect("write");
+        let destination = lands_at(dst.path(), source.path());
+        fs::create_dir_all(&destination).expect("mkdir");
+        fs::write(destination.join("a.txt"), b"old").expect("write");
+
+        let mut h = start(
+            Op::Move,
+            vec![Item::dir(source.path().to_path_buf())],
+            Some(dst.path().to_path_buf()),
+        )
+        .expect("start");
+
+        let mut events = Vec::new();
+        for _ in 0..500 {
+            h.drain_into(|e| events.push(e));
+            if matches!(events.last(), Some(JobEvent::Collided { .. })) {
+                h.decisions()
+                    .answer(Some(decide(Strategy::Skip, Scope::ThisOne)));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let rest = drain_all(&mut h);
+        h.finish();
+        events.extend(rest);
+
+        assert!(
+            source.path().join("a.txt").exists(),
+            "a skipped move must not delete the source"
+        );
+        assert_eq!(
+            fs::read(destination.join("a.txt")).expect("read"),
+            b"old",
+            "the destination must be untouched"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, JobEvent::Item { skipped: true, .. })),
+            "the job must report the item as skipped: {events:?}"
+        );
+    }
+
+    /// `is_finished` must not eat the event it inspects.
+    ///
+    /// A `try_recv`-based peek silently drops whatever it looked at — a
+    /// `Collided`, a `Failed`, an `Item` — and the next `drain_into` never sees
+    /// it. Nothing calls the method today, which is exactly why it needed a test
+    /// rather than a caller.
+    ///
+    /// The assertions are deliberately about *what the drain finds afterwards*,
+    /// not about the boolean: the bug is a missing event, and a boolean
+    /// assertion would pass just as happily against a method that ate the queue.
+    #[test]
+    fn is_finished_does_not_consume_the_event_it_inspects() {
+        let src = tmp();
+        let dst = tmp();
+        fs::write(src.path().join("a.txt"), b"new").expect("write");
+        fs::write(dst.path().join("a.txt"), b"old").expect("write");
+
+        let mut h = start(
+            Op::Copy,
+            vec![Item::file(src.path().join("a.txt"), Some(3))],
+            Some(dst.path().to_path_buf()),
+        )
+        .expect("start");
+
+        // Park the worker on the question, so a `Collided` is waiting to be
+        // swallowed.
+        for _ in 0..500 {
+            if h.decisions().is_waiting() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(h.decisions().is_waiting(), "the worker should be parked");
+
+        assert!(!h.is_finished(), "nothing terminal has been drained yet");
+        assert!(!h.is_finished(), "asking twice must not change that");
+
+        let mut first = Vec::new();
+        h.drain_into(|e| first.push(e));
+        assert!(
+            first.iter().any(|e| matches!(e, JobEvent::Started { .. })),
+            "an event went missing: {first:?}"
+        );
+        assert!(
+            first.iter().any(|e| matches!(e, JobEvent::Collided { .. })),
+            "the collision went missing: {first:?}"
+        );
+        assert!(!h.is_finished(), "a collision is not terminal");
+
+        h.decisions()
+            .answer(Some(decide(Strategy::Skip, Scope::ThisOne)));
+        let last = drain_all(&mut h);
+        assert!(
+            last.iter().any(|e| matches!(e, JobEvent::Item { .. })),
+            "the item event went missing: {last:?}"
+        );
+        assert!(
+            last.iter().any(|e| matches!(e, JobEvent::Done { .. })),
+            "the terminal event went missing: {last:?}"
+        );
+        assert!(h.is_finished(), "a terminal event has been drained");
+
+        // And it stays true, without the channel needing to be non-empty.
+        h.drain_into(|_| {});
+        assert!(h.is_finished());
+        h.finish();
     }
 
     /// `Scope::All` must not ask twice: the second colliding item is resolved by

@@ -69,11 +69,71 @@ pub enum Collision {
 pub struct CopyOptions {
     /// Collision behaviour at the destination.
     pub collision: Collision,
+    /// Collisions the caller has already answered, by destination path.
+    ///
+    /// A single [`Collision`] applies to *every* colliding path in a call, so
+    /// without this there is no way to say "overwrite this one and ask me about
+    /// the next": answering a directory's collision answers all of its
+    /// children's too, silently. See [`AnsweredCollisions`].
+    pub answered: AnsweredCollisions,
     /// Copy permission bits and (on Unix) timestamps to the destination.
     pub preserve_permissions: bool,
     /// Stop as soon as this token is cancelled, leaving a partial destination
     /// behind (which the caller is expected to clean up or report).
     pub cancel: Option<CancellationToken>,
+}
+
+/// Collisions the caller has already answered, keyed by destination path.
+///
+/// This exists to make a *scoped* answer expressible. [`Collision::Overwrite`]
+/// passed to [`copy`] applies to every remaining colliding file in the tree, so
+/// a caller that asks the user about one collision and then retries with
+/// `Overwrite` has silently answered all the others — which is the opposite of
+/// what "this one" means.
+///
+/// A path recorded here is resolved from the map instead of from
+/// [`CopyOptions::collision`], and is never raised as a new collision. A caller
+/// that wants the next collision asked about records the answer, then retries
+/// with [`Collision::Fail`]: the settled path no longer raises, and the next
+/// unrecorded one does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnsweredCollisions(std::collections::BTreeMap<PathBuf, Collision>);
+
+impl AnsweredCollisions {
+    /// Nothing answered yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the answer for one destination.
+    pub fn answer(&mut self, dst: impl Into<PathBuf>, collision: Collision) {
+        self.0.insert(dst.into(), collision);
+    }
+
+    /// The answer for `dst`, if the caller gave one.
+    #[must_use]
+    pub fn get(&self, dst: &Path) -> Option<Collision> {
+        self.0.get(dst).copied()
+    }
+
+    /// How many collisions have been answered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// `true` when nothing has been answered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The policy in force for one destination: an answer recorded for this exact
+/// path wins over the blanket [`CopyOptions::collision`].
+fn collision_for(options: &CopyOptions, dst: &Path) -> Collision {
+    options.answered.get(dst).unwrap_or(options.collision)
 }
 
 /// How [`move_`] should attempt the move.
@@ -109,7 +169,7 @@ pub fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>, options: CopyOptions) 
     // an answer to "replace what is at the destination", and the source is not
     // something the user was ever offered as a thing to replace.
     guard_against_self_destination(src, dst, metadata.is_dir())?;
-    check_collision(dst, options.collision)?;
+    check_collision(dst, collision_for(&options, dst))?;
 
     let mut counter = CopyCounter { cancelled: false };
     copy_recursive(src, dst, &metadata, &options, &cancel, 0, &mut counter)?;
@@ -162,14 +222,14 @@ pub fn move_(
     // overwrote the destination and reported success; and the copy-then-delete
     // path deleted the source after a copy that had written nothing at all. One
     // question, one answer, no data loss.
-    if options.collision == Collision::Skip && path_entry_exists(dst) {
+    if collision_for(&options, dst) == Collision::Skip && path_entry_exists(dst) {
         return Ok(());
     }
 
     if matches!(strategy, MoveStrategy::Auto) {
         // A rename is atomic and free; always try it first. Pre-checks first so
         // we never destroy a file with a blind rename.
-        check_collision(dst, options.collision)?;
+        check_collision(dst, collision_for(&options, dst))?;
         match std::fs::rename(src, dst) {
             Ok(()) => return Ok(()),
             Err(e) if is_cross_device(&e) => {
@@ -178,7 +238,7 @@ pub fn move_(
             Err(e) => return Err(classify_io(src, e)),
         }
     } else {
-        check_collision(dst, options.collision)?;
+        check_collision(dst, collision_for(&options, dst))?;
     }
 
     // The cross-device path. The source is removed only once the destination is
@@ -301,7 +361,12 @@ fn check_collision(dst: &Path, collision: Collision) -> Result<()> {
 /// "is this name taken": a dangling link at the destination occupies the name,
 /// `symlink()` on it fails `EEXIST`, and a collision at the top level is not a
 /// collision. `symlink_metadata` answers for the name itself.
-fn path_entry_exists(path: &Path) -> bool {
+///
+/// Public because the job layer has to make the same decision before it hands
+/// the work over — "was this destination here before I started?" is the
+/// question that decides whether a cancelled copy may clean up after itself.
+#[must_use]
+pub fn path_entry_exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
@@ -411,10 +476,10 @@ fn copy_recursive(
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
-        return copy_symlink(src, dst, options.collision);
+        return copy_symlink(src, dst, collision_for(options, dst));
     }
 
-    let collision = options.collision;
+    let collision = collision_for(options, dst);
     if file_type.is_dir() {
         if path_entry_exists(dst) && collision == Collision::Skip {
             return Ok(());
@@ -442,7 +507,7 @@ fn copy_recursive(
                 std::fs::symlink_metadata(&child).map_err(|e| classify_io(&child, e))?;
             let target = dst.join(child.file_name().unwrap_or(child.as_os_str()));
             if child_metadata.is_dir() && path_entry_exists(&target) {
-                check_collision(&target, options.collision)?;
+                check_collision(&target, collision_for(options, &target))?;
             }
             copy_recursive(
                 &child,
