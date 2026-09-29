@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui::epaint::{ClippedPrimitive, ImageData, Primitive, TextureId, Vertex};
 use egui::{Color32, ColorImage, Context, Pos2, Rect, Vec2, vec2};
@@ -126,16 +127,23 @@ pub fn render(opts: Options, scene: Scene, size: Option<Vec2>) -> std::io::Resul
     egui_extras::install_image_loaders(&ctx);
 
     let mut opts = opts;
-    if !opts.gallery && scene != Scene::Browser {
+    // Bound outside the `if` below on purpose: the app watches this directory
+    // for the whole capture, and a block-scoped guard would delete it before
+    // `for_capture` runs — an empty listing, no dialog, no scrim, and a watch
+    // that fails with "no path found".
+    let _fixture_guard = if !opts.gallery && scene != Scene::Browser {
         // A scene is only meaningful against a known listing, so the start
         // directory becomes the fixture unless the caller named one. Without
         // this, `--scene preview-image` in the user's home directory renders an
         // empty preview pane and reviews nothing.
         let fixture = fixture()?;
         if opts.start_dir.is_none() {
-            opts.start_dir = Some(fixture);
+            opts.start_dir = Some(fixture.path().to_path_buf());
         }
-    }
+        Some(fixture)
+    } else {
+        None
+    };
 
     let mut app = KestrelApp::for_capture(ctx.clone(), opts);
     let mut textures = TextureBook::default();
@@ -261,6 +269,40 @@ fn timed_out(scene: Scene, what: &str) -> std::io::Error {
 // Scene fixtures
 // ----------------------------------------------------------------------------
 
+/// A unique scratch directory that removes itself.
+///
+/// `tempfile` is a dev-dependency and the fixture backs the real `--screenshot`
+/// path, so this is the small version rather than a new production dependency:
+/// pid plus a process-wide counter, cleaned up on drop.
+struct FixtureDir {
+    path: PathBuf,
+}
+
+/// Distinguishes one fixture from another within this process.
+static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+impl FixtureDir {
+    /// Creates the directory, with the `assets` subfolder the pane has a case for.
+    fn new() -> std::io::Result<Self> {
+        let n = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("kestrel-shot-fixture-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(path.join("assets"))?;
+        Ok(Self { path })
+    }
+
+    /// Where the fixture files live.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Builds the directory a scene is captured against.
 ///
 /// The point of a fixture is that it contains **one of everything the pane has a
@@ -269,37 +311,37 @@ fn timed_out(scene: Scene, what: &str) -> std::io::Error {
 /// extension. A capture of `$HOME` proves the layout; a capture of a directory
 /// chosen for what is in it proves the components.
 ///
+/// A fresh [`FixtureDir`] every time, so a scene never captures a
+/// listing that a previous run left behind — the failure mode being a
+/// screenshot that changes when nothing in the app changed — and so parallel
+/// tests never share one mutable directory: rebuilding a shared path while
+/// another test's watcher is settled on it reads as an endless stream of
+/// external changes, and a working watcher re-lists forever.
+///
 /// # Errors
 ///
 /// Returns the I/O error from creating the directory or writing a fixture file.
-fn fixture() -> std::io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("kestrel-shot-fixture");
-    // A fresh directory every time, so a scene never captures a listing that a
-    // previous run left behind — the failure mode being a screenshot that
-    // changes when nothing in the app changed.
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-    }
-    std::fs::create_dir_all(dir.join("assets"))?;
+fn fixture() -> std::io::Result<FixtureDir> {
+    let dir = FixtureDir::new()?;
 
     std::fs::write(
-        dir.join("notes.md"),
+        dir.path().join("notes.md"),
         "# Kestrel\n\nThe design tokens live in /tmp/opencode/kestrel-tokens.md.\n\n\
          - density is 26px rows\n- the accent is pine teal\n- selection is a flat tint\n\n\
          // a comment, so the highlighter has something to colour\nlet width = 720.0;\n\
          let label = \"Modified\";\n",
     )?;
-    std::fs::write(dir.join("diagram.png"), sample_png())?;
+    std::fs::write(dir.path().join("diagram.png"), sample_png())?;
     // Comfortably over the cap, so `PreviewTooLarge` has a file to degrade on
     // *and* the pane's two size numbers are distinguishable. A file 4 KiB over
     // the limit formats as "1.0 MB" and the limit formats as "1.0 MB", which
     // makes the degradation sentence look self-contradictory in a capture.
     std::fs::write(
-        dir.join("archive.tar"),
+        dir.path().join("archive.tar"),
         vec![0u8; (crate::preview::MAX_PREVIEW_BYTES + 512 * 1024) as usize],
     )?;
-    std::fs::write(dir.join("LICENSE"), b"MIT\n")?;
-    std::fs::write(dir.join("run.sh"), b"#!/bin/sh\necho hello\n")?;
+    std::fs::write(dir.path().join("LICENSE"), b"MIT\n")?;
+    std::fs::write(dir.path().join("run.sh"), b"#!/bin/sh\necho hello\n")?;
     Ok(dir)
 }
 
@@ -1070,7 +1112,7 @@ mod tests {
             ctx.clone(),
             app::Options {
                 theme: crate::tokens::ThemeMode::Dark,
-                start_dir: Some(dir),
+                start_dir: Some(dir.path().to_path_buf()),
                 ..app::Options::default()
             },
         );
