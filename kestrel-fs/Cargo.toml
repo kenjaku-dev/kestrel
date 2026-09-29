@@ -14,6 +14,22 @@ notify.workspace = true
 # macOS, Shell API on Windows). Used for every user-facing delete.
 trash.workspace = true
 
+# Opening a file with the desktop's default application. Both are unix-only, so
+# they are declared for unix only rather than failing to build on a platform the
+# app does not target.
+#
+# `xdg-mime` parses the *system* shared MIME database (`/usr/share/mime`) at
+# runtime — it is a parser for what the distribution ships, not a table in the
+# binary — and it answers the same question `xdg-mime query filetype` does.
+# `mime` is a direct dependency only because `open::mime_of` names
+# `mime::Mime` in signatures derived from the database's answers.
+xdg-mime = "0.4.0"
+mime = "0.3"
+# The freedesktop *entry* format, which is what `mimeapps.list` and every
+# `.desktop` file are. Maintained, nom 8, and the parser the mime-apps-spec
+# search order in `open::handler_for` is written on top of.
+freedesktop_entry_parser = "2.0.1"
+
 [dev-dependencies]
 tempfile.workspace = true
 

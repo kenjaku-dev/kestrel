@@ -56,6 +56,33 @@ env_logger = { version = "0.11", default-features = false, features = [
   "humantime",
 ] }
 
+# --- Opening a file with the user's default application --------------------
+#
+# Two crates, and the split between them is the freedesktop.org one: a MIME
+# *type*, and then the *application* registered for that type.
+#
+# `xdg-mime` 0.4.0 is a parser for the system shared MIME database
+# (`/usr/share/mime`), not a table baked into the binary, so this build tracks
+# whatever the distribution ships rather than a snapshot of it. It reads the
+# glob table (`*.png` -> `image/png`), the magic table (content sniffing), the
+# alias table and the subclass graph, and it answers the same question
+# `xdg-mime query filetype` does. `mime` is re-exported by it and is a direct
+# dependency only because `open` has to name `mime::Mime` in its own signatures.
+#
+# `freedesktop_entry_parser` 2.0.1 parses the freedesktop *entry* format, which
+# is what both `mimeapps.list` and every `.desktop` file are. It is the
+# maintained, widely-used parser for exactly that format (nom 8, last release
+# Oct 2025); `open` implements the mime-apps-spec *search order* on top of it,
+# which is ~70 lines of documented algorithm rather than a file format.
+#
+# Both are unix-only. The app has no Windows build and `xdg-mime` is
+# `#![cfg(any(unix, target_os = "redox"))]`, so the dependency is gated to match
+# rather than failing to compile on a platform this app does not target.
+[target.'cfg(unix)'.dependencies]
+xdg-mime = "0.4.0"
+mime = "0.3"
+freedesktop_entry_parser = "2.0.1"
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

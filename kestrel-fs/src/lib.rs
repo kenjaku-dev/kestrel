@@ -31,6 +31,7 @@
 //! | [`size`] | recursive, cancellable, cached size computation |
 //! | [`watcher`] | debounced filesystem watching |
 //! | [`ops`] | copy / move / delete / trash |
+//! | [`open`] | opening a file with the user's default application, off-thread |
 //! | [`error`] | the typed error enum and `io::ErrorKind` mapping |
 //!
 //! ## Worked example: a directory view
@@ -119,6 +120,7 @@
 
 pub mod error;
 pub mod model;
+pub mod open;
 pub mod ops;
 pub mod scan;
 pub mod size;
