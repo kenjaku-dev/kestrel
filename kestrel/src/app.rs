@@ -2129,6 +2129,22 @@ impl KestrelApp {
                     .stroke(Stroke::new(border::HAIRLINE, theme.borders.subtle)),
             )
             .show(ui, |ui| {
+                // Pin the content to the full panel width, every frame.
+                //
+                // A **non-resizable** `egui::Panel` does not keep the width it was
+                // given: `Frame::end` derives the panel's outer rect from the
+                // *content's* min rect, and the result is stored in the panel
+                // state and reused from then on. So `default_size(280)` is only
+                // ever the first frame's guess, and the pane settles on the
+                // narrowest moment its content ever has. Measured: the empty
+                // state and the text preview came out 280 and 233 wide in the
+                // same session, and the 233 stuck for the rest of the run — which
+                // is why the meta line in the text preview was being truncated to
+                // fit a pane that had quietly lost 47px.
+                //
+                // A pane's content is a column that spans the pane, so stating
+                // that is not a workaround; it is what the panel is.
+                ui.set_min_width(ui.available_width());
                 // The entry's preview *inputs* are read out first, so the loader
                 // can be borrowed mutably. Holding `&FileEntry` across
                 // `self.preview.request(..)` is the borrow checker correctly
@@ -2312,17 +2328,19 @@ impl KestrelApp {
         let modified = entry
             .modified
             .map_or_else(|| "-".to_string(), format::timestamp);
-        let meta = format!("{} · {} · {}", classified.category.label(), size, modified);
-        // `Label` wraps, but a timestamp has no break opportunity in it, so a
-        // narrow pane pushed the tail of the line under the window edge instead
-        // of ellipsing it. The budget is measured, so this is the same rule the
-        // name and the code lines use.
         let meta_font = tokens::font(ty::META, theme);
-        let budget = truncation_cols(ui.painter(), &meta, &meta_font, available);
         ui.label(
-            RichText::new(format::middle_truncate(&meta, budget))
-                .font(meta_font)
-                .color(theme.text.tertiary),
+            RichText::new(meta_line(
+                ui.painter(),
+                &meta_font,
+                available,
+                // Dropped from the right, so the **size** goes first: a file
+                // list shows a size in a column of its own, while the timestamp
+                // appears nowhere else in the pane.
+                &[classified.category.label(), &modified, &size],
+            ))
+            .font(meta_font)
+            .color(theme.text.tertiary),
         );
         ui.add_space(space::S2);
         widgets::rule(
@@ -3859,6 +3877,38 @@ fn truncation_cols(painter: &egui::Painter, text: &str, font: &egui::FontId, max
     (cols as usize).clamp(4, chars)
 }
 
+/// The preview pane's `meta` line, degraded by **dropping fields**, never by
+/// truncating one.
+///
+/// The line is `kind · modified · size` in the order it drops from, and all
+/// three are machine values. A timestamp is a single unbreakable token, so a
+/// `middle_truncate` that runs out of room produces
+/// `Text · 2026-09-29 · .26-09-29 01:52` — a date that is *wrong* rather than
+/// short, which is the one thing §2.8's machine-value rule exists to prevent. A
+/// `Label` would instead wrap, which is worse: a wrapped timestamp reads as a
+/// second line of the file listing.
+///
+/// So the line is assembled widest-first and the *least* useful field is dropped
+/// until it fits. The size goes first, because a file list gives a size a column
+/// of its own and a preview pane does not; the kind goes last, because it is the
+/// one field the icon does not already say.
+fn meta_line(painter: &egui::Painter, font: &egui::FontId, width: f32, parts: &[&str]) -> String {
+    let fits = |s: &str| {
+        painter
+            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+            <= width
+    };
+    for count in (1..=parts.len()).rev() {
+        let joined = parts[..count].join(" · ");
+        if fits(&joined) {
+            return joined;
+        }
+    }
+    parts.first().copied().unwrap_or_default().to_string()
+}
+
 /// A 1-px all-round `egui::Margin` from a spacing token.
 ///
 /// `egui::Margin` is `i8` in epaint 0.36, so a sub-pixel spacing token has to
@@ -4132,6 +4182,173 @@ mod tests {
         let wide = trailing_segments(&deep, 2000.0).1;
         assert!(wide < narrow, "wide kept {wide}, narrow kept {narrow}");
         assert_eq!(wide, 0, "a wide pane shows the root too");
+    }
+
+    /// A `Ui` with one frame's worth of input, for driving the keyboard handler.
+    ///
+    /// egui delivers key events through `RawInput::events`, and a *modifier-free*
+    /// `Key` event with the default `KeyState::Pressed` is what a real keypress
+    /// looks like to `consume_key`. The handler is given a `Ui` from a headless
+    /// context so the test can call it directly — which is the only way to ask
+    /// "does Delete reach the app while a rename field is open?" without a
+    /// window.
+    fn with_keys(keys: &[Key], mut body: impl FnMut(&mut KestrelApp, &mut Ui)) {
+        let ctx = crate::shot::ctx_with_fonts();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0))),
+            events: keys
+                .iter()
+                .map(|k| egui::Event::Key {
+                    key: *k,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(raw, |ui| body(&mut minimal_app(), ui));
+        output.drop_without_applying_deltas();
+    }
+
+    /// §4.11: while the rename field is open, the global bindings must not fire.
+    ///
+    /// `Delete` is the case that matters. A row is selected, the user presses
+    /// `F2`, and the field is open — if `Delete` still reached the app, a
+    /// keystroke aimed at the *field* would open a confirm dialog to destroy the
+    /// selected file. The field is where the user's attention is; the app is not.
+    ///
+    /// `consume_key` removes the event from the input state, so the same key
+    /// cannot also reach the `TextEdit`. The test asserts the app did not act,
+    /// which is the half that would be a data-loss bug.
+    #[test]
+    fn a_rename_field_owns_the_keyboard() {
+        with_keys(&[Key::Delete], |app, ui| {
+            app.rows = vec![row_at("/r", "/r/a.txt")];
+            app.selection.click(0);
+            app.begin_rename();
+            assert!(app.renaming.is_some(), "the rename field is open");
+
+            app.keyboard(ui);
+
+            assert!(
+                app.modal.is_none(),
+                "Delete reached the app while the rename field had focus, and \
+                 opened {:?}",
+                app.modal
+            );
+            assert!(app.renaming.is_some(), "the field is still open");
+        });
+    }
+
+    /// The same for the filter field, and for every other global binding.
+    ///
+    /// `Ctrl+A` is the sharp one: while it belongs to the text editor it means
+    /// "select this query". Leaked to the app it would select every row in the
+    /// directory, which is the sort of mistake a user makes once and then stops
+    /// trusting the keyboard in.
+    #[test]
+    fn a_filter_field_owns_the_keyboard() {
+        with_keys(&[Key::A], |app, ui| {
+            app.rows = (0..5)
+                .map(|i| row_at("/r", &format!("/r/f{i}.txt")))
+                .collect();
+            app.selection.click(0);
+            app.filter_focused = true;
+            assert_eq!(app.selection.len(), 1);
+
+            ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::CTRL, Key::A);
+            });
+            // `keyboard()` runs *after* the Ctrl modifier has been consumed above
+            // in the real frame, because `TextEdit` handles it first. What the
+            // app's own handler must not do is reach for a bare `A` and type it
+            // into the query either.
+            app.keyboard(ui);
+            assert_eq!(app.selection.len(), 1, "Ctrl+A selected rows");
+            assert!(app.filter.is_empty(), "a stray A reached the query");
+        });
+    }
+
+    /// And with no field open, the same key does what §4.11 says.
+    ///
+    /// The other half of the two tests above: a guard that swallows everything
+    /// would pass both of them, and a shortcut that never fires is a different
+    /// bug with the same symptom.
+    #[test]
+    fn a_rename_field_does_not_swallow_the_keyboard_forever() {
+        with_keys(&[Key::Delete], |app, ui| {
+            app.rows = vec![row_at("/r", "/r/a.txt")];
+            app.selection.click(0);
+            app.keyboard(ui);
+            assert!(
+                app.modal.is_some(),
+                "with no field open, Delete must open the trash confirm"
+            );
+        });
+    }
+
+    /// The preview pane's `meta` line drops a field rather than cutting a
+    /// timestamp in half.
+    ///
+    /// A `middle_truncate` on "Text · 2026-09-29 01:52 · 248 B" at 220px gives
+    /// "Text · 2026-09-29 0… · 248 B": a date that is *wrong* rather than
+    /// short. The fix is to drop the least useful field instead, and the order
+    /// is asserted here because it is a design decision and not an accident.
+    #[test]
+    fn the_meta_line_drops_a_field_rather_than_a_timestamp() {
+        let ctx = crate::shot::ctx_with_fonts();
+        // A `Painter` is only useful with a font collection behind it, so it is
+        // borrowed out of a real frame rather than constructed: `Painter` holds
+        // an `Arc` to the context's fonts, so the clone outlives the frame.
+        let mut painter = None;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0))),
+                ..Default::default()
+            },
+            |ui| painter = Some(ui.painter().clone()),
+        );
+        output.drop_without_applying_deltas();
+        let painter = painter.expect("a frame ran");
+        let font = tokens::font(ty::META, &Theme::dark());
+        let parts = ["Text", "2026-09-29 01:52", "248 B"];
+
+        let full = "Text · 2026-09-29 01:52 · 248 B";
+        let width_of = |s: &str| {
+            painter
+                .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        };
+
+        assert_eq!(
+            meta_line(&painter, &font, width_of(full), &parts),
+            full,
+            "a line that fits must be the whole line"
+        );
+        // One field short: the size goes, because the file list has a size
+        // column and the pane does not.
+        let two = "Text · 2026-09-29 01:52";
+        assert_eq!(
+            meta_line(&painter, &font, width_of(two), &parts),
+            two,
+            "the size is the first field to go"
+        );
+        // Down to the kind alone. Never a truncated timestamp, at any width.
+        for width in [0.0_f32, 12.0, 40.0, width_of(two) - 1.0] {
+            let line = meta_line(&painter, &font, width, &parts);
+            assert!(
+                !line.contains("2026-09-29 0"),
+                "at {width}px the line is a wrong date: {line:?}"
+            );
+        }
+        assert_eq!(
+            meta_line(&painter, &font, 0.0, &parts),
+            "Text",
+            "one field always survives"
+        );
     }
 
     /// A 1px margin helper that rounds rather than truncating.
