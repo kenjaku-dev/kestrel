@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 /// A cached free-space reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,10 +59,18 @@ impl FreeSpace {
 /// The worker holds a generation counter so a stale answer — one that arrives
 /// after the user has navigated somewhere else — is discarded rather than shown
 /// against the wrong directory.
+///
+/// The reading is a plain [`FreeSpace`] behind a mutex, mirroring
+/// [`kestrel_fs::size::SizeCache`]'s `Arc<Mutex<HashMap<..>>>` shape. An earlier
+/// revision packed both fields into one `AtomicU64` — 32 bits each — which
+/// clamped every filesystem over 4 GiB to exactly 4,294,967,295 bytes and
+/// pinned the meter at full. A mutex held only for a struct copy is never
+/// contended (one writer, one reader per frame) and cannot block the frame
+/// loop in any observable way.
 #[derive(Debug, Clone)]
 pub struct SpaceProbe {
-    /// The most recent reading, packed for atomic access.
-    packed: Arc<AtomicU64>,
+    /// The most recent reading, or `None` when absent or invalidated.
+    slot: Arc<Mutex<Option<FreeSpace>>>,
     /// The directory the reading is for.
     subject: Arc<PathBuf>,
     /// Bumped on every request; a worker ignores a request older than its own.
@@ -79,7 +88,7 @@ impl SpaceProbe {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            packed: Arc::new(AtomicU64::new(0)),
+            slot: Arc::new(Mutex::new(None)),
             subject: Arc::new(PathBuf::new()),
             generation: Arc::new(AtomicU64::new(0)),
         }
@@ -88,24 +97,7 @@ impl SpaceProbe {
     /// The cached reading for `dir`, or `None` if it is stale or absent.
     #[must_use]
     pub fn get(&self) -> Option<FreeSpace> {
-        let packed = self.packed.load(Ordering::Relaxed);
-        if packed == 0 {
-            return None;
-        }
-        // `available` in the high 32 bits, `total` in the low. 32 bits of bytes
-        // is 4 GiB, which is not enough on its own, so this is only a
-        // *staleness/validity* flag plus a cache key: the real values are
-        // recomputed by the worker into the two halves, and a filesystem larger
-        // than 4 TiB saturates rather than wraps. Saturation is the right
-        // failure: the meter shows "full" and the label is wrong, instead of
-        // showing "empty" and the user thinking they have room.
-        let available = (packed >> 32) as u32 as u64;
-        let total = (packed & 0xFFFF_FFFF) as u32 as u64;
-        Some(FreeSpace {
-            available,
-            total,
-            used: total.saturating_sub(available),
-        })
+        *lock(&self.slot)
     }
 
     /// Requests a fresh reading for `dir`, off the UI thread.
@@ -118,9 +110,9 @@ impl SpaceProbe {
             return;
         }
         self.subject = Arc::new(dir.to_path_buf());
-        self.packed.store(0, Ordering::Relaxed);
+        *lock(&self.slot) = None;
 
-        let packed = Arc::clone(&self.packed);
+        let slot = Arc::clone(&self.slot);
         let subject = Arc::clone(&self.subject);
         let generation = Arc::clone(&self.generation);
         // `gen` is a reserved keyword in edition 2024.
@@ -137,14 +129,9 @@ impl SpaceProbe {
                 // Only publish if nobody has navigated away since this was
                 // requested.
                 if generation.load(Ordering::Relaxed) == ticket && reading.is_some() {
-                    let r = reading.unwrap_or(FreeSpace {
-                        available: 0,
-                        total: 0,
-                        used: 0,
-                    });
-                    let hi = (r.available.min(u64::from(u32::MAX)) as u32 as u64) << 32;
-                    let lo = r.total.min(u64::from(u32::MAX)) as u32 as u64;
-                    packed.store(hi | lo, Ordering::Relaxed);
+                    if let Some(r) = reading {
+                        *lock(&slot) = Some(r);
+                    }
                 }
                 drop(subject);
             });
@@ -154,6 +141,24 @@ impl SpaceProbe {
             log::warn!("space probe: could not spawn a worker: {err}");
         }
     }
+
+    /// Stores `reading` directly, for tests.
+    ///
+    /// The worker path needs a real filesystem, so a test that needs a 500 GB
+    /// volume would have to mock `statvfs` — this is the seam that lets it
+    /// feed a synthetic reading through the same slot the worker publishes to.
+    #[cfg(test)]
+    fn inject(&self, reading: FreeSpace) {
+        *lock(&self.slot) = Some(reading);
+    }
+}
+
+/// Poison-safe lock.
+///
+/// A panic elsewhere must not turn every later meter read into a panic; the
+/// slot holds only plain data, so recovering the guard is sound.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Reads `statvfs` for `path`.
@@ -250,6 +255,27 @@ mod tests {
     fn a_probe_with_no_reading_reports_none() {
         let p = SpaceProbe::new();
         assert_eq!(p.get(), None);
+    }
+
+    #[test]
+    fn a_large_filesystem_round_trips_without_clamping() {
+        // The 4 GiB regression: packing both fields into 32 bits each read
+        // every real filesystem as exactly 4,294,967,295 bytes available and
+        // pinned the meter at full. A synthetic 500 GB reading must come back
+        // with the same numbers.
+        let probe = SpaceProbe::new();
+        let big = FreeSpace {
+            available: 500 * 1024 * 1024 * 1024,
+            total: 1024 * 1024 * 1024 * 1024,
+            used: 524 * 1024 * 1024 * 1024,
+        };
+        probe.inject(big);
+        let back = probe.get().expect("an injected reading must be visible");
+        assert_eq!(back, big);
+        assert!(
+            (back.fraction() - 0.488_281_25).abs() < 1e-6,
+            "the meter must show ~49% free, not full: {back:?}"
+        );
     }
 
     #[test]
