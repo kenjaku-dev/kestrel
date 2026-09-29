@@ -140,9 +140,22 @@ OPTIONS:
 ARGS:
     <DIR>              directory to open (default: $KESTREL_HOME, else $HOME, else /)
 
+KEYBOARD:
+    F1, ?              the full shortcut list
+    Ctrl+,             settings
+    Ctrl+F, /          focus the filter field
+    Alt+Left/Right     back / forward
+    Alt+Up, Backspace  up one level
+    F5                 refresh
+
 ENVIRONMENT:
     KESTREL_HOME       overrides the start directory
     WAYLAND_DISPLAY    the Wayland socket to open against
+    KESTREL_REDUCED_MOTION
+                       1/true/yes collapses every motion duration to zero
+                       (spec 2.11 rule 5); 0/false forces motion on
+    KESTREL_DEBUG_LAYOUT
+                       dev builds only: print the gallery's layout widths
 ";
 
 /// The `--scene` names, in the order they appear in `--help`.
