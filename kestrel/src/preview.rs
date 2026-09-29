@@ -415,6 +415,17 @@ pub struct Loader {
     queued: Option<Queued>,
     /// The kind of the last request, so the pane can shape itself immediately.
     kind: Option<Kind>,
+    /// The path and image-ness of the last request, so a repeat of the same one
+    /// is recognised as such instead of cancelling its own predecessor.
+    current: Option<(PathBuf, bool)>,
+    /// `true` between spawning a worker and its result arriving.
+    ///
+    /// The debounce flag is not enough: once `poll` has spawned the worker,
+    /// `pending` is cleared and the load is still running. Anything that has to
+    /// wait for the preview to *finish* rather than merely to be *queued* needs
+    /// this, and it is the difference between a capture that shows content and
+    /// one that shows "Loading…".
+    awaiting: bool,
 }
 
 /// A request waiting out its debounce.
@@ -446,6 +457,8 @@ impl Loader {
             pending: None,
             queued: None,
             kind: None,
+            current: None,
+            awaiting: false,
         }
     }
 
@@ -454,9 +467,27 @@ impl Loader {
     /// Returns the kind that will be produced, so the pane can show the right
     /// *shape* immediately — a metadata pane while the bytes are still loading —
     /// instead of an empty rectangle.
+    ///
+    /// # Asking twice for the same file is a no-op
+    ///
+    /// The pane calls this **every frame** — it has no other way to learn that
+    /// the focus moved — and a request that always cancelled would cancel its own
+    /// predecessor, resetting the debounce 60 times a second. The preview would
+    /// never start, and the pane would sit on "Loading…" for the life of the
+    /// app. So the target is remembered and an unchanged request returns
+    /// immediately.
+    ///
+    /// That is not an optimisation, it is the only correct reading of "cancel
+    /// the previous load": the thing to cancel is the load for a *different*
+    /// file. Making the type idempotent is what stops the per-frame call site
+    /// from having to remember to diff the target itself.
     pub fn request(&mut self, path: &Path, size: Option<u64>, is_image: bool) -> Kind {
+        if self.current.as_ref() == Some(&(path.to_path_buf(), is_image)) {
+            return self.kind.unwrap_or_else(|| kind_for(is_image, size));
+        }
         // Cancel first, always. This is the whole reason for the type.
         self.cancel();
+        self.current = Some((path.to_path_buf(), is_image));
         let kind = kind_for(is_image, size);
         self.kind = Some(kind);
         if !kind.is_viewable() {
@@ -478,6 +509,10 @@ impl Loader {
         self.cancelled.store(true, Ordering::Relaxed);
         self.pending = None;
         self.queued = None;
+        // The in-flight worker's result is now unwanted, so nothing is awaiting
+        // it. Clearing this is what stops a cancelled load from pinning the pane
+        // in "Loading…" forever.
+        self.awaiting = false;
     }
 
     /// `true` while a load is debouncing.
@@ -486,9 +521,19 @@ impl Loader {
         self.pending.is_some()
     }
 
+    /// `true` while a load is queued **or** running.
+    ///
+    /// [`Self::is_pending`] alone answers "has the debounce elapsed?", which is
+    /// not the same question: a 1 MiB decode on a cold cache outlives its
+    /// debounce by orders of magnitude.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.pending.is_some() || self.awaiting
+    }
+
     /// The kind of the last request.
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kind(&self) -> Option<Kind> {
         self.kind
     }
@@ -498,6 +543,7 @@ impl Loader {
     /// Non-blocking by construction: one `try_recv` and at most one `spawn`.
     pub fn poll(&mut self) -> Option<Loaded> {
         if let Ok(loaded) = self.rx.try_recv() {
+            self.awaiting = false;
             return Some(loaded);
         }
         let due = self
@@ -521,6 +567,11 @@ impl Loader {
         self.cancelled.store(false, Ordering::Relaxed);
         let generation = Arc::clone(&self.generation);
         let cancelled = Arc::clone(&self.cancelled);
+        // The generation this load belongs to. Read **here**, on the frame
+        // thread, and carried into the worker: reading it inside the worker
+        // would compare the counter against itself and always answer "unchanged".
+        let mine = self.generation.load(Ordering::Relaxed);
+        self.awaiting = true;
         // A named thread so a stack trace during a slow preview names the
         // subsystem. One thread per request is safe *because* `request` cancels
         // first: cancelled workers exit at their next 32 KiB read boundary.
@@ -531,26 +582,17 @@ impl Loader {
                 // Only publish if nobody has asked for something else since. This
                 // is the check that stops a slow decode for row 2 from landing
                 // after the user has already moved to row 3.
-                if generation.load(Ordering::Relaxed) == cancelled_generation(&generation) {
+                if generation.load(Ordering::Relaxed) == mine {
                     let _ = tx.send(result);
                 }
             });
         if spawned.is_err() {
             // A failed spawn must not leave the pane spinning forever. Report it
             // through the channel the same way a load would.
-            let _ = self.rx.try_recv();
+            self.awaiting = false;
             self.kind = Some(Kind::Metadata);
         }
     }
-}
-
-/// A no-op predicate kept for the symmetry of `load`'s signature.
-///
-/// It exists only to make the generation comparison in `spawn` read as a
-/// question ("has anyone asked since?") rather than as a comparison against a
-/// number the reader has to trust.
-fn cancelled_generation(_generation: &Arc<AtomicU64>) -> u64 {
-    u64::MAX
 }
 
 /// Reads a file for preview, honouring the cap and the cancel flag.
@@ -893,6 +935,128 @@ mod tests {
         // `poll` before the deadline must not start anything.
         assert!(l.poll().is_none());
         assert!(l.is_pending(), "still debouncing");
+    }
+
+    /// The whole round trip: request → debounce → spawn → result.
+    ///
+    /// This is the test the loader was missing, and it is the one that matters,
+    /// because every other test here calls [`load`] directly. A defect in the
+    /// publish guard — the generation comparison that decides whether a worker is
+    /// allowed to hand its result over — is invisible to a direct `load` call and
+    /// invisible to every other test in this module, because the only observable
+    /// effect is that the preview pane never stops saying "Loading…".
+    #[test]
+    fn a_request_comes_back_through_the_loader() {
+        let d = tmp();
+        let a = d.path().join("round-trip.txt");
+        fs::write(&a, b"alpha\nbeta\ngamma\n").expect("write");
+        let mut l = Loader::new();
+        assert_eq!(l.request(&a, Some(24), false), Kind::Text);
+
+        // Poll on a real clock: the debounce has to elapse and the worker has to
+        // be scheduled. Bounded so a regression fails the suite instead of
+        // hanging it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(loaded) = l.poll() {
+                got = Some(loaded);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        match got {
+            Some(Loaded::Text { lines, truncated }) => {
+                assert!(!truncated);
+                assert_eq!(lines.len(), 3, "the file has three lines");
+                assert_eq!(lines[1].text, "beta");
+            }
+            other => panic!("the loader never published a result: {other:?}"),
+        }
+        assert!(!l.is_busy(), "nothing is in flight once the result lands");
+    }
+
+    /// A cancelled request must not pin the pane in "Loading…" forever.
+    ///
+    /// The counterpart to the round trip: `cancel` clears the in-flight flag, so
+    /// a caller that waits for the pane to go quiet is not waiting on a worker
+    /// whose result was thrown away on purpose.
+    #[test]
+    fn cancelling_clears_the_in_flight_flag() {
+        let d = tmp();
+        let a = d.path().join("x.txt");
+        fs::write(&a, b"x").expect("write");
+        let mut l = Loader::new();
+        l.request(&a, Some(1), false);
+        assert!(l.is_busy());
+        l.cancel();
+        assert!(!l.is_busy());
+    }
+
+    /// A request for something that is not viewable is never in flight.
+    #[test]
+    fn an_unviewable_request_is_idle_immediately() {
+        let mut l = Loader::new();
+        l.request(Path::new("/x"), Some(u64::MAX), false);
+        assert!(!l.is_busy());
+        assert_eq!(l.kind(), Some(Kind::TooLarge));
+    }
+
+    /// Asking again for the **same** file must not cancel the first request.
+    ///
+    /// The pane calls `request` on every frame, because it has no other way to
+    /// learn the focus moved. A version of `request` that always cancelled
+    /// therefore cancelled its own predecessor 60 times a second: the debounce
+    /// never elapsed, no load ever started, and the pane sat on "Loading…" for
+    /// the life of the app. The symptom is a preview that is *stuck*, which is
+    /// why this is asserted directly rather than inferred from a round trip.
+    #[test]
+    fn repeating_the_same_request_does_not_restart_it() {
+        let d = tmp();
+        let a = d.path().join("a.txt");
+        fs::write(&a, b"a").expect("write");
+        let mut l = Loader::new();
+        l.request(&a, Some(1), false);
+        assert!(l.is_pending());
+        let queued_at = l.queued.clone();
+        // Ten more frames' worth of the same request.
+        for _ in 0..10 {
+            l.request(&a, Some(1), false);
+        }
+        assert!(l.is_pending(), "the request survived the repeats");
+        assert_eq!(l.queued, queued_at, "the queued work is the same one");
+    }
+
+    /// Moving to a different file *does* replace the request, and the old
+    /// target's result can no longer land.
+    ///
+    /// The two halves of the idempotence rule together: same file is a no-op,
+    /// different file cancels. Without the second, arrow-keying back and forth
+    /// over two files would run both loads forever.
+    #[test]
+    fn a_different_request_replaces_the_queued_one() {
+        let d = tmp();
+        let a = d.path().join("a.txt");
+        let b = d.path().join("b.txt");
+        fs::write(&a, b"a").expect("write");
+        fs::write(&b, b"b").expect("write");
+        let mut l = Loader::new();
+        l.request(&a, Some(1), false);
+        let first = l.generation.load(Ordering::Relaxed);
+        l.request(&b, Some(1), false);
+        assert_ne!(
+            l.generation.load(Ordering::Relaxed),
+            first,
+            "a new target must bump the generation, so an in-flight worker for the \
+             old one cannot publish over it"
+        );
+        assert_eq!(
+            l.queued,
+            Some(Queued {
+                path: b,
+                is_image: false
+            })
+        );
     }
 
     // -- the highlighter ---------------------------------------------------

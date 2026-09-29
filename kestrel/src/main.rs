@@ -27,7 +27,8 @@
 //! # CLI
 //!
 //! ```text
-//! kestrel [--gallery] [--tree] [--light | --dark | --system] [--screenshot PATH] [DIR]
+//! kestrel [--gallery] [--tree] [--light | --dark | --system] [--screenshot PATH]
+//!         [--scene NAME] [--size WxH] [DIR]
 //!
 //!   --gallery   render the design-system gallery instead of the file manager
 //!   --tree      start in the indented tree view (default: a flat list)
@@ -35,6 +36,12 @@
 //!               render the UI, write a PNG, and exit. The capture comes from
 //!               egui's own tessellation rather than a screen grab, so it works
 //!               on a busy desktop and is the way the theme is reviewed.
+//!   --scene NAME
+//!               drive the app into a named state before capturing it. The
+//!               dialogs and the populated preview pane are states, not screens,
+//!               so this is the only way to see them; see [`app::Scene`].
+//!   --size WxH  capture at an explicit size, e.g. 900x700. A layout that only
+//!               works at the default width is a layout that does not work.
 //!   --light     force the light theme (§3, light column)
 //!   --dark      force the dark theme (§3, dark column) — the default fallback
 //!   --system    follow the compositor (the default)
@@ -93,6 +100,10 @@ struct Cli {
     help: bool,
     /// `--screenshot PATH`: write a PNG of the UI here and exit.
     screenshot: Option<std::path::PathBuf>,
+    /// `--scene NAME`: the state to drive the app into before capturing.
+    scene: app::Scene,
+    /// `--size WxH`: an explicit capture size.
+    size: Option<egui::Vec2>,
     /// `--tree`: start in the indented tree view.
     tree: bool,
 }
@@ -113,6 +124,12 @@ OPTIONS:
         --tree         start in the indented tree view (default: flat list)
         --screenshot PATH
                        render the UI, write a PNG to PATH, and exit
+        --scene NAME
+                       drive the app into a state, then capture it. One of:
+                       browser, confirm-permanent, confirm-trash, collision,
+                       progress, failed, preview-empty, preview-text,
+                       preview-image, preview-too-large
+        --size WxH     capture at an explicit size, e.g. 900x700
 
 ARGS:
     <DIR>              directory to open (default: $KESTREL_HOME, else $HOME, else /)
@@ -121,6 +138,30 @@ ENVIRONMENT:
     KESTREL_HOME       overrides the start directory
     WAYLAND_DISPLAY    the Wayland socket to open against
 ";
+
+/// The `--scene` names, in the order they appear in `--help`.
+///
+/// A closed table rather than a `FromStr` on an open string: a mistyped scene
+/// has to be an error listing the real names, not a silent fallback to the
+/// default state that then produces a perfectly reviewable PNG of the wrong
+/// thing.
+const SCENES: &[(&str, app::Scene)] = &[
+    ("browser", app::Scene::Browser),
+    ("confirm-permanent", app::Scene::ConfirmPermanent),
+    ("confirm-trash", app::Scene::ConfirmTrash),
+    ("collision", app::Scene::Collision),
+    ("progress", app::Scene::Progress),
+    ("failed", app::Scene::Failed),
+    ("preview-empty", app::Scene::PreviewEmpty),
+    ("preview-text", app::Scene::PreviewText),
+    ("preview-image", app::Scene::PreviewImage),
+    ("preview-too-large", app::Scene::PreviewTooLarge),
+];
+
+/// `None` for a name no scene answers to, with the list of the ones that do.
+fn scene_by_name(name: &str) -> Option<app::Scene> {
+    SCENES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+}
 
 impl Cli {
     /// Parses `args` (excluding `argv[0]`).
@@ -136,6 +177,8 @@ impl Cli {
             dir: None,
             help: false,
             screenshot: None,
+            scene: app::Scene::Browser,
+            size: None,
             tree: false,
         };
         let mut iter = args.iter();
@@ -149,6 +192,21 @@ impl Cli {
                         return Err("--screenshot needs a path".to_string());
                     };
                     out.screenshot = Some(std::path::PathBuf::from(path));
+                }
+                "--scene" => {
+                    let Some(name) = iter.next() else {
+                        return Err("--scene needs a name".to_string());
+                    };
+                    out.scene = scene_by_name(name).ok_or_else(|| {
+                        let names: Vec<&str> = SCENES.iter().map(|(n, _)| *n).collect();
+                        format!("unknown scene: {name} (try: {})", names.join(", "))
+                    })?;
+                }
+                "--size" => {
+                    let Some(spec) = iter.next() else {
+                        return Err("--size needs WxH".to_string());
+                    };
+                    out.size = Some(parse_size(spec)?);
                 }
                 "-l" | "--light" => out.theme = ThemeMode::Light,
                 "-d" | "--dark" => out.theme = ThemeMode::Dark,
@@ -167,6 +225,27 @@ impl Cli {
         }
         Ok(out)
     }
+}
+
+/// Parses `WxH` into a size.
+///
+/// A wrong size is a wrong size, not a default: a capture that quietly ignored
+/// `--size 900x700` would render a 1200px layout into a file named for a 900px
+/// one, and the whole point of the flag is to see a narrow pane.
+fn parse_size(spec: &str) -> Result<egui::Vec2, String> {
+    let Some((w, h)) = spec.split_once(['x', 'X']) else {
+        return Err(format!("--size wants WxH, got {spec}"));
+    };
+    let width: f32 = w
+        .parse()
+        .map_err(|_| format!("--size width is not a number: {w}"))?;
+    let height: f32 = h
+        .parse()
+        .map_err(|_| format!("--size height is not a number: {h}"))?;
+    if width < 200.0 || height < 200.0 {
+        return Err(format!("--size is too small to lay out: {spec}"));
+    }
+    Ok(egui::vec2(width, height))
 }
 
 fn main() -> std::process::ExitCode {
@@ -209,7 +288,7 @@ fn main() -> std::process::ExitCode {
     // whatever happens to be on top of the desktop. It is checked *before* the
     // `AppCreator` is built because that closure moves `opts`.
     if let Some(path) = cli.screenshot.take() {
-        return match shot::capture(opts, &path) {
+        return match shot::capture(opts, cli.scene, cli.size, &path) {
             Ok(()) => {
                 println!("wrote {}", path.display());
                 std::process::ExitCode::SUCCESS

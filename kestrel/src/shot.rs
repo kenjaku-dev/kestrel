@@ -31,12 +31,13 @@
 //! hundred and one more thing in the dependency graph.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use egui::epaint::{ClippedPrimitive, ImageData, Primitive, TextureId, Vertex};
 use egui::{Color32, ColorImage, Context, Pos2, Rect, Vec2, vec2};
 
-use crate::app::{KestrelApp, Options};
+use crate::app::{KestrelApp, Options, Scene};
 
 /// The size the file-manager capture is rendered at, in logical points.
 ///
@@ -58,15 +59,28 @@ const GALLERY_SIZE: Vec2 = vec2(1200.0, 2600.0);
 /// whose rows are painted in pass 2.
 const PASSES: usize = 3;
 
+/// How long a scene may spend settling, in milliseconds.
+///
+/// A scene that cannot settle is a bug in the scene, not something to paper over
+/// with a longer sleep: the bound is here so a broken capture fails loudly
+/// instead of hanging the review.
+const SETTLE_BUDGET_MS: u64 = 5_000;
+
 /// Renders the app and writes a PNG to `path`.
 ///
 /// # Errors
 ///
-/// Returns the I/O error from writing `path`. Rendering itself cannot fail: it
-/// allocates an in-memory framebuffer and touches no filesystem, GPU, or display
-/// server.
-pub fn capture(opts: Options, path: &Path) -> std::io::Result<()> {
-    let image = render(opts);
+/// Returns the I/O error from writing `path`, or a message describing why the
+/// scene could not be driven into the state it names. Rendering a settled frame
+/// itself cannot fail: it allocates an in-memory framebuffer and touches no
+/// display server.
+pub fn capture(
+    opts: Options,
+    scene: Scene,
+    size: Option<Vec2>,
+    path: &Path,
+) -> std::io::Result<()> {
+    let image = render(opts, scene, size)?;
     save_png(&image, path)
 }
 
@@ -77,13 +91,18 @@ pub fn capture(opts: Options, path: &Path) -> std::io::Result<()> {
 /// for the `--light`/`--dark` regression: the failure mode being guarded against
 /// is "the two flags produce the same picture", and the cheapest honest check is
 /// to render both and compare the pixels.
-#[must_use]
-pub fn render(opts: Options) -> ColorImage {
-    let size = if opts.gallery {
+///
+/// # Errors
+///
+/// Returns `io::ErrorKind::TimedOut` when a scene never settles. A capture that
+/// gives up loudly is worth more than a PNG of a pane that still says
+/// "Loading…", which is the failure this whole module exists to make impossible.
+pub fn render(opts: Options, scene: Scene, size: Option<Vec2>) -> std::io::Result<ColorImage> {
+    let size = size.unwrap_or(if opts.gallery {
         GALLERY_SIZE
     } else {
         BROWSER_SIZE
-    };
+    });
     let ctx = Context::default();
 
     // The font set is installed before the first pass, exactly as the real
@@ -92,42 +111,220 @@ pub fn render(opts: Options) -> ColorImage {
     crate::tokens::fonts::install(&ctx);
     egui_extras::install_image_loaders(&ctx);
 
+    let mut opts = opts;
+    if !opts.gallery && scene != Scene::Browser {
+        // A scene is only meaningful against a known listing, so the start
+        // directory becomes the fixture unless the caller named one. Without
+        // this, `--scene preview-image` in the user's home directory renders an
+        // empty preview pane and reviews nothing.
+        let fixture = fixture()?;
+        if opts.start_dir.is_none() {
+            opts.start_dir = Some(fixture);
+        }
+    }
+
     let mut app = KestrelApp::for_capture(ctx.clone(), opts);
     let mut textures = TextureBook::default();
     let mut image = blank(size, 1.0);
 
-    for pass in 0..PASSES {
-        let raw = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
-            // No `pixels_per_point` override: egui 0.36's `RawInput` has no such
-            // field — the scale comes from `Context::pixels_per_point`, which
-            // defaults to 1.0 for a `Context::default()`. That is exactly what
-            // this wants: a capture at 1.0 is the size the tokens are written
-            // in, so a 26px row is 26 pixels and the density decisions can be
-            // checked directly.
-            ..Default::default()
-        };
-        let mut output = ctx.run_ui(raw, |ui| app.draw(ui));
+    // Two settling phases, because a scene names a *row* and a row only exists
+    // once the scan has delivered. Applying the scene before the listing arrives
+    // would silently select nothing — and a capture that quietly reviews the
+    // wrong state is worse than one that fails.
+    if !settle_until(&ctx, &mut app, size, &mut textures, |a| a.is_listed()) {
+        return Err(timed_out(scene, "the listing"));
+    }
+    if scene != Scene::Browser {
+        app.apply_scene(scene);
+    }
+    if !settle_until(&ctx, &mut app, size, &mut textures, |a| a.is_settled()) {
+        return Err(timed_out(scene, "the scene"));
+    }
 
+    for _ in 0..PASSES {
+        let mut output = run_frame(&ctx, &mut app, size);
         textures.absorb(&output.textures_delta);
         let shapes = std::mem::take(&mut output.shapes);
         let ppp = output.pixels_per_point;
-        // The platform output is dropped on the floor: there is no window to act
-        // on it. The texture deltas are *not* dropped — `absorb` above has
-        // already taken what the rasteriser needs.
         output.drop_without_applying_deltas();
-
         // Every pass is rasterized and the last one kept. The earlier passes are
         // wasted work, but they cost a few hundred microseconds and they make the
         // loop obviously correct: what ends up in the file is exactly what the
-        // final pass painted. (A `--preview` / `--collision` capture uses the
-        // extra passes to settle the debounce and the modal, so they are not
-        // free of purpose.)
-        let _ = pass;
+        // final pass painted.
         image = rasterize(&ctx, shapes, ppp, size, &textures);
     }
 
-    image
+    Ok(image)
+}
+
+/// One frame of the app, with the input a capture always supplies.
+fn run_frame(ctx: &Context, app: &mut KestrelApp, size: Vec2) -> egui::FullOutput {
+    let raw = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+        // No `pixels_per_point` override: egui 0.36's `RawInput` has no such
+        // field — the scale comes from `Context::pixels_per_point`, which
+        // defaults to 1.0 for a `Context::default()`. That is exactly what
+        // this wants: a capture at 1.0 is the size the tokens are written
+        // in, so a 26px row is 26 pixels and the density decisions can be
+        // checked directly.
+        ..Default::default()
+    };
+    ctx.run_ui(raw, |ui| app.draw(ui))
+}
+
+/// Runs frames until `ready` says so, or the budget runs out.
+///
+/// Returns `true` when it settled. Sleeping between frames is not a stall in the
+/// product — this is the review tool, it owns the process, and there is no user
+/// to be responsive to. The frame loop *itself* still never blocks; that is a
+/// property of [`KestrelApp::draw`] and is unaffected by how often this calls it.
+fn settle_until(
+    ctx: &Context,
+    app: &mut KestrelApp,
+    size: Vec2,
+    textures: &mut TextureBook,
+    ready: impl Fn(&KestrelApp) -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(SETTLE_BUDGET_MS);
+    loop {
+        let output = run_frame(ctx, app, size);
+        // The texture book is shared with the drawing passes, and it has to be:
+        // the font atlas is *built* by the frames that lay the UI out, and it is
+        // delivered one frame late. Discarding the settling frames' deltas
+        // therefore leaves the book empty for every drawing frame too, and every
+        // glyph in the capture rasterises as a solid block — a caption that
+        // looks like a row of little bricks, which is not an error anyone can
+        // read past as "the renderer is broken".
+        textures.absorb(&output.textures_delta);
+        output.drop_without_applying_deltas();
+        if ready(app) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+}
+
+/// The error a capture returns when a scene never reaches its state.
+fn timed_out(scene: Scene, what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("scene {scene:?} never finished settling {what} within {SETTLE_BUDGET_MS}ms"),
+    )
+}
+
+// ----------------------------------------------------------------------------
+// Scene fixtures
+// ----------------------------------------------------------------------------
+
+/// Builds the directory a scene is captured against.
+///
+/// The point of a fixture is that it contains **one of everything the pane has a
+/// case for**: a text file with several lines and a comment, an image, a file
+/// over [`crate::preview::MAX_PREVIEW_BYTES`], a folder, a file with no
+/// extension. A capture of `$HOME` proves the layout; a capture of a directory
+/// chosen for what is in it proves the components.
+///
+/// # Errors
+///
+/// Returns the I/O error from creating the directory or writing a fixture file.
+fn fixture() -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("kestrel-shot-fixture");
+    // A fresh directory every time, so a scene never captures a listing that a
+    // previous run left behind — the failure mode being a screenshot that
+    // changes when nothing in the app changed.
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::create_dir_all(dir.join("assets"))?;
+
+    std::fs::write(
+        dir.join("notes.md"),
+        "# Kestrel\n\nThe design tokens live in /tmp/opencode/kestrel-tokens.md.\n\n\
+         - density is 26px rows\n- the accent is pine teal\n- selection is a flat tint\n\n\
+         // a comment, so the highlighter has something to colour\nlet width = 720.0;\n\
+         let label = \"Modified\";\n",
+    )?;
+    std::fs::write(dir.join("diagram.png"), sample_png())?;
+    // Comfortably over the cap, so `PreviewTooLarge` has a file to degrade on
+    // *and* the pane's two size numbers are distinguishable. A file 4 KiB over
+    // the limit formats as "1.0 MB" and the limit formats as "1.0 MB", which
+    // makes the degradation sentence look self-contradictory in a capture.
+    std::fs::write(
+        dir.join("archive.tar"),
+        vec![0u8; (crate::preview::MAX_PREVIEW_BYTES + 512 * 1024) as usize],
+    )?;
+    std::fs::write(dir.join("LICENSE"), b"MIT\n")?;
+    std::fs::write(dir.join("run.sh"), b"#!/bin/sh\necho hello\n")?;
+    Ok(dir)
+}
+
+/// A small, real PNG: 320x240, an accent-tinted field in three bands with a
+/// left-to-right ramp.
+///
+/// Written from this file's own encoder rather than pasted in as hex, because a
+/// hand-copied byte string is exactly the kind of fixture that is one wrong
+/// nibble away from testing the *decoder's* error path instead of the preview
+/// pane's success path. The size is chosen so the image is **larger** than the
+/// pane's body and therefore has to be scaled down: a 1x1 or 64x48 fixture proves
+/// the decoder works and nothing about whether the scaling, the aspect ratio or
+/// the centring is right, which is the thing worth looking at.
+fn sample_png() -> Vec<u8> {
+    let (w, h) = (320u32, 240u32);
+    let image = ColorImage::new([w as usize, h as usize], {
+        let mut px = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let band = y / 12;
+                let tint = match band % 3 {
+                    0 => Color32::from_rgb(0x0E, 0x6B, 0x5F),
+                    1 => Color32::from_rgb(0x33, 0xA8, 0x94),
+                    _ => Color32::from_rgb(0xC9, 0xE6, 0xDF),
+                };
+                // A left-to-right ramp so scaling artefacts (a wrong aspect
+                // ratio, a nearest-neighbour magnify) are visible in the capture.
+                let t = x as f32 / w as f32;
+                let mix = |c: u8, f: u8| {
+                    let v = f32::from(c) * (1.0 - t) + f32::from(f) * t;
+                    (v.round().clamp(0.0, 255.0)) as u8
+                };
+                px.push(Color32::from_rgb(
+                    mix(tint.r(), 0xFC),
+                    mix(tint.g(), 0xFB),
+                    mix(tint.b(), 0xF9),
+                ));
+            }
+        }
+        px
+    });
+    encode_png(&image)
+}
+
+/// The PNG byte stream for `image`.
+///
+/// The same stored-deflate scheme [`save_png`] uses, factored out so a fixture
+/// and a capture are encoded by one piece of code.
+fn encode_png(image: &ColorImage) -> Vec<u8> {
+    let [w, h] = image.size;
+    let mut raw = Vec::with_capacity(h * (1 + w * 4));
+    for y in 0..h {
+        raw.push(0u8);
+        for x in 0..w {
+            raw.extend_from_slice(&image.pixels[y * w + x].to_array());
+        }
+    }
+    let mut png = Vec::new();
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &zlib_stored(&raw));
+    chunk(&mut png, b"IEND", &[]);
+    png
 }
 
 // ----------------------------------------------------------------------------
@@ -147,16 +344,51 @@ struct TextureBook {
 impl TextureBook {
     /// Folds one frame's texture deltas into the book.
     ///
-    /// A delta with a `pos` is a *partial* update. The font atlas grows by
-    /// rewriting its whole image, and nothing in this app uses a moving
-    /// texture, so a partial delta is skipped rather than mis-composited —
-    /// recorded here because silently dropping one would be a rendering bug
-    /// that only shows up as missing glyphs.
+    /// # Both kinds of delta are applied
+    ///
+    /// `pos: None` is a full rewrite — the atlas's first frame, and every time
+    /// it doubles in height. `pos: Some(_)` is a **partial** update, and that is
+    /// the common case: `TextureAtlas::take_delta` only reports `EVERYTHING`
+    /// when the atlas has been reallocated, so once it has stopped growing every
+    /// new glyph arrives as a small dirty rectangle.
+    ///
+    /// The previous version dropped partial deltas on the grounds that "nothing
+    /// in this app uses a moving texture". That is true of *images* and false of
+    /// the **font atlas**, which is exactly the texture that grows by accretion:
+    /// drop its partial deltas and the book keeps whatever the last reallocation
+    /// looked like, so every glyph rasterised after that point samples the wrong
+    /// texels. It does not look like missing text — it looks like *solid boxes*,
+    /// which is a far more convincing lie, and every icon in every capture was
+    /// rendering as a filled rectangle.
     fn absorb(&mut self, delta: &egui::TexturesDelta) {
         for (id, deltas) in &delta.set {
             for image_delta in deltas {
-                if image_delta.pos.is_none() {
-                    self.images.insert(*id, image_delta.image.clone());
+                match image_delta.pos {
+                    None => {
+                        self.images.insert(*id, image_delta.image.clone());
+                    }
+                    Some(pos) => {
+                        // A partial update is a blit. The destination has to
+                        // exist already: a partial delta before any full one
+                        // would be epaint writing into a texture this book has
+                        // never been told the size of, and guessing the size is
+                        // how a capture ends up sampling off the end of an image.
+                        let Some(existing) = self.images.get_mut(id) else {
+                            continue;
+                        };
+                        // `ImageData` is a single-variant enum in epaint 0.36,
+                        // so these two patterns are irrefutable today. The
+                        // `#[allow]` documents that as a version fact rather than
+                        // as an oversight — the same reasoning as `sample`.
+                        #[allow(irrefutable_let_patterns)]
+                        let ImageData::Color(dst) = existing;
+                        #[allow(irrefutable_let_patterns)]
+                        let ImageData::Color(src) = &image_delta.image;
+                        // The atlas is shared with nobody here, but it is handed
+                        // over behind an `Arc`, so the copy-on-write is what gets
+                        // the mutation in without cloning the whole atlas.
+                        blit(Arc::make_mut(dst), src, pos);
+                    }
                 }
             }
         }
@@ -210,6 +442,27 @@ impl TextureBook {
             out[ch] = top + (bottom - top) * fy;
         }
         out
+    }
+}
+
+/// Copies `src` into `dst` at `pos`, clipping at the destination's edges.
+///
+/// Every index is bounds-checked rather than asserted: a partial delta whose
+/// rectangle runs off the edge of a texture that was resized since the book last
+/// saw it is a possibility, not an impossibility, and a screenshot tool that
+/// panics is a screenshot tool that produces no screenshot.
+fn blit(dst: &mut ColorImage, src: &ColorImage, pos: [usize; 2]) {
+    for y in 0..src.size[1] {
+        for x in 0..src.size[0] {
+            let Some(pixel) = src.pixels.get(y * src.size[0] + x) else {
+                continue;
+            };
+            let tx = pos[0] + x;
+            let ty = pos[1] + y;
+            if let Some(slot) = dst.pixels.get_mut(ty * dst.size[0] + tx) {
+                *slot = *pixel;
+            }
+        }
     }
 }
 
@@ -430,31 +683,7 @@ fn clamp_u8(v: f32) -> u8 {
 /// uncompressed PNG needs only CRC-32 and Adler-32 — neither of which justifies
 /// a dependency. A 1200x1000 capture is a few MB on disk, which is fine.
 fn save_png(image: &ColorImage, path: &Path) -> std::io::Result<()> {
-    let [w, h] = image.size;
-    let mut raw = Vec::with_capacity(h * (1 + w * 4));
-    for y in 0..h {
-        // Filter type 0 (None) per scanline, which is what the zlib stream
-        // expects before each row of pixels.
-        raw.push(0u8);
-        for x in 0..w {
-            let px = image.pixels[y * w + x];
-            raw.extend_from_slice(&px.to_array());
-        }
-    }
-
-    let mut png = Vec::new();
-    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA, deflate, no filter, no interlace
-    chunk(&mut png, b"IHDR", &ihdr);
-
-    chunk(&mut png, b"IDAT", &zlib_stored(&raw));
-    chunk(&mut png, b"IEND", &[]);
-
-    std::fs::write(path, png)
+    std::fs::write(path, encode_png(image))
 }
 
 fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -543,6 +772,243 @@ mod tests {
     use super::*;
     use crate::app;
 
+    /// Every scene must render, in both themes, without hanging.
+    ///
+    /// The dialogs had never been rendered at all, which is the whole reason
+    /// [`Scene`] exists. A scene that cannot be driven into its state is a
+    /// regression in the state machine, and the cheapest place to notice is a
+    /// test that walks every variant rather than a person remembering to open
+    /// each dialog by hand.
+    ///
+    /// Rendered small on purpose: this asks "can the app be *driven* here?", not
+    /// "does it look right", and the answer to the second is what a human is for.
+    /// At the default size the software rasteriser turns twenty renders into two
+    /// minutes of test time, which is how a test gets deleted.
+    #[test]
+    fn every_scene_renders() {
+        let size = vec2(640.0, 480.0);
+        for scene in [
+            Scene::Browser,
+            Scene::ConfirmPermanent,
+            Scene::ConfirmTrash,
+            Scene::Collision,
+            Scene::Progress,
+            Scene::Failed,
+            Scene::PreviewEmpty,
+            Scene::PreviewText,
+            Scene::PreviewImage,
+            Scene::PreviewTooLarge,
+        ] {
+            for theme in [
+                crate::tokens::ThemeMode::Light,
+                crate::tokens::ThemeMode::Dark,
+            ] {
+                let image = render(
+                    app::Options {
+                        theme,
+                        ..app::Options::default()
+                    },
+                    scene,
+                    Some(size),
+                )
+                .unwrap_or_else(|e| panic!("{scene:?} / {theme:?} did not render: {e}"));
+                assert_eq!(
+                    (image.width(), image.height()),
+                    (640, 480),
+                    "{scene:?} rendered at the wrong size"
+                );
+            }
+        }
+    }
+
+    /// The list must never draw into the preview pane.
+    ///
+    /// The reported defect was the `Modified` column being clipped at the pane's
+    /// left edge. The cause was structural rather than arithmetic: the column set
+    /// was chosen from the *panel's* width while the rows were laid out from the
+    /// width read **inside** the `ScrollArea`, so the header and the values could
+    /// resolve to different columns, and any disagreement shows up as a value
+    /// sitting under the wrong header or running under the divider.
+    ///
+    /// This measures the rendered picture instead of the layout: it finds the
+    /// pane's left edge from the pixels, then requires every row band's ink to
+    /// stop short of it. It holds at any width, which is the property that
+    /// matters — a check at one width would only pin one width.
+    #[test]
+    fn the_list_never_draws_into_the_preview_pane() {
+        for width in [900.0_f32, 1200.0, 1600.0] {
+            let image = render(
+                app::Options::default(),
+                Scene::Browser,
+                Some(vec2(width, 800.0)),
+            )
+            .unwrap_or_else(|e| panic!("render at {width} failed: {e}"));
+            let w = image.width();
+            let h = image.height();
+            let px = |x: usize, y: usize| {
+                let p = image.pixels[y * w + x];
+                (p.r(), p.g(), p.b())
+            };
+            // The preview pane's fill, sampled from its own middle. Every pixel of
+            // a pane that is not showing an image or text is this colour, and
+            // `Scene::Browser` focuses nothing, so it is the pane's uniform fill.
+            let pane = px(w - 20, h / 2);
+            // The list's own surface, sampled well inside the list body and on a
+            // row, so it is between two rows rather than on one.
+            let list_surface = px(400, 110);
+            // Walk in from the right until the pane's fill starts.
+            let Some(pane_left) = (1..w - 1).rev().find(|x| px(*x, h / 2) == pane) else {
+                panic!("no preview pane found at width {width}");
+            };
+            // The list band: below the column header, above the status bar.
+            let band = 100..(h - 40);
+            let mut worst = 0usize;
+            for y in band {
+                for x in pane_left.saturating_sub(80)..pane_left {
+                    // Ink is anything in the list that is not the list surface.
+                    if px(x, y) != list_surface {
+                        worst = worst.max(x);
+                    }
+                }
+            }
+            assert!(
+                worst < pane_left,
+                "at width {width}: the list paints ink at x={worst}, inside the \
+                 preview pane that starts at {pane_left}"
+            );
+        }
+    }
+
+    /// The preview pane's empty state is centred in the part of the pane the
+    /// user can see.
+    ///
+    /// The pane used to be *sized* before the status bar existed — an egui panel
+    /// is measured against whatever the root `Ui` has left when it is shown, and
+    /// the status bar is a full-width band that had not been reserved yet — so
+    /// its rectangle ran 25px under the status bar. Nothing about the fill showed
+    /// it, because the status bar and the pane share `surface.panel`. What it did
+    /// show was anything centred in the pane sitting 15px below the middle of the
+    /// visible area, which is a defect no unit test on the layout function could
+    /// have found.
+    ///
+    /// So this measures the picture: the block's ink, against the band between
+    /// the column header and the status bar. The band's edges are the tokens:
+    /// toolbar 34 + breadcrumb 28 + column header 24 at the top, status bar 24 at
+    /// the bottom.
+    #[test]
+    fn the_preview_empty_state_is_centred_in_the_pane() {
+        // The pane is a full-height side panel, so its visible band runs from
+        // under the toolbar to the top of the status bar — *not* under the
+        // column header, which only spans the list column. Getting that wrong is
+        // how a test can pass a layout that is 25px low.
+        let top = crate::tokens::metric::TOOLBAR as usize;
+        let bottom_gap = crate::tokens::component::STATUSBAR_HEIGHT as usize;
+        for theme in [
+            crate::tokens::ThemeMode::Light,
+            crate::tokens::ThemeMode::Dark,
+        ] {
+            let image = render(
+                app::Options {
+                    theme,
+                    ..app::Options::default()
+                },
+                Scene::PreviewEmpty,
+                Some(BROWSER_SIZE),
+            )
+            .expect("render");
+            let w = image.width();
+            let h = image.height();
+            let px = |x: usize, y: usize| {
+                let p = image.pixels[y * w + x];
+                (p.r(), p.g(), p.b())
+            };
+            // The pane's fill, from its own middle.
+            let pane_fill = px(w - 20, h / 2);
+            // The pane's left edge: the first list-surface pixel walking left
+            // from the right-hand side.
+            let pane_left = (1..w - 1)
+                .rev()
+                .find(|x| px(*x, h / 2) != pane_fill)
+                .expect("a list surface at mid-height");
+            // `top + 1`: the toolbar's bottom border is a hairline that spans the
+            // whole window, so it lands on the band's first row inside the
+            // pane's own x range. Everything below it in the pane belongs to the
+            // block, so the bounding box is min..max of the rest.
+            let rows: Vec<usize> = (top + 1..h - bottom_gap)
+                .filter(|y| (pane_left + 4..w - 4).any(|x| px(x, *y) != pane_fill))
+                .collect();
+            assert!(
+                !rows.is_empty(),
+                "{theme:?}: the empty state drew nothing in the pane"
+            );
+            let start = rows[0];
+            let end = rows[rows.len() - 1];
+            let centre = (start + end) as f32 / 2.0;
+            let band_centre = (top + h - bottom_gap) as f32 / 2.0;
+            assert!(
+                (centre - band_centre).abs() < 8.0,
+                "{theme:?}: the empty state is centred at {centre} (rows {start}..\
+                 {end}) but the visible pane is centred at {band_centre}"
+            );
+        }
+    }
+
+    /// A text preview must actually put text on the pane.
+    ///
+    /// Without this, `PreviewText` renders happily with a pane that says
+    /// "Loading…" forever and the test above passes — which is exactly the bug
+    /// this capture path exists to make visible, so it needs an assertion of its
+    /// own rather than only a "it did not hang".
+    #[test]
+    fn a_text_preview_lands_content() {
+        let dir = fixture().expect("fixture");
+        let ctx = Context::default();
+        crate::tokens::fonts::install(&ctx);
+        let mut app = KestrelApp::for_capture(
+            ctx.clone(),
+            app::Options {
+                theme: crate::tokens::ThemeMode::Dark,
+                start_dir: Some(dir),
+                ..app::Options::default()
+            },
+        );
+        let mut textures = TextureBook::default();
+        assert!(
+            settle_until(&ctx, &mut app, BROWSER_SIZE, &mut textures, |a| a
+                .is_listed()),
+            "the fixture listing never arrived"
+        );
+        app.apply_scene(Scene::PreviewText);
+        assert!(
+            settle_until(&ctx, &mut app, BROWSER_SIZE, &mut textures, |a| a
+                .is_settled()),
+            "the preview scene never settled"
+        );
+        assert!(
+            matches!(
+                app.preview_state(),
+                Some(crate::preview::Loaded::Text { .. })
+            ),
+            "the preview pane never received its content: {:?}",
+            app.preview_state()
+        );
+    }
+
+    /// A capture at an explicit size is that size, not the default.
+    ///
+    /// The narrow-pane bug was invisible at 1200px, so the ability to render
+    /// narrower is not a convenience: without it the next one cannot be caught.
+    #[test]
+    fn an_explicit_size_is_honoured() {
+        let image = render(
+            app::Options::default(),
+            Scene::Browser,
+            Some(vec2(640.0, 480.0)),
+        )
+        .expect("render");
+        assert_eq!((image.width(), image.height()), (640, 480));
+    }
+
     /// `--light` and `--dark` must produce **different pictures**.
     ///
     /// The reported failure was "`--light` produces a dark screenshot", and the
@@ -566,14 +1032,24 @@ mod tests {
             start_dir: Some(dir.clone()),
             ..app::Options::default()
         };
-        let dark = render(app::Options {
-            theme: crate::tokens::ThemeMode::Dark,
-            ..base.clone()
-        });
-        let light = render(app::Options {
-            theme: crate::tokens::ThemeMode::Light,
-            ..base
-        });
+        let dark = render(
+            app::Options {
+                theme: crate::tokens::ThemeMode::Dark,
+                ..base.clone()
+            },
+            Scene::Browser,
+            None,
+        )
+        .expect("dark render");
+        let light = render(
+            app::Options {
+                theme: crate::tokens::ThemeMode::Light,
+                ..base
+            },
+            Scene::Browser,
+            None,
+        )
+        .expect("light render");
         assert_eq!(
             (light.width(), light.height()),
             (dark.width(), dark.height()),
@@ -614,6 +1090,22 @@ mod tests {
         // are thinking of CRC-32/MPEG-2 — is the non-reflected variant and would
         // make every chunk in every capture unreadable to a strict decoder.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// The fixture's PNG has to be a real PNG, or every image capture in the
+    /// suite is really testing the decoder's failure path.
+    #[test]
+    fn the_fixture_image_is_a_decodable_png() {
+        let bytes = sample_png();
+        let kinds = read_chunks(&bytes);
+        assert_eq!(
+            kinds,
+            vec![*b"IHDR", *b"IDAT", *b"IEND"],
+            "the fixture must be a complete PNG, CRC and all"
+        );
+        let image =
+            egui_extras::image::load_image_bytes(&bytes).expect("the fixture PNG must decode");
+        assert_eq!((image.width(), image.height()), (320, 240));
     }
 
     #[test]

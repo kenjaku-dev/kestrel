@@ -147,16 +147,6 @@ impl ColumnLayout {
     pub fn name_text_width(&self) -> f32 {
         (self.name.right() - self.name_text_x).max(0.0)
     }
-
-    /// Roughly how many characters fit, for the middle-truncation budget.
-    ///
-    /// 6.5px per character at `type.name`'s 13px in Plex Sans is within a few
-    /// percent; the truncation point being a character either side of optimal
-    /// is invisible, and a wrong estimate that *slices* a glyph is not.
-    #[must_use]
-    pub fn name_text_cols(&self) -> usize {
-        ((self.name_text_width() / 6.5) as usize).max(4)
-    }
 }
 
 /// The column set to use for a pane of `width` px.
@@ -379,10 +369,33 @@ mod tests {
         let wide = ColumnLayout::resolve(row(1400.0), columns_for(1400.0, false));
         let narrow = ColumnLayout::resolve(row(500.0), columns_for(500.0, false));
         assert!(
-            wide.name_text_cols() > narrow.name_text_cols(),
+            wide.name_text_width() > narrow.name_text_width(),
             "a wider pane must fit more characters"
         );
-        assert!(narrow.name_text_cols() >= 4, "never less than the floor");
+        assert!(narrow.name_text_width() > 0.0, "never less than nothing");
+    }
+
+    /// The trailing column reaches the row's right edge, and the two right-hand
+    /// cells are exactly one column-gap apart.
+    ///
+    /// The *inset* of a right-aligned value is applied at paint time, not here —
+    /// the cell is the full column and the text sits `row.padding-x` inside it.
+    /// `shot::tests::the_list_never_draws_into_the_preview_pane` is what pins the
+    /// painted result; this pins the geometry it is painted into.
+    #[test]
+    fn the_trailing_columns_partition_the_row() {
+        let width = 1000.0;
+        let l = ColumnLayout::resolve(row(width), columns_for(width, false));
+        let modified = l.modified.expect("modified column at 1000px");
+        let size = l.size.expect("size column at 1000px");
+        assert!((modified.right() - width).abs() < 0.01);
+        // With no Kind column, Modified is the rightmost and Size sits to its
+        // left, one column-gap away.
+        assert!(
+            (modified.left() - size.right() - component::ROW_COLUMN_GAP).abs() < 0.01,
+            "modified at {modified:?}, size at {size:?}"
+        );
+        assert!(l.name.right() <= size.left() + 0.01);
     }
 
     /// Every cell must span the row's own vertical extent.

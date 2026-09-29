@@ -79,6 +79,49 @@ pub enum Screen {
     Gallery,
 }
 
+/// A starting state for a headless `--screenshot` capture.
+///
+/// # Why the capture path needs this
+///
+/// The dialogs and the populated preview pane are **states**, not screens: they
+/// exist only as a result of a keystroke or a background answer, and there is no
+/// flag that reaches them. Without a way to *put the app into* them, the only
+/// way to review §4.7 is to reproduce the operation by hand in a live window and
+/// hope the machine is idle — which is precisely the "screenshot grabbed off the
+/// desktop" failure [`crate::shot`] exists to avoid.
+///
+/// So the states are named here, applied to a real [`KestrelApp`], and rendered
+/// through the same [`KestrelApp::draw`] the window runs. Nothing about the
+/// paint path is special-cased for a capture; a scene is just the app's state
+/// before the first frame.
+///
+/// Every variant is something a user can actually reach. There is no
+/// `Scene::BrokenLayout` that only exists to make a screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scene {
+    /// The default: a listing, nothing selected, no dialog.
+    #[default]
+    Browser,
+    /// §4.7 `Delete Permanently` for three items, with a quoted path.
+    ConfirmPermanent,
+    /// §4.7 `Move to Trash` for three items — the reversible default.
+    ConfirmTrash,
+    /// §4.7 A collision the filesystem asked about: five buttons, both scopes.
+    Collision,
+    /// §4.7 A running copy with a Stop button.
+    Progress,
+    /// §4.7 A job that stopped halfway.
+    Failed,
+    /// The preview pane's empty state, centred.
+    PreviewEmpty,
+    /// The preview pane on a text file, syntax-highlighted.
+    PreviewText,
+    /// The preview pane on an image.
+    PreviewImage,
+    /// The preview pane's "too large" degradation.
+    PreviewTooLarge,
+}
+
 /// What the preview pane needs about the focused row.
 ///
 /// A small owned copy rather than a borrow, so requesting a load does not alias
@@ -429,6 +472,149 @@ impl KestrelApp {
         };
         app.open_dir(dir);
         app
+    }
+
+    // -- Capture scenes -----------------------------------------------------
+
+    /// Puts the app into `scene`, given the directory it is listing.
+    ///
+    /// The scenes that raise a dialog go through the *real* entry points
+    /// ([`KestrelApp::begin`]) rather than assigning [`DlgKind`] directly, so a
+    /// capture cannot show a dialog the app would never actually build. The two
+    /// the app only raises from a background worker — a collision and a failure —
+    /// are constructed directly, because reproducing them for real would mean
+    /// copying files and deleting them on the reviewer's machine to look at a
+    /// PNG.
+    pub fn apply_scene(&mut self, scene: Scene) {
+        match scene {
+            // `Browser` is "no scene", and `PreviewEmpty` is "no scene" too: it
+            // is the *absence* of a selection, which is what the browser scene
+            // already is.
+            Scene::Browser | Scene::PreviewEmpty => {}
+            Scene::ConfirmPermanent => {
+                self.select_fixture_sample();
+                self.begin(dialog::op_for_delete(true), None);
+            }
+            Scene::ConfirmTrash => {
+                self.select_fixture_sample();
+                self.begin(dialog::op_for_delete(false), None);
+            }
+            Scene::Collision => {
+                let src = self.dir.join("report.txt");
+                let dst = self.dir.join("report (copy).txt");
+                self.modal = Some(DlgKind::Collision {
+                    src,
+                    dst,
+                    remaining: 3,
+                });
+                self.modal_focus = 0;
+            }
+            Scene::Progress => {
+                self.modal = Some(DlgKind::Progress {
+                    op: job::Op::Copy,
+                    done: 7,
+                    total: 24,
+                    bytes: 48 * 1024 * 1024,
+                    total_bytes: Some(310 * 1024 * 1024),
+                    current: self.dir.join("assets"),
+                    rate: "12 items/s".to_string(),
+                });
+                self.modal_focus = 0;
+            }
+            Scene::Failed => {
+                self.modal = Some(DlgKind::Failed {
+                    op: job::Op::Move,
+                    path: self.dir.join("locked"),
+                    reason: "Permission denied (os error 13)".to_string(),
+                });
+                self.modal_focus = 0;
+            }
+            Scene::PreviewText => {
+                self.focus_named("notes.md");
+            }
+            Scene::PreviewImage => {
+                self.focus_named("diagram.png");
+            }
+            Scene::PreviewTooLarge => {
+                self.focus_named("archive.tar");
+            }
+        }
+    }
+
+    /// What the preview pane currently holds, for a test or a capture that has
+    /// to know whether content landed rather than merely that nothing hung.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn preview_state(&self) -> Option<&PvLoaded> {
+        self.preview_content.as_ref()
+    }
+
+    /// `true` once the initial scan has finished delivering.
+    ///
+    /// The engine keeps the handle until `Complete`, so this is the honest
+    /// "the listing is here" signal. It says nothing about whether the listing is
+    /// *empty*, and must not: an empty directory is a settled directory, and a
+    /// check that conflated the two would hang a capture of one forever.
+    #[must_use]
+    pub fn is_listed(&self) -> bool {
+        self.scan.is_none()
+    }
+
+    /// `true` once the app has nothing left in flight for a capture to wait on.
+    ///
+    /// A capture has to be *settled*, not merely *drawn*: a PNG of a preview
+    /// pane that still says "Loading…" reviews nothing. The scan and the preview
+    /// loader are both non-blocking by design, so the honest way to wait for them
+    /// is to keep running frames until they say they are done — never to sleep on
+    /// a guessed duration, and never to block the worker.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        if !self.is_listed() || self.preview.is_busy() {
+            return false;
+        }
+        match self.focused_preview_target() {
+            // Nothing to preview: there is nothing to wait for.
+            None => true,
+            Some(target) => {
+                // A non-viewable target (a directory, a file with no size, an
+                // oversized file) never queues a load at all, so "no content has
+                // landed" is the *correct* final state, not a hang.
+                !pv::kind_for(target.is_image, target.size).is_viewable()
+                    || self.preview_content.is_some()
+            }
+        }
+    }
+
+    /// Selects the three fixture rows a confirm dialog is captured with.
+    ///
+    /// The first is a plain click and the rest are ctrl-clicks, so the capture
+    /// shows a genuine multi-selection — anchor, focus and all — rather than a
+    /// selection assembled by a method the pointer never calls.
+    fn select_fixture_sample(&mut self) {
+        let mut first = true;
+        for name in ["notes.md", "diagram.png", "archive.tar"] {
+            let Some(at) = self.row_index(name) else {
+                continue;
+            };
+            if first {
+                self.selection.click(at);
+                first = false;
+            } else {
+                self.selection.toggle(at);
+            }
+        }
+    }
+
+    /// Focuses the row called `name`, if the listing has one.
+    fn focus_named(&mut self, name: &str) {
+        if let Some(at) = self.row_index(name) {
+            self.selection.click(at);
+        }
+    }
+
+    /// The visible index of the row called `name`.
+    fn row_index(&self, name: &str) -> Option<usize> {
+        self.rows.iter().position(|r| r.entry.name == name)
     }
 
     /// Cycles Light → Dark → System, re-resolving on the next frame.
@@ -1402,10 +1588,10 @@ impl KestrelApp {
         let Some(kind) = self.modal.clone() else {
             return;
         };
-        let buttons = dialog::buttons_for(&kind);
-        let Some(button) = buttons.get(self.modal_focus).copied() else {
-            return;
-        };
+        // Enter follows §4.7's *default*, which is not always the focused button:
+        // the focus ring is always on the safe action, and the Enter default is
+        // `Move to Trash` when — and only when — the action is reversible.
+        let button = dialog::enter_default(&kind);
         match &kind {
             DlgKind::Collision { .. } => self.answer_collision(button),
             DlgKind::Confirm { .. } | DlgKind::Failed { .. } => {
@@ -1577,7 +1763,19 @@ impl KestrelApp {
 impl KestrelApp {
     /// Builds the whole shell. Panels before the `CentralPanel`, always.
     fn panels(&mut self, ui: &mut Ui) {
+        // Panel order is not cosmetic: an egui panel is sized against whatever
+        // the *root* `Ui` has left at the moment it is shown, so a panel shown
+        // before a full-width band does not know that band exists.
+        //
+        // The status bar used to be shown sixth, after the preview pane, which
+        // meant the pane was 748px tall when 723px of it was visible: the last
+        // 25px sat under the status bar. Nothing looked wrong until something
+        // was *centred* in the pane — the empty state landed 15px below the
+        // middle of what the user can see, and an image's fit box was 25px taller
+        // than the space it was centred in. The two full-width bands therefore
+        // go first, and every side panel after them.
         self.top_toolbar(ui);
+        self.status_bar(ui);
         if self.show_preview {
             // Right, so the list keeps the left-to-right reading order of a file
             // manager: places, list, detail.
@@ -1585,14 +1783,34 @@ impl KestrelApp {
         }
         self.sidebar(ui);
         self.breadcrumb(ui);
-        self.column_headers(ui);
-        self.status_bar(ui);
+        // The list's width is measured **once**, here, and handed to both the
+        // header and the rows.
+        //
+        // The three `available_width()` reads this replaces were each correct in
+        // isolation and wrong as a set. `columns_for` took the `CentralPanel`'s
+        // width, the rows took the width *inside* the `ScrollArea`, and the
+        // header took the root `Ui`'s. They agree today, and that agreement is
+        // the trap: `ScrollArea`'s content `Ui` reports a `max_rect` built from
+        // the viewport, and reading it works — right up until a widget inside the
+        // closure widens the content, at which point the content `Ui`'s
+        // `max_rect` grows with it and `available_width()` reports the *content*
+        // width, not the viewport's. The gallery hit exactly that (1200 -> 1564)
+        // and the fix there was `set_max_width` at the top of every section.
+        //
+        // Here the honest fix is not a clamp but a single source: the width the
+        // panel actually has, threaded explicitly. The header and the rows then
+        // cannot disagree even in principle, and §4.9's "the list is never inset
+        // to make room" for a floating scrollbar is honoured — a bar that appears
+        // overlays the last column instead of silently re-flowing the values out
+        // from under their own header.
+        let list_width = ui.available_width();
+        self.column_headers(ui, list_width);
         // The central panel goes **last**: it claims whatever rectangle the
         // others did not take.
         let fill = self.theme.surfaces.list;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(fill))
-            .show(ui, |ui| self.file_list(ui));
+            .show(ui, |ui| self.file_list(ui, list_width));
         // The modal is drawn after everything, so it is genuinely on top — and
         // the scrim it paints is what makes the window behind it clearly not
         // clickable, which §2.12's "never an overlay" is about for *chrome*, not
@@ -1605,131 +1823,204 @@ impl KestrelApp {
     /// A `Modal` rather than a `Window`, because a dialog must not be movable,
     /// resizable, or closable by its title bar: §4.7 gives it a scrim, a fixed
     /// `dialog.width`, and one of exactly two or five buttons.
+    ///
+    /// # Why the content is scoped, and why there is no height guess
+    ///
+    /// `dialog.width` is 400px, and the previous version "applied" it by
+    /// allocating a 400 x 140-172 rect and then calling `Frame::show` on the
+    /// *remaining* space. Two things went wrong, both of them layout rather than
+    /// style, and neither was visible without a render:
+    ///
+    /// * the frame wrapped a `Ui` whose width was still the whole `Modal` area,
+    ///   so the dialog came out **600px** wide; and
+    /// * the reservation stayed on the cursor, so the frame was painted *below*
+    ///   it — the dialog was 172px too low, which read as "slightly off-centre"
+    ///   until you measured it.
+    ///
+    /// An egui `Frame` sizes itself to its **content** (`Prepared::outer_rect` is
+    /// `content_ui.min_rect()` plus the margins), so constraining the content's
+    /// `max_rect` to `dialog::WIDTH` and letting it grow vertically gives both
+    /// numbers for free: a dialog that is exactly 400px wide and exactly as tall
+    /// as its content, with the `Modal`'s own centring doing the rest. A
+    /// hard-coded height is the thing that has to be wrong when a sentence wraps
+    /// to three lines instead of two.
     fn modal_layer(&mut self, ui: &mut Ui) {
-        if self.modal.is_none() {
+        let Some(kind) = self.modal.clone() else {
             return;
-        }
+        };
         let theme = self.theme;
-        let scrim = dialog::scrim(&theme);
         // A scrim over everything, and it eats clicks: `Modal` does the latter,
         // this rect does the former.
         let full = ui.max_rect();
         ui.painter()
-            .rect_filled(full, radius::all(radius::NONE), scrim);
+            .rect_filled(full, radius::all(radius::NONE), dialog::scrim(&theme));
 
-        let kind = self.modal.clone().expect("checked above");
         let buttons = dialog::buttons_for(&kind);
         // Keep the focus index inside the button list: the list changes shape
         // between dialog kinds, and a stale index would index out of bounds.
         if self.modal_focus >= buttons.len() {
             self.modal_focus = 0;
         }
-        let op = match &kind {
-            DlgKind::Confirm { op, .. } | DlgKind::Failed { op, .. } => *op,
-            _ => job::Op::Copy,
-        };
+        let op = kind.op();
         let title = kind.title();
         let body = kind.body();
-        let warning = match &kind {
-            DlgKind::Confirm { warning, .. } => warning.clone(),
-            _ => DlgKind::irreversibility_line(op).map(str::to_string),
-        };
-        let sample = match &kind {
-            DlgKind::Confirm { sample, .. } => sample.clone(),
-            _ => None,
-        };
+        // `extra_warning`, not the raw line: for `Delete` the sentence already
+        // ends in "This cannot be undone.", and rendering the line as well said
+        // it twice.
+        let warning = kind.extra_warning();
+        let quote = kind.quoted_path();
         let icon = kind.icon();
+        let icon_danger = kind.is_icon_dangerous();
+        let fraction = kind.progress_fraction();
         let destructive = buttons.iter().any(|b| b.is_destructive());
+        let focused_button = buttons[self.modal_focus];
 
         let mut clicked: Option<DlgButton> = None;
         egui::Modal::new(egui::Id::new("kestrel-dialog"))
             .frame(egui::Frame::NONE)
             .show(ui.ctx(), |ui| {
-                let height_guess = if warning.is_some() { 172.0 } else { 140.0 };
-                ui.allocate_exact_size(vec2(dialog::WIDTH, height_guess), Sense::hover());
-                let frame = egui::Frame::new()
-                    .fill(dialog::background(&theme))
-                    .inner_margin(egui::Margin::same(dialog::PADDING as i8))
-                    .corner_radius(radius::all(dialog::RADIUS))
-                    // `dialog.border` — 1px `border.strong`, so the dialog reads as
-                    // an object even where the scrim is subtle.
-                    .stroke(Stroke::new(border::HAIRLINE, theme.borders.strong));
-                frame.show(ui, |ui| {
-                    // --- title row: icon + title ---
-                    ui.horizontal(|ui| {
-                        let ir = Rect::from_center_size(
-                            ui.cursor().left_top() + vec2(dialog::ICON / 2.0, dialog::ICON / 2.0),
-                            vec2(dialog::ICON, dialog::ICON),
-                        );
-                        tokens::icon_glyph(
-                            ui.painter(),
-                            ir,
-                            icon,
-                            if destructive {
-                                theme.status.danger_text
-                            } else {
-                                theme.icon.chrome
-                            },
-                        );
-                        ui.add_space(space::S2);
-                        ui.label(
-                            RichText::new(title.clone())
-                                .font(tokens::font(ty::DIALOG_TITLE, &theme))
-                                .color(theme.text.primary),
-                        );
-                    });
-                    ui.add_space(space::S2);
-                    // --- body ---
-                    ui.label(
-                        RichText::new(body.clone())
-                            .font(tokens::font(ty::DIALOG_BODY, &theme))
-                            .color(theme.text.secondary),
-                    );
-                    // --- the irreversibility line, in danger text ---
-                    if let Some(w) = warning {
-                        ui.add_space(space::S1);
-                        ui.label(
-                            RichText::new(w)
-                                .font(tokens::font(ty::CAPTION, &theme))
-                                .color(if destructive {
+                // The area's own top-left, and a *finite* height. An infinite
+                // one is the obvious way to say "as tall as it needs", and egui
+                // answers it with `Rect::NOTHING` and a NaN: `align_size_within_rect`
+                // takes a midpoint of two infinities. The frame sizes itself to
+                // its content regardless, so the available height is only a
+                // ceiling.
+                let ceiling = ui.max_rect().size();
+                let box_rect =
+                    Rect::from_min_size(ui.max_rect().min, vec2(dialog::WIDTH, ceiling.y));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(box_rect), |ui| {
+                    let frame = egui::Frame::new()
+                        .fill(dialog::background(&theme))
+                        .inner_margin(egui::Margin::same(dialog::PADDING as i8))
+                        .corner_radius(radius::all(dialog::RADIUS))
+                        // `dialog.border` — 1px `border.strong`, so the dialog
+                        // reads as an object even where the scrim is subtle.
+                        .stroke(Stroke::new(border::HAIRLINE, theme.borders.strong));
+                    frame.show(ui, |ui| {
+                        // --- title row: icon + title ---
+                        ui.horizontal(|ui| {
+                            // The icon is **allocated**, not painted at the
+                            // cursor. Painting it left the cursor 8px further on
+                            // than the icon's own 20px, so a 20px glyph was
+                            // overlapped by the first letter of the title. The
+                            // bug was invisible until the capture path could
+                            // actually typeset text: with every glyph a solid
+                            // block it just looked like a wide icon.
+                            let (ir, _) = ui.allocate_exact_size(
+                                vec2(dialog::ICON, dialog::ICON),
+                                Sense::hover(),
+                            );
+                            tokens::icon_glyph(
+                                ui.painter(),
+                                ir,
+                                icon,
+                                if icon_danger {
                                     theme.status.danger_text
                                 } else {
-                                    theme.text.tertiary
-                                }),
-                        );
-                    }
-                    // --- `dialog.path-quote` ---
-                    if let Some(path) = sample {
+                                    theme.icon.chrome
+                                },
+                            );
+                            ui.add_space(space::S1);
+                            ui.label(
+                                RichText::new(title.clone())
+                                    .font(tokens::font(ty::DIALOG_TITLE, &theme))
+                                    .color(theme.text.primary),
+                            );
+                        });
                         ui.add_space(space::S2);
-                        let quoted = format::middle_truncate(&path.to_string_lossy(), 56);
-                        let (qr, _) = ui
-                            .allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
-                        ui.painter().rect_filled(
-                            qr,
-                            radius::all(component::DIALOG_PATH_QUOTE_RADIUS),
-                            theme.state.hover,
+                        // --- body ---
+                        ui.label(
+                            RichText::new(body.clone())
+                                .font(tokens::font(ty::DIALOG_BODY, &theme))
+                                .color(theme.text.secondary),
                         );
-                        ui.painter().text(
-                            qr.left_center() + vec2(component::DIALOG_PATH_QUOTE_PAD_X, 0.0),
-                            Align2::LEFT_CENTER,
-                            quoted,
-                            tokens::font(ty::META, &theme),
-                            theme.text.secondary,
-                        );
-                    }
-                    // --- footer, right-aligned per `dialog.footer-align` ---
-                    ui.add_space(dialog::FOOTER_GAP);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // Laid right-to-left, so the *last* button in the list ends
-                        // up leftmost... which is wrong: §4.7 requires Cancel
-                        // leftmost. So the list is walked in reverse to undo the
-                        // layout, keeping one source of truth for the order.
-                        for b in buttons.iter().rev().copied() {
-                            ui.add_space(space::HALF);
-                            if self.dialog_button(ui, b, b == buttons[self.modal_focus], op) {
-                                clicked = Some(b);
-                            }
+                        // --- the irreversibility line, in danger text ---
+                        if let Some(w) = warning {
+                            ui.add_space(space::S1);
+                            ui.label(
+                                RichText::new(w)
+                                    .font(tokens::font(ty::CAPTION, &theme))
+                                    .color(if destructive {
+                                        theme.status.danger_text
+                                    } else {
+                                        theme.text.tertiary
+                                    }),
+                            );
                         }
+                        // --- the progress bar, on a `Progress` dialog ---
+                        //
+                        // §4.7 has no tokens for one, so it is derived from §4.5's
+                        // free-space meter — the only determinate meter already in
+                        // the spec, and the right shape for "how far along is
+                        // this". A progress dialog with no progress indicator is
+                        // a dialog that interrupts the user to tell them a number.
+                        if let Some(fraction) = fraction {
+                            ui.add_space(space::S2);
+                            let (bar, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), dialog::PROGRESS_BAR_H),
+                                Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                bar,
+                                radius::all(radius::XS),
+                                theme.state.hover,
+                            );
+                            let fill = Rect::from_min_size(
+                                bar.min,
+                                vec2(bar.width() * fraction, bar.height()),
+                            );
+                            ui.painter().rect_filled(
+                                fill,
+                                radius::all(radius::XS),
+                                theme.accent.base,
+                            );
+                        }
+                        // --- `dialog.path-quote` ---
+                        if let Some(path) = quote {
+                            ui.add_space(space::S2);
+                            let quoted = format::middle_truncate(
+                                &path.to_string_lossy(),
+                                (ui.available_width() / 6.5) as usize,
+                            );
+                            let (qr, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), component::DIALOG_PATH_QUOTE_H),
+                                Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                qr,
+                                radius::all(component::DIALOG_PATH_QUOTE_RADIUS),
+                                theme.state.hover,
+                            );
+                            ui.painter().text(
+                                qr.left_center() + vec2(component::DIALOG_PATH_QUOTE_PAD_X, 0.0),
+                                Align2::LEFT_CENTER,
+                                quoted,
+                                tokens::font(ty::META, &theme),
+                                theme.text.secondary,
+                            );
+                        }
+                        // --- footer, right-aligned per `dialog.footer-align` ---
+                        ui.add_space(dialog::FOOTER_GAP);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            // `space::S1_5` between buttons rather than the
+                            // theme's 8px. §4.7 specifies no inter-button gap,
+                            // and the collision dialog is the one kind with five
+                            // buttons: at 10px between them they are 40px of
+                            // padding competing with the labels inside a 400px
+                            // box. Six is the chrome band and it is what the
+                            // row can afford.
+                            ui.spacing_mut().item_spacing.x = space::S1_5;
+                            // Laid right-to-left, so the *last* button in the
+                            // list ends up leftmost... which is wrong: §4.7
+                            // requires Cancel leftmost. So the list is walked in
+                            // reverse to undo the layout, keeping one source of
+                            // truth for the order.
+                            for b in buttons.iter().rev().copied() {
+                                if self.dialog_button(ui, b, b == focused_button, op) {
+                                    clicked = Some(b);
+                                }
+                            }
+                        });
                     });
                 });
             });
@@ -1758,7 +2049,9 @@ impl KestrelApp {
         let theme = self.theme;
         let font = tokens::font(ty::UI, &theme);
         let text_w = crate::widgets::text_width(ui, b.label(), font.clone());
-        let w = text_w + dialog::BTN_HEIGHT * 0.9;
+        // `dialog.btn-padding-x` on each side, from the token, not from a
+        // multiple of the height: 14 x 2 is 28, and `BTN_HEIGHT * 0.9` was 27.
+        let w = text_w + component::DIALOG_BTN_PADDING_X * 2.0;
         let (rect, response) = ui.allocate_exact_size(vec2(w, dialog::BTN_HEIGHT), Sense::click());
         let hovered = response.hovered();
         ui.painter().rect_filled(
@@ -1775,8 +2068,13 @@ impl KestrelApp {
             );
         }
         // §4.7 `dialog.btn-focus-ring` — 2px `focus.ring` at 2px offset. Drawn on
-        // the *focused* button, which on open is always Cancel.
-        if focused || b.is_default_for_enter(op) && focused {
+        // the *focused* button, which on open is always the safe one. The
+        // previous version wrote `focused || b.is_default_for_enter(op) && focused`,
+        // whose second arm is implied by its first: the ring follows the focus
+        // index and nothing else, and `Button::is_default_for_enter` documents
+        // *which* button that index is for each op.
+        let _ = op;
+        if focused {
             crate::widgets::rect_stroke(
                 ui.painter(),
                 rect.expand(2.0),
@@ -1859,27 +2157,98 @@ impl KestrelApp {
     }
 
     /// Shown when nothing is focused. Metadata-shaped, never blank.
+    ///
+    /// # Why this is centred and not offset
+    ///
+    /// The previous version did `ui.vertical_centered` and then
+    /// `add_space(available_height * 0.2)`, which produced two separate defects
+    /// that read as one sloppy placement:
+    ///
+    /// * `vertical_centered` *shrinks* its `Ui` to the content's width, so the
+    ///   block sat wherever the pane's own padding put it, not in the middle of
+    ///   the pane; and
+    /// * the glyph rect was built with `Rect::from_center_size(cursor + 24x, ...)`
+    ///   without ever **allocating** it, so the cursor did not move past the
+    ///   48px icon and the caption was laid out *inside* the icon's lower half.
+    ///
+    /// §4.2's empty state is "a real design moment": one 48px glyph at 40%, the
+    /// subject, one sentence, and nothing else. The three are allocated in one
+    /// column of exactly the pane's width, and that column is placed in the
+    /// middle of the pane's remaining height. The subject is `type.empty-state`
+    /// (`type.display`) in `text.primary` and the sentence is
+    /// `row.empty-body` in `text.secondary` — the same two roles the file list's
+    /// own empty state uses, so the two read as the same idea.
     fn preview_nothing(&mut self, ui: &mut Ui, theme: &Theme) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.2);
-            tokens::icon_glyph(
-                ui.painter(),
-                Rect::from_center_size(
-                    ui.cursor().left_top() + vec2(component::ROW_EMPTY_ICON_SIZE / 2.0, 0.0),
-                    vec2(
-                        component::ROW_EMPTY_ICON_SIZE,
-                        component::ROW_EMPTY_ICON_SIZE,
-                    ),
-                ),
-                icons::EYE,
-                component::icon_at(theme.icon.chrome, 0.4),
-            );
-            ui.label(
-                RichText::new("Nothing selected")
-                    .font(tokens::font(ty::CAPTION, theme))
-                    .color(theme.text.tertiary),
-            );
-        });
+        let icon = component::ROW_EMPTY_ICON_SIZE;
+        let title = "Nothing selected";
+        let body = "Choose a file to preview it. Space opens quick look.";
+        let title_font = tokens::font(component::ROW_EMPTY_TITLE, theme);
+        let body_font = tokens::font(component::ROW_EMPTY_BODY, theme);
+        let pane = ui.max_rect();
+        // The block's height is **measured**, not summed from font sizes.
+        //
+        // `type.empty-state` is 22px but its line box is 28, `type.dialog-body` is
+        // 13px in a 20px box, and the body wraps to two lines in a 280px pane. A
+        // sum of the sizes is short by 10px before the wrap is counted at all,
+        // which puts the block a visible few pixels low. `Painter::layout` is the
+        // same galley `ui.label` will lay out, so the number is exact and the
+        // galley cache makes it free after the first frame.
+        let title_h = ui
+            .painter()
+            .layout(
+                title.to_string(),
+                title_font.clone(),
+                theme.text.primary,
+                pane.width(),
+            )
+            .size()
+            .y;
+        let body_h = ui
+            .painter()
+            .layout(
+                body.to_string(),
+                body_font.clone(),
+                theme.text.secondary,
+                pane.width(),
+            )
+            .size()
+            .y;
+        let column_h = icon + space::S3 + title_h + space::S1 + body_h;
+        let top = ((pane.height() - column_h) / 2.0).max(0.0);
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                pos2(pane.left(), pane.top() + top),
+                vec2(pane.width(), column_h),
+            )),
+            |ui| {
+                // `vertical_centered` is egui's "horizontally centred column"; the
+                // vertical centring is the `top` above. Naming that here is the
+                // point: the earlier `add_space(available_height * 0.2)` was an
+                // invented fraction of a space that has nothing to do with the
+                // block's height.
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(icon, icon), Sense::hover());
+                    tokens::icon_glyph(
+                        ui.painter(),
+                        rect,
+                        icons::EYE,
+                        component::icon_at(theme.icon.chrome, component::ROW_EMPTY_ICON_ALPHA),
+                    );
+                    ui.add_space(space::S3);
+                    ui.label(
+                        RichText::new(title)
+                            .font(title_font)
+                            .color(theme.text.primary),
+                    );
+                    ui.add_space(space::S1);
+                    ui.label(
+                        RichText::new(body)
+                            .font(body_font)
+                            .color(theme.text.secondary),
+                    );
+                });
+            },
+        );
     }
 
     /// The pane's body: header, then whatever the kind allows.
@@ -1898,13 +2267,12 @@ impl KestrelApp {
 
         // --- header: icon, name, kind, size, modified. Always rendered. -----
         ui.horizontal(|ui| {
-            let ir = Rect::from_center_size(
-                ui.cursor().left_top()
-                    + vec2(
-                        component::ROW_ICON_SIZE / 2.0,
-                        component::ROW_ICON_SIZE / 2.0,
-                    ),
+            // Allocated, not painted at the cursor — see the same note in
+            // `modal_layer`. Painted, the 16px icon shared space with the first
+            // two characters of the filename.
+            let (ir, _) = ui.allocate_exact_size(
                 vec2(component::ROW_ICON_SIZE, component::ROW_ICON_SIZE),
+                Sense::hover(),
             );
             if let Some(g) = classified.glyph() {
                 tokens::icon_glyph(ui.painter(), ir, g, classified.icon_color(&theme.icon));
@@ -1912,13 +2280,17 @@ impl KestrelApp {
                 tokens::icon_placeholder(ui.painter(), ir, classified.icon_color(&theme.icon));
             }
             ui.add_space(component::ROW_ICON_GAP);
+            let name_font = tokens::font(ty::UI_STRONG, theme);
+            let budget = truncation_cols(
+                ui.painter(),
+                &name,
+                &name_font,
+                (available - component::ROW_ICON_SIZE - component::ROW_ICON_GAP).max(0.0),
+            );
             ui.label(
-                RichText::new(format::middle_truncate(
-                    &entry.name,
-                    (available / 7.0) as usize,
-                ))
-                .font(tokens::font(ty::UI_STRONG, theme))
-                .color(theme.text.primary),
+                RichText::new(format::middle_truncate(&name, budget))
+                    .font(name_font)
+                    .color(theme.text.primary),
             );
         });
         ui.add_space(space::S1);
@@ -1931,15 +2303,17 @@ impl KestrelApp {
         let modified = entry
             .modified
             .map_or_else(|| "-".to_string(), format::timestamp);
+        let meta = format!("{} · {} · {}", classified.category.label(), size, modified);
+        // `Label` wraps, but a timestamp has no break opportunity in it, so a
+        // narrow pane pushed the tail of the line under the window edge instead
+        // of ellipsing it. The budget is measured, so this is the same rule the
+        // name and the code lines use.
+        let meta_font = tokens::font(ty::META, theme);
+        let budget = truncation_cols(ui.painter(), &meta, &meta_font, available);
         ui.label(
-            RichText::new(format!(
-                "{} · {} · {}",
-                classified.category.label(),
-                size,
-                modified
-            ))
-            .font(tokens::font(ty::META, theme))
-            .color(theme.text.tertiary),
+            RichText::new(format::middle_truncate(&meta, budget))
+                .font(meta_font)
+                .color(theme.text.tertiary),
         );
         ui.add_space(space::S2);
         widgets::rule(
@@ -1954,7 +2328,7 @@ impl KestrelApp {
         // --- body, by kind. Never empty: every arm renders something. -------
         match kind {
             PvKind::Image => self.preview_image(ui, theme, &name),
-            PvKind::Text => self.preview_text(ui, theme),
+            PvKind::Text => self.preview_text(ui, theme, available),
             PvKind::TooLarge => {
                 let n = entry.size.unwrap_or(pv::MAX_PREVIEW_BYTES + 1);
                 ui.label(
@@ -1962,9 +2336,14 @@ impl KestrelApp {
                         .font(tokens::font(ty::UI, theme))
                         .color(theme.text.secondary),
                 );
+                // "stops at" rather than "reads at most": both numbers are
+                // rounded to one decimal, so a file 4 KiB over the cap formatted
+                // as "1.0 MB — the preview reads at most 1.0 MB", which reads as
+                // a contradiction. Naming the second number as the *threshold*
+                // keeps the sentence true at every size.
                 ui.label(
                     RichText::new(format!(
-                        "{} — the preview reads at most {}.",
+                        "{} — the preview stops at {}.",
                         format::bytes(n),
                         format::bytes(pv::MAX_PREVIEW_BYTES)
                     ))
@@ -2000,13 +2379,16 @@ impl KestrelApp {
     }
 
     /// An image, via egui's loaders.
+    ///
+    /// Centred in the pane's remaining space and outlined in `border.subtle`:
+    /// an image with a transparent background is otherwise invisible against
+    /// `surface.panel`, and "the preview pane is blank" is indistinguishable from
+    /// "the preview is broken" — which is the one thing §4.2's empty-state rule
+    /// exists to prevent.
     fn preview_image(&mut self, ui: &mut Ui, theme: &Theme, entry_name: &str) {
         let Some(PvLoaded::Image { bytes }) = self.preview_content.clone() else {
             return self.preview_waiting(ui, theme);
         };
-        // `load_image_from_bytes` is egui_extras'; the GUI does not decode a
-        // container format itself. A URI is not needed and would require the path
-        // to survive a round trip through a string.
         // `load_image_bytes` is `egui_extras`' own decoder, driven by the loaders
         // `install_image_loaders` registered. The GUI does not sniff a container
         // or decode a format itself: a second implementation here would be a
@@ -2027,9 +2409,30 @@ impl KestrelApp {
                     egui::TextureOptions::LINEAR,
                 );
                 let available = ui.available_size();
-                ui.add(
-                    egui::Image::new(egui::load::SizedTexture::new(&handle, natural))
-                        .fit_to_exact_size(fit(natural, available)),
+                let drawn = fit(natural, available);
+                // Reserve the whole remaining space and centre the image in it,
+                // both ways. `Align::Center` on a top-down layout only centres the
+                // cross axis (x), so the vertical centring has to be arithmetic —
+                // and an image hard against the header rule with 600px of blank
+                // pane under it reads as a failed preview rather than a small one.
+                let top = ((available.y - drawn.y) / 2.0).max(0.0);
+                let left = ((available.x - drawn.x) / 2.0).max(0.0);
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(ui.cursor().left_top(), available))
+                        .layout(Layout::top_down(Align::Min)),
+                    |ui| {
+                        let (rect, _) = ui.allocate_exact_size(drawn, Sense::hover());
+                        let rect = rect.translate(vec2(left, top));
+                        egui::Image::new(egui::load::SizedTexture::new(&handle, drawn))
+                            .paint_at(ui, rect);
+                        widgets::rect_stroke(
+                            ui.painter(),
+                            rect,
+                            radius::all(radius::NONE),
+                            Stroke::new(border::HAIRLINE, theme.borders.subtle),
+                        );
+                    },
                 );
             }
             Err(_) => {
@@ -2047,7 +2450,11 @@ impl KestrelApp {
     /// The same rule as the file list: a 1 MiB file is 60,000 lines, and building
     /// 60,000 rows per frame would drop frames. So `show_rows`, and only the
     /// visible slice is laid out.
-    fn preview_text(&mut self, ui: &mut Ui, theme: &Theme) {
+    ///
+    /// `width` is the pane's own content width, measured by the caller **before**
+    /// the `ScrollArea` — for the same reason the file list does not read it
+    /// inside one.
+    fn preview_text(&mut self, ui: &mut Ui, theme: &Theme, width: f32) {
         let Some(PvLoaded::Text { lines, truncated }) = self.preview_content.clone() else {
             return self.preview_waiting(ui, theme);
         };
@@ -2069,7 +2476,6 @@ impl KestrelApp {
         let line_h = dialog::preview_metrics::LINE_H;
         let total = lines.len();
         let gutter = dialog::preview_metrics::GUTTER_W;
-        let width = ui.available_width();
         let font = tokens::font(ty::META, theme);
         let palette = pv::palette(theme);
         ScrollArea::vertical()
@@ -2135,13 +2541,12 @@ impl KestrelApp {
         let baseline = egui::pos2(x, y + line_h / 2.0);
         // Measure the whole line first, so a long line can be middle-truncated
         // (§2.8: all list text is single-line, centred, middle-truncated) rather
-        // than being drawn off the pane's edge.
-        let full_w = painter
-            .layout_no_wrap(line.text.clone(), font.clone(), theme.text.primary)
-            .size()
-            .x;
-        if full_w > max_w {
-            let cols = (max_w / 6.5).max(4.0) as usize;
+        // than being drawn off the pane's edge. The budget is measured in the
+        // code face, not in the sans average — see [`truncation_cols`], which
+        // exists because this line used to overflow the pane by exactly the
+        // difference between the two advances.
+        let cols = truncation_cols(painter, &line.text, &font, max_w);
+        if cols < line.text.chars().count() {
             painter.text(
                 baseline,
                 Align2::LEFT_CENTER,
@@ -2508,23 +2913,43 @@ impl KestrelApp {
             .show(ui, |ui| {
                 // §4.3: overflow collapses from the left and the last two
                 // segments always stay visible, because the user's actual
-                // question is always "where am I" and "what's in here". The
-                // leading overflow button itself is Phase 4.
+                // question is always "where am I" and "what's in here".
                 let (visible, first) = trailing_segments(&segments, ui.available_width());
+                // The band's own vertical centre, read **once**.
+                //
+                // This is the whole fix for the clipped separator. The previous
+                // version positioned the overflow button and the `caret-right`
+                // separators at `ui.cursor().max.y`, which in a
+                // `horizontal_centered` layout is the *bottom of the band*, not
+                // the middle of the text: egui stretches the first item's frame
+                // to the full available height (`Layout::next_frame_ignore_wrap`
+                // maximises the cross axis when `vertical_align == Center`), so
+                // the cursor's `max.y` is the panel's lower edge from the very
+                // first segment onward. A 20px-tall hit rect centred there hangs
+                // half outside the 28px band, and the last four rows of every
+                // separator are clipped by `breadcrumb.bottom-border` — which is
+                // what made `/ home achraf` read as cut off. The segments were
+                // never clipped; the separators were.
+                let center_y = ui.max_rect().center().y;
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = component::BREADCRUMB_SEGMENT_GAP;
                     let last = visible.len().saturating_sub(1);
                     if first > 0 {
                         // `breadcrumb.overflow` — a leading `dots-three` button
-                        // standing in for the collapsed ancestors.
+                        // standing in for the collapsed ancestors. Painted, not
+                        // interactive: §4.3 says it "opens a menu of collapsed
+                        // ancestors", and a button that does nothing when clicked
+                        // is exactly the hidden affordance §7.14 forbids. The menu
+                        // is the remaining breadcrumb TODO.
                         let c = component::icon_at(
                             theme.icon.chrome,
                             component::BREADCRUMB_SEPARATOR_ALPHA,
                         );
                         let r = Rect::from_center_size(
                             pos2(
-                                ui.available_rect_before_wrap().left() + 10.0,
-                                ui.cursor().max.y,
+                                ui.available_rect_before_wrap().left()
+                                    + component::BREADCRUMB_OVERFLOW_SIZE / 2.0,
+                                center_y,
                             ),
                             vec2(
                                 component::BREADCRUMB_OVERFLOW_SIZE,
@@ -2539,25 +2964,36 @@ impl KestrelApp {
                     }
                     for (i, seg) in visible.iter().enumerate() {
                         if i > 0 {
-                            // `breadcrumb.separator` — 12px `caret-right`,
-                            // `icon.chrome` at 55%.
+                            // `breadcrumb.separator-clickable` — a 16 x 20 hit
+                            // area, which is a *hit area* and so is allocated
+                            // rather than painted at an arbitrary offset. Its
+                            // 12px `caret-right` sits inside it, centred.
                             let c = component::icon_at(
                                 theme.icon.chrome,
                                 component::BREADCRUMB_SEPARATOR_ALPHA,
                             );
-                            let r = Rect::from_center_size(
-                                pos2(
-                                    ui.available_rect_before_wrap().left()
-                                        + component::BREADCRUMB_SEPARATOR_SIZE / 2.0,
-                                    ui.cursor().max.y,
-                                ),
+                            let (hit, hit_response) = ui.allocate_exact_size(
                                 vec2(
-                                    component::BREADCRUMB_SEPARATOR_SIZE,
+                                    component::BREADCRUMB_SEPARATOR_HIT_W,
                                     component::BREADCRUMB_SEPARATOR_HIT_H,
                                 ),
+                                Sense::click(),
                             );
-                            tokens::icon_glyph(ui.painter(), r, icons::CARET_RIGHT, c);
-                            ui.allocate_space(vec2(component::BREADCRUMB_SEPARATOR_HIT_W, 0.0));
+                            tokens::icon_glyph(
+                                ui.painter(),
+                                Rect::from_center_size(hit.center(), vec2(12.0, 12.0)),
+                                icons::CARET_RIGHT,
+                                c,
+                            );
+                            // Clicking a separator goes to the segment on its
+                            // left: the directory the caret is pointing away
+                            // from. `visible[i]` is the segment that follows.
+                            if hit_response.clicked() {
+                                if let Some(target) = visible.get(i - 1) {
+                                    let path = target.path.clone();
+                                    self.open_dir(path);
+                                }
+                            }
                         }
                         let is_current = i == last;
                         // The final segment is the current directory, rendered
@@ -2591,12 +3027,15 @@ impl KestrelApp {
     }
 
     /// §4.2 `row.col-header`: clickable, with a sort glyph on the active column.
-    fn column_headers(&mut self, ui: &mut Ui) {
+    ///
+    /// `list_width` is the panel's own width, threaded in by
+    /// [`KestrelApp::panels`] so the header and the rows resolve their columns
+    /// from the same number.
+    fn column_headers(&mut self, ui: &mut Ui, list_width: f32) {
         let theme = self.theme;
-        let set = columns::columns_for(ui.available_width(), self.show_kind_column);
+        let set = columns::columns_for(list_width, self.show_kind_column);
         let height = component::ROW_COL_HEADER_HEIGHT;
-        let width = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(vec2(list_width, height), Sense::hover());
         // A header is a layout sibling with a 1px border, never an overlay
         // (§2.12): a sticky header that floats over the list would be exactly
         // the thing that hides a focused row at the top of the viewport.
@@ -2638,10 +3077,13 @@ impl KestrelApp {
             let align_right = matches!(key, SortKey::Size | SortKey::Modified);
             let font = tokens::font(ty::LABEL, &theme);
             let label_w = widgets::text_width(ui, label, font.clone());
+            // `row.padding-x`, on both edges — a right-aligned machine column
+            // used to be inset 4px, which is half the token and put the timestamp
+            // 4px from the preview pane's divider.
             let label_left = if align_right {
-                cell.right() - space::S1 - label_w
+                cell.right() - component::ROW_PADDING_X - label_w
             } else {
-                cell.left() + space::S1
+                cell.left() + component::ROW_PADDING_X
             };
             // The alignment is already baked into `label_left`, so both
             // columns draw left-to-right from a pre-computed x. A right-aligned
@@ -2679,9 +3121,9 @@ impl KestrelApp {
             };
             let gsize = 12.0_f32;
             let gx = if align_right {
-                label_left - space::S1 - gsize / 2.0
+                label_left - component::ROW_PADDING_X - gsize / 2.0
             } else {
-                label_left + label_w + space::S1 + gsize / 2.0
+                label_left + label_w + component::ROW_PADDING_X + gsize / 2.0
             };
             let grect = Rect::from_center_size(egui::pos2(gx, cell.center().y), vec2(gsize, gsize));
             let gc = component::icon_at(
@@ -2823,7 +3265,13 @@ impl KestrelApp {
     }
 
     /// §4.2 File list. **Virtualized**: only the visible row range is built.
-    fn file_list(&mut self, ui: &mut Ui) {
+    ///
+    /// `list_width` is the panel's own width, threaded in by
+    /// [`KestrelApp::panels`]. It is used for the column set *and* for every row
+    /// rect, and it is deliberately **not** re-read from the `Ui` inside the
+    /// `ScrollArea` closure: see the note in `panels` for why that read is a
+    /// trap.
+    fn file_list(&mut self, ui: &mut Ui, list_width: f32) {
         let theme = self.theme;
         let visible = self.visible_rows();
         let total = visible.len();
@@ -2832,7 +3280,7 @@ impl KestrelApp {
             return;
         }
 
-        let set = columns::columns_for(ui.available_width(), self.show_kind_column);
+        let set = columns::columns_for(list_width, self.show_kind_column);
         // `ScrollArea::show_rows` builds only `range` of `total_rows` widgets, so
         // a 50,000-item directory costs what a 50-item one does. Mapping the
         // whole `Vec` into a widget per row would build 50,000 closures per frame
@@ -2852,7 +3300,7 @@ impl KestrelApp {
                 // (the 2px half-step) must be zeroed here or rows come out at
                 // 28px instead of the specified 26px.
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let width = ui.available_width();
+                let width = list_width;
                 for at in range {
                     let Some(&index) = visible.get(at) else {
                         continue;
@@ -3062,6 +3510,7 @@ impl KestrelApp {
             tokens::icon_placeholder(painter, layout.icon, icon_color);
         }
 
+        let name_font = tokens::font(state.name_token(), theme);
         // `text.tertiary` on a hidden file's name (§4.2 `hidden file` row), and
         // `text.disabled` only in the `disabled` state — which is exactly the
         // §6.2 structural rule, since `RowState::Disabled` has no bar and so can
@@ -3072,13 +3521,17 @@ impl KestrelApp {
             (false, component::DisabledText::Normal) => theme.text.primary,
         };
         // §2.8: all list text is single-line, vertically centred, never wrapped,
-        // middle-truncated.
-        let name = format::middle_truncate(&entry.name, layout.name_text_cols());
+        // middle-truncated. The character budget is *measured*, not estimated —
+        // see [`truncation_cols`].
+        let name = format::middle_truncate(
+            &entry.name,
+            truncation_cols(painter, &entry.name, &name_font, layout.name_text_width()),
+        );
         painter.text(
             pos2(layout.name_text_x, rect.center().y),
             Align2::LEFT_CENTER,
             &name,
-            tokens::font(state.name_token(), theme),
+            name_font,
             name_color,
         );
 
@@ -3089,7 +3542,7 @@ impl KestrelApp {
                 .modified
                 .map_or_else(|| "-".to_string(), format::timestamp);
             painter.text(
-                pos2(cell.right() - space::S1, rect.center().y),
+                pos2(cell.right() - component::ROW_PADDING_X, rect.center().y),
                 Align2::RIGHT_CENTER,
                 &text,
                 tokens::font(ty::META, theme),
@@ -3101,7 +3554,7 @@ impl KestrelApp {
         // when the listing is genuinely mixed; see `columns::listing_is_mixed`.
         if let Some(cell) = layout.kind {
             painter.text(
-                pos2(cell.left() + space::S1, rect.center().y),
+                pos2(cell.left() + component::ROW_PADDING_X, rect.center().y),
                 Align2::LEFT_CENTER,
                 classified.category.label(),
                 tokens::font(ty::CAPTION, theme),
@@ -3123,7 +3576,7 @@ impl KestrelApp {
                 (_, None) => "-".to_string(),
             };
             painter.text(
-                pos2(cell.right() - space::S1, rect.center().y),
+                pos2(cell.right() - component::ROW_PADDING_X, rect.center().y),
                 Align2::RIGHT_CENTER,
                 &text,
                 tokens::font(ty::META, theme),
@@ -3352,6 +3805,49 @@ fn trailing_segments(segments: &[Segment], available: f32) -> (Vec<&Segment>, us
         used += width_of(&segments[first].label);
     }
     (segments[first..].iter().collect(), first)
+}
+
+/// The middle-truncation budget for `text` in `max_w` — how many characters of
+/// it can be shown before the ellipsis.
+///
+/// # Measured, not estimated
+///
+/// §2.8 requires list text to be "middle-truncated with ellipsis at 60% width if
+/// needed", which means the budget has to be *right*: too many and the text runs
+/// into the next column, too few and a short name gets needlessly elided. A
+/// constant like "6.5px per character at 13px" is only right for one face at one
+/// size — the file list's names are Plex **Sans** at 13px, where it is roughly
+/// correct, and the preview's code lines are Plex **Mono** at 12px, where the
+/// advance is a fixed 7.2px. Using the sans average for the mono face
+/// under-measures by about 11%, so a long code line was truncated to a
+/// "fitting" budget and then overflowed the pane anyway.
+///
+/// So the width is measured with the font that will draw it, and the
+/// per-character average is taken from *this* string rather than from a sample:
+/// a name of narrow characters (`iii`) then keeps more of itself than one of wide
+/// ones (`WWW`), which is what the eye expects of a truncation point.
+///
+/// One `layout_no_wrap` when the text fits, two when it does not. The galley
+/// cache is keyed on the job, so the first is free after the first frame.
+fn truncation_cols(painter: &egui::Painter, text: &str, font: &egui::FontId, max_w: f32) -> usize {
+    let chars = text.chars().count();
+    if chars == 0 {
+        return 0;
+    }
+    let full = painter
+        .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+        .size()
+        .x;
+    if full <= max_w {
+        return chars;
+    }
+    // `chars >= 1` here, so the division is safe; `floor`, because a budget that
+    // rounds up is a budget that overflows.
+    let per_char = full / chars as f32;
+    let cols = (max_w / per_char).floor();
+    // Four is the smallest budget `format::middle_truncate` can work with and
+    // still keep something at each end.
+    (cols as usize).clamp(4, chars)
 }
 
 /// A 1-px all-round `egui::Margin` from a spacing token.

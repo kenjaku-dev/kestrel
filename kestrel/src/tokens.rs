@@ -1718,6 +1718,18 @@ pub mod component {
     /// Not a spec value — a layout convenience so the gallery can allocate one
     /// rectangle instead of nesting five `allocate_ui` calls.
     pub const DIALOG_BLOCK_HEIGHT: f32 = 340.0;
+    /// `dialog.path-quote` height — the spec gives padding (6/8px) around
+    /// `type.meta`, whose line box is 16px, so 16 + 6 + 6 = 28.
+    pub const DIALOG_PATH_QUOTE_H: f32 = 28.0;
+    /// The determinate progress bar on a `Progress` dialog.
+    ///
+    /// §4.7 has no token for a progress bar, so this is derived from §4.5's
+    /// free-space meter — the only determinate meter in the spec — at its
+    /// `metric`-level height rather than the meter's 4px, which is sized for a
+    /// status-bar strip and would be a hairline in a dialog. Named here so the
+    /// derivation is one line to review and one line to overrule when §4.7 grows
+    /// a progress row of its own.
+    pub const DIALOG_PROGRESS_BAR_H: f32 = 6.0;
     /// `dialog.btn-destructive-bg` — `status.danger-solid`.
     ///
     /// A function rather than a constant because it is a *semantic role* looked
@@ -2198,6 +2210,24 @@ pub mod fonts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn probe_glyphs() {
+        let ctx = crate::shot::ctx_with_fonts();
+        let id = crate::tokens::font_icon(16.0, false);
+        let galley = ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                crate::icons::FOLDER.char().to_string(),
+                id.clone(),
+                Color32::WHITE,
+            )
+        });
+        eprintln!("PROBE galley size {:?}", galley.size());
+        for r in galley.rows.iter() {
+            for g in r.glyphs.iter() {
+                eprintln!("PROBE glyph chr={:?} uv_rect={:?}", g.chr, g.uv_rect);
+            }
+        }
+    }
 
     /// Every registered family must be able to produce epaint's
     /// replacement glyph, or the app logs a warning on every launch and renders
