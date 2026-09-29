@@ -129,8 +129,8 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         group: Group::Selection,
         action: "Move focus",
-        keys: "↑ ↓",
-        also: "PgUp PgDn",
+        keys: "Up / Down",
+        also: "Page Up/Down",
     },
     Binding {
         group: Group::Selection,
@@ -141,8 +141,8 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         group: Group::Selection,
         action: "Extend selection",
-        keys: "Shift+↑ ↓",
-        also: "Shift+Home End",
+        keys: "Shift+Up / Shift+Down",
+        also: "Shift+Home/End",
     },
     Binding {
         group: Group::Selection,
@@ -275,7 +275,7 @@ pub const BINDINGS: &[Binding] = &[
 /// a panel rather than a banner. §4.6's `menu.max-width` is the closest thing
 /// the spec has to an overlay that is not a dialog, and this is the same shape:
 /// a `surface.raised` sheet of rows.
-const WIDTH: f32 = 520.0;
+const WIDTH: f32 = 560.0;
 
 /// The overlay's height as a fraction of the window.
 ///
@@ -293,11 +293,20 @@ const GROUP_GAP: f32 = space::S1;
 /// The gap above a group heading.
 const SECTION_GAP: f32 = space::S4;
 
-/// The right edge of the primary key column, from the overlay's left edge.
-const KEYS_X: f32 = 330.0;
+/// The two key columns, measured **from the right edge** of the content.
+///
+/// From the right, not from the left, because the widths are not known until the
+/// fonts have measured them and `double-click` is 45px wider than `Enter`. A
+/// fixed `ALSO_X = 440` put the widest secondary key 50px outside a 520px sheet,
+/// on top of the browser behind it.
+const ALSO_COL_W: f32 = 150.0;
 
-/// The right edge of the secondary key column.
-const ALSO_X: f32 = 440.0;
+/// The narrowest the two key columns together are allowed to get, below which
+/// the action name is elided rather than the keys.
+///
+/// 220px is `Ctrl+Shift+N` and `double-click` side by side plus a gap; below
+/// it something has to give, and it must not be the binding.
+const KEY_COL_MIN: f32 = 220.0;
 
 /// §4.11 bindings this build deliberately does not implement, with the reason.
 ///
@@ -326,12 +335,18 @@ pub fn draw(ui: &mut Ui, theme: &Theme) -> bool {
         .frame(egui::Frame::NONE)
         .backdrop_color(theme.surfaces.scrim)
         .show(ui.ctx(), |ui| {
-            let ceiling = ui.max_rect().size();
+            // The **content rect**, not `ui.max_rect()`. Inside a `Modal` the
+            // closure's `Ui` is sized to the modal area, which egui derives
+            // from its own content — so asking it how much room there is
+            // answers with "however much the thing I am about to draw wants",
+            // and the first version of this came out 178px tall with three
+            // rows visible and no scrollbar. The window is the honest ceiling.
+            let area = ui.ctx().content_rect();
             let size = vec2(
-                WIDTH.min(ceiling.x - space::S6),
-                (ceiling.y * HEIGHT_FRACTION).min(ceiling.y - space::S6),
+                WIDTH.min(area.width() - space::S6),
+                (area.height() * HEIGHT_FRACTION).min(area.height() - space::S6),
             );
-            let rect = egui::Rect::from_center_size(ui.max_rect().center(), size);
+            let rect = egui::Rect::from_center_size(area.center(), size);
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 let frame = egui::Frame::new()
                     .fill(theme.surfaces.raised)
@@ -341,7 +356,15 @@ pub fn draw(ui: &mut Ui, theme: &Theme) -> bool {
                 frame.show(ui, |ui| {
                     heading(ui, theme);
                     ui.add_space(space::S2);
-                    body(ui, theme, &mut close);
+                    // The list takes what it needs and scrolls; the footer sits
+                    // outside the `ScrollArea` so it is always visible, and it
+                    // is the only thing on screen that says the list continues.
+                    // A last row clipped flush against the sheet's bottom edge
+                    // is indistinguishable from a complete list.
+                    let want = ui.available_height() - FOOTER_H - space::S2;
+                    body(ui, theme, want, &mut close);
+                    ui.add_space(space::S2);
+                    footer(ui, theme);
                 });
             });
         });
@@ -351,12 +374,11 @@ pub fn draw(ui: &mut Ui, theme: &Theme) -> bool {
 /// The sheet's title line: what this is, and how to get out of it.
 fn heading(ui: &mut Ui, theme: &Theme) {
     ui.horizontal(|ui| {
-        tokens::icon_glyph(
-            ui.painter(),
-            Rect::from_center_size(ui.cursor().left_top() + vec2(9.0, 9.0), vec2(18.0, 18.0)),
-            icons::KEYBOARD,
-            theme.icon.chrome,
-        );
+        // **Allocated**, not painted at an offset from the cursor. The first
+        // version painted the glyph and never moved the cursor, so the title
+        // started at x=0 and the two overlapped for the first 18 pixels.
+        let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), egui::Sense::hover());
+        tokens::icon_glyph(ui.painter(), rect, icons::KEYBOARD, theme.icon.chrome);
         ui.add_space(space::S2);
         ui.label(
             RichText::new("Keyboard shortcuts")
@@ -392,13 +414,32 @@ fn close_id() -> egui::Id {
     egui::Id::new("kestrel-help-close")
 }
 
-/// The scrolling list of bindings.
-fn body(ui: &mut Ui, theme: &Theme, close: &mut bool) {
+/// The footer's height — one `type.caption` line.
+const FOOTER_H: f32 = 15.0;
+
+/// The line below the list: what the sheet does *not* bind, and how to close it.
+fn footer(ui: &mut Ui, theme: &Theme) {
+    let font = tokens::font(ty::CAPTION, theme);
+    ui.painter().text(
+        ui.cursor().left_top(),
+        Align2::LEFT_TOP,
+        format!(
+            "Not bound: {} \u{2014} this build has one pane that takes the keyboard.   Escape closes.",
+            UNBOUND[0].keys
+        ),
+        font,
+        theme.text.tertiary,
+    );
+}
+
+/// The scrolling list of bindings, at most `max_h` tall.
+fn body(ui: &mut Ui, theme: &Theme, max_h: f32, close: &mut bool) {
     let width = ui.available_width();
     ui.set_max_width(width);
     ScrollArea::vertical()
         .id_salt("help")
         .auto_shrink([false, false])
+        .max_height(max_h.max(ROW_H * 3.0))
         .show(ui, |ui| {
             ui.set_max_width(width);
             let mut group: Option<Group> = None;
@@ -420,49 +461,54 @@ fn body(ui: &mut Ui, theme: &Theme, close: &mut bool) {
                 // can reach and not leave.
                 let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
                 let font = tokens::font(ty::UI, theme);
-                ui.painter().text(
-                    pos2(rect.left(), rect.center().y),
-                    Align2::LEFT_CENTER,
-                    b.action,
-                    font,
-                    theme.text.primary,
-                );
+                // The action name is elided, never the keys: a binding the user
+                // cannot read is worse than an action name they can guess from
+                // the key beside it.
+                let name_cols = ((KEY_COL_MIN - space::S2) / 6.5).floor() as usize;
+                ui.painter()
+                    .with_clip_rect(Rect::from_min_max(
+                        pos2(rect.left(), rect.top()),
+                        pos2(rect.left() + KEY_COL_MIN - space::S2, rect.bottom()),
+                    ))
+                    .text(
+                        pos2(rect.left(), rect.center().y),
+                        Align2::LEFT_CENTER,
+                        crate::format::end_truncate(b.action, name_cols.max(4)),
+                        font,
+                        theme.text.primary,
+                    );
                 let keys = tokens::font(ty::META, theme);
-                for (x, text) in [(KEYS_X, b.keys), (ALSO_X, b.also)] {
+                // Two columns, both right-aligned, in this order **from the
+                // right edge**: the alternate, then the primary.
+                //
+                // Right-aligned rather than left-aligned, so `Enter` and
+                // `Ctrl+Shift+N` end at the same x and the eye scans the *ends*
+                // of the bindings — which is the part that differs — rather than
+                // their starts. And each column is anchored to the *left* of the
+                // one beside it, not to its own left edge: an earlier version
+                // had `keys` ending 20px after `also` began, so `double-click`
+                // and `Enter` were painted on top of each other.
+                for (right, text, color) in [
+                    (rect.right(), b.also, theme.text.tertiary),
+                    (rect.right() - ALSO_COL_W, b.keys, theme.text.secondary),
+                ] {
                     if text.is_empty() {
                         continue;
                     }
-                    ui.painter().text(
-                        pos2(rect.left() + x, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        text,
-                        keys.clone(),
-                        // A secondary binding is `text.tertiary`, not
-                        // `text.secondary`: it is the alternative, and the
-                        // primary is the one to reach for.
-                        if text == b.keys {
-                            theme.text.secondary
-                        } else {
-                            theme.text.tertiary
-                        },
-                    );
+                    ui.painter()
+                        .with_clip_rect(Rect::from_min_max(
+                            pos2(rect.left() + KEY_COL_MIN, rect.top()),
+                            pos2(rect.right(), rect.bottom()),
+                        ))
+                        .text(
+                            pos2(right, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            text,
+                            keys.clone(),
+                            color,
+                        );
                 }
             }
-            ui.add_space(space::S3);
-            // The honest note. §4.11 binds `Tab` to "cycle panes" and this build
-            // has one pane that takes the keyboard, so the binding is absent
-            // rather than present-and-inert. A reference that quietly omits a
-            // spec binding is a reference you cannot trust; one that names the
-            // gap is a reference you can check.
-            ui.label(
-                RichText::new(format!(
-                    "Not bound: {} — this build has one pane that takes the keyboard.",
-                    UNBOUND[0].keys
-                ))
-                .font(tokens::font(ty::CAPTION, theme))
-                .color(theme.text.tertiary),
-            );
-            ui.add_space(space::S2);
         });
     *close |= ui
         .ctx()

@@ -122,6 +122,32 @@ pub fn middle_truncate(text: &str, max_cols: usize) -> String {
     format!("{head}\u{2026}{tail}")
 }
 
+/// End-truncates `text` to at most `max_cols` columns, with a trailing ellipsis.
+///
+/// # When this and [`middle_truncate`] are the right answer
+///
+/// [`middle_truncate`] exists because §2.8 says list text is
+/// middle-truncated, and the reason that is right for a *path* or a *file name*
+/// is that the identifying part is neither end. It is the wrong answer for
+/// prose: a sentence's payload is its ending, and
+/// `"System follows the \u{2026}r dark preference."` reads as a corrupted string
+/// rather than as an elision. This is the variant for anything read
+/// left-to-right as a sentence.
+///
+/// Char-boundary safe, for the same reason and by the same `chars` walk.
+#[must_use]
+pub fn end_truncate(text: &str, max_cols: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_cols {
+        return text.to_string();
+    }
+    if max_cols <= 1 {
+        return "\u{2026}".to_string();
+    }
+    let head: String = chars[..max_cols - 1].iter().collect();
+    format!("{head}\u{2026}")
+}
+
 /// Pluralises `count` against `singular`/`plural`.
 ///
 /// A status bar that says "1 items" is a bug, and this app has enough places to

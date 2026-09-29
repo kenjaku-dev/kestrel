@@ -1809,16 +1809,34 @@ pub mod component {
     /// The settings header band's height, matching `metric.toolbar`.
     pub const SETTINGS_HEADER_H: f32 = metric::TOOLBAR;
     /// The settings body's reading measure, and the horizontal row padding.
-    pub const SETTINGS_BODY_MAX_W: f32 = 560.0;
+    ///
+    /// 700px, not the 560 a reading-comfort heuristic would suggest: a
+    /// side-by-side row has to fit a 44-character help line *and* a
+    /// four-option segmented control, and at 560 the help line was elided on
+    /// every screen wider than 800px. The measure is the sum of what the two
+    /// columns need.
+    pub const SETTINGS_BODY_MAX_W: f32 = 700.0;
     pub const SETTINGS_ROW_PAD_X: f32 = space::S5;
+    /// A segmented control's glyph, and its horizontal padding either side.
+    ///
+    /// 16px rather than 14: `metric.icon`, the list-icon size and the smallest
+    /// size at which a `sun` or a `clock` is still a shape rather than a smudge.
+    /// 14px is `metric.icon-compact`, which §2.9 scopes to *compact density,
+    /// Regular weight only* — not to a control on a settings screen.
+    pub const SEGMENT_ICON: f32 = metric::ICON;
     /// The label column's cap when there is room for a side-by-side row.
-    pub const SETTINGS_LABEL_MAX_W: f32 = 190.0;
+    ///
+    /// 320px: the longest help sentence on the screen is 40 characters, and at
+    /// `type.caption` that is about 250px. At the 190px this was first given,
+    /// every one of them elided — and an elided help line is a help line the
+    /// user cannot read.
+    pub const SETTINGS_LABEL_MAX_W: f32 = 320.0;
     /// The label column's share of a side-by-side row.
     pub const SETTINGS_LABEL_SHARE: f32 = 0.46;
     /// The width below which a row stacks label-above-control.
     ///
-    /// Derived from the two things that have to fit: a 190px label column and
-    /// the widest control, which is the four-option segmented control.
+    /// Derived from the two things that have to fit: the label column and the
+    /// widest control, which is the four-option segmented control.
     pub const SETTINGS_STACK_BELOW_W: f32 = 400.0;
     /// The `−`/`+` stepper's button, `metric.target-min`.
     pub const SETTINGS_STEPPER_BTN: f32 = metric::TARGET_MIN;

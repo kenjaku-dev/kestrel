@@ -9,7 +9,7 @@
 use egui::{Align2, Color32, FontId, Rangef, Rect, RichText, Sense, Stroke, Ui, vec2};
 
 use crate::motion::Motion;
-use crate::tokens::{self, Theme, border, component, metric, radius, space, ty};
+use crate::tokens::{self, Theme, border, component, metric, radius, space, ty, with_alpha};
 
 /// Measures a string's rendered width.
 ///
@@ -218,27 +218,33 @@ pub fn status_error(ui: &mut Ui, theme: &Theme, text: &str) {
 /// `label` is the whole sentence — this is not a tooltip, and the status bar is
 /// the last place that has room for a sentence without eating the list.
 pub fn status_notice(ui: &mut Ui, theme: &Theme, label: &str, button: &str, tip: &str) -> bool {
+    const ICON: f32 = 14.0;
+    const BTN_H: f32 = 16.0;
+    let label_font = tokens::font(component::STATUSBAR_LABEL, theme);
+    let button_font = tokens::font(ty::META_STRONG, theme);
+    // The width is the sum of its parts, each measured with the font that will
+    // draw it. Two things went wrong before it was: guessing, and — the one that
+    // actually shipped — building the button rect with `from_min_size` at
+    // `chip.right() - padding`, which sets a *left* edge and so put the button
+    // one text-width outside the chip, on top of the path beside it.
+    let label_w = text_width(ui, label, label_font.clone());
+    let button_w = text_width(ui, button, button_font.clone()) + space::S3;
+    let pad = space::S2;
     let (chip, response) = ui.allocate_exact_size(
         vec2(
-            crate::widgets::text_width(ui, button, tokens::font(ty::META_STRONG, theme))
-                + space::S3
-                + space::S2
-                + 14.0
-                + space::S2
-                + crate::widgets::text_width(
-                    ui,
-                    label,
-                    tokens::font(component::STATUSBAR_LABEL, theme),
-                ),
+            pad + ICON + pad + label_w + pad + button_w + pad,
             component::STATUSBAR_HEIGHT - border::HAIRLINE * 2.0 - 6.0,
         ),
         Sense::hover(),
     );
     let painter = ui.painter();
+    // `status.warning-bg` at rest, not a transparent chip. A chip that only
+    // appears on hover is §7.14's hidden affordance in a status-bar costume:
+    // the fact has to be on screen when the pointer is somewhere else.
     let bg = if response.hovered() {
         theme.status.warning_bg
     } else {
-        theme.surfaces.panel
+        with_alpha(theme.status.warning_bg, 0.5)
     };
     painter.rect_filled(chip, radius::all(radius::SM), bg);
     rect_stroke(
@@ -247,31 +253,26 @@ pub fn status_notice(ui: &mut Ui, theme: &Theme, label: &str, button: &str, tip:
         radius::all(radius::SM),
         Stroke::new(border::HAIRLINE, theme.status.warning_border),
     );
-    let icon = Rect::from_center_size(
-        chip.left_center() + vec2(space::S2 + 7.0, 0.0),
-        vec2(14.0, 14.0),
-    );
-    crate::tokens::icon_glyph(
+    // §3.6: a status colour is never without a glyph.
+    tokens::icon_glyph(
         painter,
-        icon,
+        Rect::from_center_size(
+            chip.left_center() + vec2(pad + ICON / 2.0, 0.0),
+            vec2(ICON, ICON),
+        ),
         crate::icons::WARNING_CIRCLE,
         theme.status.warning_text,
     );
-    let text_x = icon.right() + space::S2;
     painter.text(
-        egui::pos2(text_x, chip.center().y),
+        egui::pos2(chip.left() + pad + ICON + pad, chip.center().y),
         Align2::LEFT_CENTER,
         label,
-        tokens::font(component::STATUSBAR_LABEL, theme),
+        label_font,
         theme.text.secondary,
     );
     let button_rect = Rect::from_min_size(
-        egui::pos2(chip.right() - space::S2, chip.center().y - 8.0),
-        vec2(
-            crate::widgets::text_width(ui, button, tokens::font(ty::META_STRONG, theme))
-                + space::S2,
-            16.0,
-        ),
+        egui::pos2(chip.right() - pad - button_w, chip.center().y - BTN_H / 2.0),
+        vec2(button_w, BTN_H),
     );
     let button_id = ui.make_persistent_id("status-notice-button");
     let button_response = ui.interact(button_rect, button_id, Sense::click());
@@ -282,15 +283,11 @@ pub fn status_notice(ui: &mut Ui, theme: &Theme, label: &str, button: &str, tip:
         button_rect.center(),
         Align2::CENTER_CENTER,
         button,
-        tokens::font(ty::META_STRONG, theme),
+        button_font,
         theme.accent.text,
     );
-    if button_response.clicked() {
-        response.on_hover_text(tip);
-        return true;
-    }
     response.on_hover_text(tip);
-    false
+    button_response.clicked()
 }
 
 pub fn status_busy(ui: &mut Ui, theme: &Theme, label: &str, detail: &str, motion: Motion) {

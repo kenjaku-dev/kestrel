@@ -437,191 +437,212 @@ fn body(ui: &mut Ui, theme: &Theme, stored: &mut Stored, action: &mut Action) {
         .frame(egui::Frame::new().fill(fill))
         .show(ui, |ui| {
             let width = available.min(component::SETTINGS_BODY_MAX_W);
-            // Pinned before anything is measured, and re-pinned inside the
-            // `ScrollArea` — the gallery's own width regression (1200 -> 1564)
-            // is what this is guarding against, in a second place.
-            ui.set_max_width(width);
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ScrollArea::vertical()
-                .id_salt("settings")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_max_width(width);
-                    let inner = ui.available_width();
-                    ui.vertical(|ui| {
-                        section(ui, theme, "Appearance");
-                        segmented(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Theme",
-                                help: Some("System follows the compositor's light or dark preference."),
-                            },
-                            inner,
-                            &Mode::ALL,
-                            &[
-                                Segment {
-                                    label: Mode::Light.label(),
-                                    glyph: Mode::Light.glyph(),
-                                    shortcut: "",
-                                },
-                                Segment {
-                                    label: Mode::Dark.label(),
-                                    glyph: Mode::Dark.glyph(),
-                                    shortcut: "Ctrl+T",
-                                },
-                                Segment {
-                                    label: Mode::System.label(),
-                                    glyph: Mode::System.glyph(),
-                                    shortcut: "",
-                                },
-                            ],
-                            &mut stored.theme,
-                        );
-                        checkbox(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Show sidebar",
-                                help: Some("The Places list on the left."),
-                            },
-                            inner,
-                            &mut stored.show_sidebar,
-                        );
+            // Centred, because a 560px measure pinned to the left edge of a
+            // 1900px window leaves a third of the screen as a void on the right
+            // and reads as a mistake rather than as a layout.
+            //
+            // A `scope_builder` on an explicit rect, not `add_space`: the
+            // `ScrollArea` below takes the *whole* remaining width regardless of
+            // how far the cursor was nudged, so a gutter inserted as a space
+            // survives exactly until the first scrollable widget and is then
+            // gone. The version that did that put the whole screen at x=0 and
+            // clipped "APPEARANCE" to "PPEARANCE".
+            let gutter = ((available - width) / 2.0).max(0.0);
+            let top = ui.max_rect().top();
+            let body_rect = egui::Rect::from_min_size(
+                egui::pos2(ui.max_rect().left() + gutter, top),
+                vec2(width, ui.available_height()),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(body_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ScrollArea::vertical()
+                        .id_salt("settings")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_max_width(width);
+                            let inner = ui.available_width();
+                            ui.vertical(|ui| {
+                                section(ui, theme, "Appearance");
+                                segmented(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Theme",
+                                        help: Some("Follow the desktop's light or dark setting."),
+                                    },
+                                    inner,
+                                    &Mode::ALL,
+                                    &[
+                                        Segment {
+                                            label: Mode::Light.label(),
+                                            glyph: Mode::Light.glyph(),
+                                            shortcut: "",
+                                        },
+                                        Segment {
+                                            label: Mode::Dark.label(),
+                                            glyph: Mode::Dark.glyph(),
+                                            shortcut: "Ctrl+T",
+                                        },
+                                        Segment {
+                                            label: Mode::System.label(),
+                                            glyph: Mode::System.glyph(),
+                                            shortcut: "",
+                                        },
+                                    ],
+                                    &mut stored.theme,
+                                );
+                                checkbox(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Show sidebar",
+                                        help: Some("The Places list on the left."),
+                                    },
+                                    inner,
+                                    &mut stored.show_sidebar,
+                                );
 
-                        section(ui, theme, "List");
-                        checkbox(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Show hidden files",
-                                help: Some(
-                                    "Entries whose name starts with a dot. They are always marked, never hidden by surprise.",
-                                ),
-                            },
-                            inner,
-                            &mut stored.show_hidden,
-                        );
-                        segmented(
-                            ui,
-                            theme,
-                            Row {
-                                label: "View",
-                                help: Some("Tree indents one step per level and expands in place."),
-                            },
-                            inner,
-                            &View::ALL,
-                            &[
-                                Segment {
-                                    label: View::List.label(),
-                                    glyph: View::List.glyph(),
-                                    shortcut: View::List.shortcut(),
-                                },
-                                Segment {
-                                    label: View::Tree.label(),
-                                    glyph: View::Tree.glyph(),
-                                    shortcut: View::Tree.shortcut(),
-                                },
-                            ],
-                            &mut stored.view,
-                        );
-                        segmented(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Sort by",
-                                help: None,
-                            },
-                            inner,
-                            &Column::ALL,
-                            &[
-                                Segment {
-                                    label: Column::Name.label(),
-                                    glyph: icons::TEXT_AA,
-                                    shortcut: "",
-                                },
-                                Segment {
-                                    label: Column::Size.label(),
-                                    glyph: icons::HARD_DRIVE,
-                                    shortcut: "",
-                                },
-                                Segment {
-                                    label: Column::Modified.label(),
-                                    glyph: icons::CLOCK,
-                                    shortcut: "",
-                                },
-                                Segment {
-                                    label: Column::Kind.label(),
-                                    glyph: icons::FOLDER,
-                                    shortcut: "",
-                                },
-                            ],
-                            &mut stored.sort,
-                        );
-                        checkbox(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Descending",
-                                help: Some("Reverses the chosen column's order."),
-                            },
-                            inner,
-                            &mut stored.sort_ascending,
-                        );
-                        checkbox(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Folders first",
-                                help: Some("Keeps directories above files whatever the column is."),
-                            },
-                            inner,
-                            &mut stored.dirs_first,
-                        );
+                                section(ui, theme, "List");
+                                checkbox(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Show hidden files",
+                                        help: Some(
+                                            "Names beginning with a dot. Always marked when shown.",
+                                        ),
+                                    },
+                                    inner,
+                                    &mut stored.show_hidden,
+                                );
+                                segmented(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "View",
+                                        help: Some("One indent step per level, expanded in place."),
+                                    },
+                                    inner,
+                                    &View::ALL,
+                                    &[
+                                        Segment {
+                                            label: View::List.label(),
+                                            glyph: View::List.glyph(),
+                                            shortcut: View::List.shortcut(),
+                                        },
+                                        Segment {
+                                            label: View::Tree.label(),
+                                            glyph: View::Tree.glyph(),
+                                            shortcut: View::Tree.shortcut(),
+                                        },
+                                    ],
+                                    &mut stored.view,
+                                );
+                                segmented(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Sort by",
+                                        help: None,
+                                    },
+                                    inner,
+                                    &Column::ALL,
+                                    &[
+                                        Segment {
+                                            label: Column::Name.label(),
+                                            glyph: icons::TEXT_AA,
+                                            shortcut: "",
+                                        },
+                                        Segment {
+                                            label: Column::Size.label(),
+                                            glyph: icons::HARD_DRIVE,
+                                            shortcut: "",
+                                        },
+                                        Segment {
+                                            label: Column::Modified.label(),
+                                            glyph: icons::CLOCK,
+                                            shortcut: "",
+                                        },
+                                        Segment {
+                                            label: Column::Kind.label(),
+                                            glyph: icons::FOLDER,
+                                            shortcut: "",
+                                        },
+                                    ],
+                                    &mut stored.sort,
+                                );
+                                checkbox(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Descending",
+                                        help: Some("Reverses the chosen column's order."),
+                                    },
+                                    inner,
+                                    &mut stored.sort_ascending,
+                                );
+                                checkbox(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Folders first",
+                                        help: Some("Directories stay above files in any column."),
+                                    },
+                                    inner,
+                                    &mut stored.dirs_first,
+                                );
 
-                        section(ui, theme, "Preview");
-                        checkbox(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Show preview pane",
-                                help: Some("Also bound to Ctrl+P."),
-                            },
-                            inner,
-                            &mut stored.show_preview,
-                        );
-                        stepper(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Preview width",
-                                help: Some("How much of the window the preview pane takes."),
-                            },
-                            inner,
-                            &mut stored.preview_width,
-                            PREVIEW_RANGE,
-                        );
+                                section(ui, theme, "Preview");
+                                checkbox(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Show preview pane",
+                                        help: Some("Also bound to Ctrl+P."),
+                                    },
+                                    inner,
+                                    &mut stored.show_preview,
+                                );
+                                stepper(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Preview width",
+                                        help: Some(
+                                            "How much of the window the preview pane takes.",
+                                        ),
+                                    },
+                                    inner,
+                                    &mut stored.preview_width,
+                                    PREVIEW_RANGE,
+                                );
 
-                        section(ui, theme, "Keyboard");
-                        // §7.14: a binding that exists only in the source is a
-                        // hidden affordance. The settings screen is one of the
-                        // two places it can be taught; the help overlay is the
-                        // other, and it is one keystroke away.
-                        key_hint(
-                            ui,
-                            theme,
-                            Row {
-                                label: "Shortcuts",
-                                help: Some("Every binding is listed in the help overlay."),
-                            },
-                            inner,
-                            "F1",
-                        );
+                                section(ui, theme, "Keyboard");
+                                // §7.14: a binding that exists only in the source is a
+                                // hidden affordance. The settings screen is one of the
+                                // two places it can be taught; the help overlay is the
+                                // other, and it is one keystroke away.
+                                key_hint(
+                                    ui,
+                                    theme,
+                                    Row {
+                                        label: "Shortcuts",
+                                        help: Some("Every binding is listed in the help overlay."),
+                                    },
+                                    inner,
+                                    "F1",
+                                );
 
-                        ui.add_space(space::S6);
-                        let _ = action;
-                    });
-                });
+                                ui.add_space(space::S6);
+                                let _ = action;
+                            });
+                        });
+                },
+            );
         });
 }
 
@@ -676,6 +697,31 @@ pub fn is_narrow(width: f32) -> bool {
     width < component::SETTINGS_STACK_BELOW_W
 }
 
+/// How many characters of `text` fit in `width` at `font`, less one for the
+/// ellipsis.
+///
+/// One `layout_no_wrap` to measure and one to fit, both memoized by the galley
+/// cache. An estimate would be wrong by ~11% in Plex Mono and by more in Sans,
+/// and the cost of being wrong is a sentence that either overflows into the
+/// control column or stops a word early.
+fn ellipsis_cols(ui: &Ui, text: &str, font: &egui::FontId, width: f32) -> usize {
+    let chars = text.chars().count();
+    if chars == 0 {
+        return 0;
+    }
+    let full = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+        .size()
+        .x;
+    if full <= width {
+        return chars;
+    }
+    // `chars >= 1` and `full > width > 0`, so neither division is degenerate.
+    let per_char = full / chars as f32;
+    (((width / per_char).floor()) as usize).clamp(4, chars.saturating_sub(1))
+}
+
 /// Draws a row's label block into `rect`: the name, and the help line under it.
 ///
 /// The two offsets are `type.ui`'s and `type.caption`'s line boxes, not tuned
@@ -691,11 +737,17 @@ fn label(ui: &Ui, theme: &Theme, rect: Rect, row: &Row<'_>) {
         theme.text.primary,
     );
     if let Some(help) = row.help {
-        painter.text(
+        // Elided to the label column, not merely clipped. A hard clip cuts a
+        // word in half with no ellipsis, which reads as a rendering fault; a
+        // middle-truncation with an ellipsis reads as "there is more, and here
+        // is where it stopped", which is what it means.
+        let font = tokens::font(ty::CAPTION, theme);
+        let shown = crate::format::end_truncate(help, ellipsis_cols(ui, help, &font, rect.width()));
+        painter.with_clip_rect(rect).text(
             pos2(rect.left(), rect.top() + name_line),
             Align2::LEFT_TOP,
-            help,
-            tokens::font(ty::CAPTION, theme),
+            shown,
+            font,
             theme.text.tertiary,
         );
     }
@@ -783,8 +835,10 @@ fn stepper(ui: &mut Ui, theme: &Theme, row: Row<'_>, width: f32, value: &mut f32
     // The group is right-aligned in the control column and its parts are laid
     // out from its left edge, so the two buttons are at fixed positions and the
     // number between them never nudges them when its digits change width.
-    let group_w = btn * 2.0 + gap * 2.0 + value_w;
-    let group_x = (control_rect.right() - group_w).max(control_rect.left());
+    // Left-aligned in the control column, like every other control here. It was
+    // right-aligned, which put the only control in the screen whose left edge
+    // did not line up with the checkbox above it.
+    let group_x = control_rect.left();
     let cy = control_rect.center().y;
     let value_rect = Rect::from_center_size(
         pos2(group_x + gap + btn + value_w / 2.0, cy),
@@ -802,7 +856,7 @@ fn stepper(ui: &mut Ui, theme: &Theme, row: Row<'_>, width: f32, value: &mut f32
     let at_min = *value <= range.min + 0.5;
     let at_max = *value >= range.max - 0.5;
 
-    if mini_button(ui, theme, minus, icons::X, !at_min, "Narrower") {
+    if mini_button(ui, theme, minus, Sign::Minus, !at_min, "Narrower") {
         *value = (round(*value) - range.step).clamp(range.min, range.max);
     }
     ui.painter().text(
@@ -812,17 +866,64 @@ fn stepper(ui: &mut Ui, theme: &Theme, row: Row<'_>, width: f32, value: &mut f32
         tokens::font(ty::META_STRONG, theme),
         theme.text.primary,
     );
-    if mini_button(ui, theme, plus, icons::CHECK, !at_max, "Wider") {
+    if mini_button(ui, theme, plus, Sign::Plus, !at_max, "Wider") {
         *value = (round(*value) + range.step).clamp(range.min, range.max);
     }
 }
 
-/// A 24px square button holding a glyph. `enabled` greys it and drops hover.
+/// The mark on a stepper's button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sign {
+    /// `minus` — one bar.
+    Minus,
+    /// `plus` — two.
+    Plus,
+}
+
+impl Sign {
+    /// The size of the mark, in pixels.
+    const SIZE: f32 = 10.0;
+
+    /// The stroke weight, from §2.7's `border.thick`.
+    const STROKE: f32 = border::THICK;
+
+    /// Paints the mark centred in `rect`.
+    ///
+    /// # Drawn, not typeset
+    ///
+    /// Phosphor has `minus` and `plus` and they are the right glyphs — but a
+    /// plus is two rectangles meeting at a right angle, and drawing it that way
+    /// makes it exactly `border.thick` wide, exactly centred, and exactly
+    /// aligned with the minus beside it. A glyph is a font's idea of a plus at
+    /// whatever size the icon font decides, and §5.1's grid does not extend to
+    /// "and the mark is optically centred within the button". For the one mark in
+    /// the app that has to sit dead-centre in a 24px target, geometry beats a
+    /// font. (The codepoints were not even looked up: `minus` is 0xE32E, and
+    /// `plus` is somewhere in the same alphabetical run, and reading it off a
+    /// render of candidate codepoints is a poor use of an afternoon.)
+    fn paint(self, painter: &egui::Painter, rect: Rect, color: egui::Color32) {
+        let c = rect.center();
+        painter.rect_filled(
+            egui::Rect::from_center_size(c, vec2(Self::SIZE, Self::STROKE)),
+            radius::all(radius::XS),
+            color,
+        );
+        if self == Self::Plus {
+            painter.rect_filled(
+                egui::Rect::from_center_size(c, vec2(Self::STROKE, Self::SIZE)),
+                radius::all(radius::XS),
+                color,
+            );
+        }
+    }
+}
+
+/// A 24px square button holding a mark. `enabled` greys it and drops hover.
 fn mini_button(
     ui: &mut Ui,
     theme: &Theme,
     rect: Rect,
-    glyph: icons::Glyph,
+    sign: Sign,
     enabled: bool,
     what: &str,
 ) -> bool {
@@ -838,19 +939,12 @@ fn mini_button(
         } else {
             theme.icon.chrome
         };
-        // The Fill face, per §4.4's toggled-on rule, because these two glyphs
-        // are heavier as outlines at 14px than they need to be.
-        tokens::icon_glyph_fill(
-            ui.painter(),
-            Rect::from_center_size(rect.center(), vec2(14.0, 14.0)),
-            glyph,
-            c,
-        );
+        sign.paint(ui.painter(), rect, c);
     } else {
-        tokens::icon_glyph(
+        // §4.4 `toolbar.btn-disabled`: 40% and no hover.
+        sign.paint(
             ui.painter(),
-            Rect::from_center_size(rect.center(), vec2(14.0, 14.0)),
-            glyph,
+            rect,
             component::icon_at(theme.icon.chrome, 0.4),
         );
     }
@@ -904,6 +998,9 @@ fn key_hint(ui: &mut Ui, theme: &Theme, row: Row<'_>, width: f32, key: &str) {
     response.on_hover_text("Opens the keyboard shortcut list");
 }
 
+/// A segment's horizontal padding, either side of the glyph and its label.
+const SEG_PAD_X: f32 = space::S2;
+
 /// One segment's painted content.
 struct Segment {
     /// The option's name.
@@ -937,12 +1034,31 @@ fn segmented<T: Copy + PartialEq>(
     let (label_rect, control_rect) = split(rect, stacked);
     label(ui, theme, label_rect, &row);
 
-    // The segments share whatever the control column has. A four-option
-    // segmented control at `SETTINGS_BODY_MAX_W`'s control column is comfortable; at a
-    // 400px window the row stacks and the control gets the full width, which is
-    // why the breakpoint is `is_narrow` and not a fixed pixel count.
+    // Sized to its **content**, then capped — not stretched across the control
+    // column. A three-option control in a 370px cell gave every option 122px,
+    // so "Dark" was a 122px block with a 4-character label in it: the accent
+    // background, which is the only thing saying which option is selected, was
+    // four times wider than the thing it was selecting.
+    //
+    // The content width is measured per segment, so a control mixing "Flat
+    // list" and "Tree" does not give both the same 80px. The cap then keeps a
+    // four-option control from exceeding the cell on a narrow window, where the
+    // row stacks and the cell is the full row width.
     let n = options.len().max(1) as f32;
-    let seg_w = (control_rect.width() - (n - 1.0) * space::HALF) / n;
+    let font = tokens::font(ty::UI, theme);
+    let natural: f32 = meta
+        .iter()
+        .map(|m| {
+            SEG_PAD_X * 2.0
+                + component::SEGMENT_ICON
+                + space::S2
+                + crate::widgets::text_width(ui, m.label, font.clone())
+        })
+        .sum();
+    let avail = control_rect.width();
+    let seg_w = ((natural + (n - 1.0) * space::HALF) / n)
+        .min((avail - (n - 1.0) * space::HALF) / n)
+        .max(44.0);
     for (i, opt) in options.iter().enumerate() {
         let seg = Rect::from_min_size(
             pos2(
