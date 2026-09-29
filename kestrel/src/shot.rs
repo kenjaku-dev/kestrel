@@ -840,6 +840,12 @@ mod tests {
             Scene::PreviewText,
             Scene::PreviewImage,
             Scene::PreviewTooLarge,
+            Scene::Settings,
+            Scene::Help,
+            Scene::Empty,
+            Scene::Denied,
+            Scene::Gone,
+            Scene::NoWatch,
         ] {
             for theme in [
                 crate::tokens::ThemeMode::Light,

@@ -1,0 +1,28 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Kestrel
+GenericName=File Manager
+Comment=A lightweight file manager
+# `@@BIN@@` is a placeholder, substituted with an absolute path by
+# `just install`. A bare `Exec=kestrel` looks right and is not: a launcher's
+# PATH is whatever the session it was started from had, which is not the PATH
+# the install shell had and not the PATH the next login will have. `TryExec` is
+# the same path for the same reason, and it is the key a desktop uses to decide
+# whether to show the entry at all.
+Exec=@@BIN@@ %F
+TryExec=@@BIN@@
+Icon=kestrel
+Terminal=false
+# `Terminal=false` because a file manager that flickers a terminal on every
+# launch is not a file manager. `StartupNotify=true` because egui's window is
+# already visible on its first frame, so there is nothing left to notify *about*
+# and claiming otherwise is a notification that never arrives.
+StartupNotify=true
+# Kestrel opens a *folder*, never a document, so it registers for directories
+# and nothing else. `inode/directory` is the one MIME type that means "a
+# directory"; there is no other, and claiming extra types would put Kestrel in
+# every application chooser on the machine.
+Categories=System;FileTools;FileManager;Filesystem;
+Keywords=file;manager;files;folder;directory;browser;
+MimeType=inode/directory;

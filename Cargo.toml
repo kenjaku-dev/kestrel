@@ -18,5 +18,53 @@ notify = { version = "8.2", default-features = false, features = [
 trash = { version = "5.2", default-features = false }
 tempfile = "3.27"
 
+# "Lightweight" is a claim, and a claim needs a number. These are the settings
+# that were measured rather than guessed; the resulting stripped binary is
+# reported in the Phase 5 write-up rather than asserted here.
+#
+# `lto = "fat"` over the previous `"thin"`: the app is one binary with no
+# dynamic plugins and no shared-library ABI to preserve, so whole-program
+# optimisation has nothing to lose and about 4MB to find. `codegen-units = 1`
+# is the other half of the same trade — it is also what makes fat LTO actually
+# see the whole program.
+#
+# `panic = "abort"` is **deliberately not set**, and the reason is not size. This
+# app runs workers (scan, watcher, preview, free space, job) and egui runs its
+# own; a panic on one of those threads under `abort` kills the process with no
+# backtrace and no chance to log the path that caused it. Under the default
+# unwind it is still a crash, but `RUST_BACKTRACE=1` prints where, and a crash
+# with a stack is a bug report I can act on. Paying a few percent of binary
+# size for that is the right side of the trade for a tool that touches
+# someone's filesystem. The size difference is in the measurements below.
+#
+# `strip = "symbols"` moves the stripping out of a manual `strip` step and into
+# the build, so `target/release/kestrel` is already the number that ships.
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# 3 is the default. Bumped to 2 because `-C embed-bitcode=no` is already the
+# release default and 1 buys nothing on top of fat LTO.
+opt-level = 3
+
+# Day-to-day builds.
+#
+# The default dev profile is `debug = 2` with incremental compilation and no
+# debuginfo splitting, which for a 400-crate egui/eframe graph produced a 5.8GB
+# `target/`. Line tables keep every panic message and every `dbg!` readable and
+# still let the optimiser and the backtracer work, which is the whole point of
+# a debug build; full variable inspection is what costs the gigabytes and is
+# what a UI bug is almost never diagnosed with. `incremental` stays on because
+# a UI crate is recompiled constantly and a full rebuild of this graph is four
+# minutes.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+incremental = true
+
+# `cargo test` builds with the `test` profile, which inherits from `dev` but
+# always at `debug = 2` and with debuginfo splitting off. The tests are the
+# second-most-run command in the repo, so they get the same treatment.
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "packed"

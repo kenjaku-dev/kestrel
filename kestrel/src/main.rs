@@ -65,6 +65,8 @@ mod history;
 mod icons;
 mod job;
 mod motion;
+#[cfg(test)]
+mod packaging;
 mod places;
 mod preview;
 mod rename;

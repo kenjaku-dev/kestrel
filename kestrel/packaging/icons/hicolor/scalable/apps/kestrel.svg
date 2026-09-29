@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Kestrel's app icon.
+
+  Drawn to the spec's own tokens and nothing else. The shape is a folder seen
+  from the front with the tab, because that is the one silhouette a 16px
+  launcher cell renders unambiguously; a kestrel would be a smudge at every size
+  a desktop actually uses. The tab carries `accent.500` (#33A894) so the mark is
+  recognisable as *this* file manager rather than as a folder icon, and the
+  body is `neutral.25` in the light strokes below / `neutral.800` in dark — one
+  icon, two themes, because a launcher shows a light icon on a dark panel and a
+  dark icon on a light one and there is no runtime to ask which.
+
+  Kept as a hand-written 108x108 grid rather than a 512x512 raster: it is
+  resolution-independent, it is 2KB instead of 200KB, and every desktop in the
+  freedesktop hierarchy can scale it. The legacy PNG sizes that some older
+  launchers still ask for are not shipped, and `just install` says so rather
+  than generating a blurry one.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108">
+  <defs>
+    <clipPath id="body">
+      <path d="M14 34 h34 l8 9 h38 a6 6 0 0 1 6 6 v43 a6 6 0 0 1 -6 6 H14 a6 6 0 0 1 -6 -6 V40 a6 6 0 0 1 6 -6 z"/>
+    </clipPath>
+  </defs>
+  <rect width="108" height="108" rx="20" fill="#131211"/>
+  <g clip-path="url(#body)">
+    <rect x="8" y="28" width="92" height="72" fill="#2B2824"/>
+    <rect x="8" y="28" width="92" height="14" fill="#33A894"/>
+  </g>
+  <path d="M14 34 h34 l8 9 h38 a6 6 0 0 1 6 6 v43 a6 6 0 0 1 -6 6 H14 a6 6 0 0 1 -6 -6 V40 a6 6 0 0 1 6 -6 z"
+        fill="none" stroke="#6F6961" stroke-width="3" stroke-linejoin="round"/>
+  <!-- Three file marks inside: the app is about what is in a folder, and at
+       16px they are three bars and nothing else, which is the point. -->
+  <g fill="#B8B2A9">
+    <rect x="26" y="62" width="40" height="6" rx="3"/>
+    <rect x="26" y="74" width="56" height="6" rx="3"/>
+    <rect x="26" y="86" width="32" height="6" rx="3"/>
+  </g>
+</svg>

@@ -80,6 +80,7 @@ pub fn show(ui: &mut Ui, theme: &mut Theme, mode: &mut ThemeMode) {
 ///
 /// Named rather than inlined so the release stub below and the debug build
 /// cannot disagree about what the switch is called.
+#[cfg(debug_assertions)]
 const DEBUG_LAYOUT_ENV: &str = "KESTREL_DEBUG_LAYOUT";
 
 /// Reports the content `Ui`'s available width at each section boundary.
