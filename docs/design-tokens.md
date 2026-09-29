@@ -434,7 +434,7 @@ recorded as such rather than quietly re-passed.
 | `accent.hover` | `#0A5449` | `#6BD9C4` |
 | `accent.pressed` | `#073B33` | `#8FE6D4` |
 | `accent.subtle-bg` | `#DCF0EA` | `#16332F` |
-| `accent.border` | `#A6D6CB` | `#3A7A6E` |
+| `accent.border` | `#A6D6CB` | `#3F8478` |
 | `accent.text` | `#0A5449` | `#6BD9C4` |
 | `accent.on` | `#FFFFFF` | `#08221D` |
 
@@ -1111,7 +1111,7 @@ Every one of these was a real failure found by measurement, then fixed. Recordin
 | 11 | dark `icon.hidden` on `state.selected` | `#8C8579` on `#1E4640` | **2.87** — under 3:1 | `#948E85` (and the tint fix in #3) | 3.81 |
 | 12 | light `hue.folder` on `state.selected-hover` | `#A0741A` on `#BCDED5` | **2.94** — under 3:1 | `#9A6510` | 3.43 |
 | 13 | dark `accent.border` on `surface.raised` | `#2A5A51` on `#24221F` | **2.02** — under 3:1 | `#3A7A6E` | 3.16 — **superseded by 14** |
-| 14 | dark `accent.border` on `surface.raised` (re-verified 2026-09 after §8 D-1 moved the surface to `#2B2824`) | `#3A7A6E` on `#2B2824` | **2.93** — under 3:1, **re-opened by the surface change, not a new defect** | **OPEN** — must be ≥ `#3C7F73` (3.13); `#3F8478` gives 3.34 | **OPEN** |
+| 14 | dark `accent.border` on `surface.raised` (re-verified 2026-09 after §8 D-1 moved the surface to `#2B2824`) | `#3A7A6E` on `#2B2824` | **2.93** — under 3:1, **re-opened by the surface change, not a new defect** | `#3F8478` | **3.34** — CLOSED 2026-09; recomputed by the §6.2 method (`L(#3F8478) = 0.18915`, `L(#2B2824) = 0.02159`), and pinned by `tokens::tests::dark_accent_border_clears_three_to_one_on_raised` |
 
 **Entry 13 — how to reproduce, and why 14 exists.** Entry 13 is the one row in this
 table that depends on `surface.raised`, and it is the row that the §8 D-1 correction
@@ -1132,9 +1132,11 @@ terms, and 0.23 of a contrast ratio at the 3:1 boundary. That is the whole reaso
 corrected surface is *lighter*, every ratio against it falls, and `accent.border` dark
 `#3A7A6E` did not survive. It is a small step — `#3C7F73` is 3.13 and `#3F8478` is
 3.34, both still unambiguously pine teal and both still well clear of `border.default` —
-but it is a step, and it belongs to the code lane, not to a documentation edit. Until
-it is taken, entry 14 is a live accessibility failure in dark dialogs and menus, and
-this document says so.
+but it is a step, and it belongs to the code lane, not to a documentation edit. It
+is taken as of 2026-09: `accent.border` dark is `#3F8478` (3.34 by the §6.2 method,
+`L = 0.18915` against `L = 0.02159` for `#2B2824`), chosen over `#3C7F73` (3.13) for
+margin above the 3.0 floor while staying unambiguously pine teal and well clear of
+`border.default`. Entry 14 is CLOSED.
 
 Entries 3, 4, 5 and 11 are all consequences of the same root cause: the dark selection tints were originally too light, which compressed the available contrast range for everything drawn on top of a selected row. Fixing the tints (3) exposed a second failure (4), which fixed the tint differently. The `selected-hover` state is the worst surface in the entire system — darker than `selected` in light mode is a mistake, lighter is a mistake in dark mode, and every value here was chosen by measurement rather than by eye.
 

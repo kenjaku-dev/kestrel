@@ -1253,7 +1253,7 @@ impl Theme {
                 hover: a::A300_DARK,                            // #6BD9C4
                 pressed: Color32::from_rgb(0x8F, 0xE6, 0xD4),   // #8FE6D4
                 subtle_bg: Color32::from_rgb(0x16, 0x33, 0x2F), // #16332F
-                border: Color32::from_rgb(0x3A, 0x7A, 0x6E),    // #3A7A6E
+                border: Color32::from_rgb(0x3F, 0x84, 0x78),    // #3F8478
                 text: a::A300_DARK,                             // #6BD9C4
                 on: Color32::from_rgb(0x08, 0x22, 0x1D),        // #08221D
             },
@@ -2417,6 +2417,38 @@ mod tests {
         assert_eq!(
             Theme::dark().accent.base.to_array(),
             [0x4F, 0xC7, 0xB1, 255]
+        );
+    }
+
+    /// §6.5 entry 14: dark `accent.border` on `surface.raised` must clear 3:1.
+    ///
+    /// Computed with the §6 method — WCAG 2.x relative luminance over the sRGB
+    /// values as specified, `(L_lighter + 0.05) / (L_darker + 0.05)` — so the
+    /// audit's "machine-verified" claim is true of the code, not just the doc.
+    /// `#3A7A6E` measured 2.93 after the `surface.raised` correction to
+    /// `neutral.800`; `#3F8478` measures 3.34.
+    #[test]
+    fn dark_accent_border_clears_three_to_one_on_raised() {
+        fn linear(c: f32) -> f32 {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(c: Color32) -> f32 {
+            let [r, g, b, _] = c.to_array().map(|v| f32::from(v) / 255.0);
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        }
+        let theme = Theme::dark();
+        let (la, lb) = (
+            luminance(theme.accent.border),
+            luminance(theme.surfaces.raised),
+        );
+        let ratio = (la.max(lb) + 0.05) / (la.min(lb) + 0.05);
+        assert!(
+            ratio >= 3.0,
+            "dark accent.border on surface.raised is {ratio:.2}, want >= 3.0 (§6.5 entry 14)"
         );
     }
 
