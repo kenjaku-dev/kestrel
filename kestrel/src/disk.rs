@@ -61,7 +61,7 @@ impl FreeSpace {
 /// against the wrong directory.
 ///
 /// The reading is a plain [`FreeSpace`] behind a mutex, mirroring
-/// [`kestrel_fs::size::SizeCache`]'s `Arc<Mutex<HashMap<..>>>` shape. An earlier
+/// `kestrel_fs::size::SizeCache`'s `Arc<Mutex<HashMap<..>>>` shape. An earlier
 /// revision packed both fields into one `AtomicU64` — 32 bits each — which
 /// clamped every filesystem over 4 GiB to exactly 4,294,967,295 bytes and
 /// pinned the meter at full. A mutex held only for a struct copy is never
