@@ -355,8 +355,16 @@ fn debounce_loop(
 
         match raw.recv_timeout(POLL) {
             Ok(Ok(event)) => {
-                if matches!(event.kind, EventKind::Other) {
-                    // e.g. a "rescan" poke on some backends; nothing to show.
+                if matches!(event.kind, EventKind::Other | EventKind::Access(_)) {
+                    // `Other` is a backend poke with nothing to show, and
+                    // `Access` (open/read/close) never makes a listing stale:
+                    // reading a file changes no name, size or mtime the list
+                    // displays. The app's own scan (`readdir`) and preview
+                    // reads emit exactly these, so delivering them as `Changed`
+                    // re-lists the directory the app just read — which starts
+                    // a new scan, which emits another access event, forever —
+                    // and each re-list clears the selection, so a focused
+                    // preview never loads.
                     continue;
                 }
                 for path in &event.paths {
@@ -561,6 +569,42 @@ mod tests {
                     Err(e) => panic!("subscriber missed the event: {e}"),
                 }
             }
+        }
+    }
+
+    /// Reading a file — or listing the directory — is not a change.
+    ///
+    /// Regression: the debouncer delivered `Access` (open/read/close) events as
+    /// `Changed`, so the app's own scan and preview reads re-listed the
+    /// directory they just read, which cleared the selection and starved the
+    /// preview. Opening and reading must stay silent; only creates, writes,
+    /// renames and removals refresh the listing.
+    #[test]
+    fn reading_a_file_does_not_report_a_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("read-me.txt");
+        fs::write(&path, b"preview me").expect("write");
+        // A short debounce, so the test waits a few full windows rather than a
+        // guessed duration.
+        let sub = watch_with(tmp.path(), Duration::from_millis(50)).expect("watch");
+        // The write above predates the watch, so inotify has nothing queued for
+        // it; drop anything already waiting so only the reads below can speak.
+        while sub.try_recv().is_ok() {}
+        // The app's two steady-state reads: previewing a file, and scanning
+        // (opening and listing) the directory.
+        let contents = fs::read(&path).expect("read");
+        assert_eq!(contents, b"preview me");
+        let count = fs::read_dir(tmp.path()).expect("read_dir").count();
+        assert_eq!(count, 1);
+        // Several debounce windows of reads must produce no refresh. A single
+        // bounded wait, not a retry: absence of an event is the assertion.
+        match sub.recv_timeout(Duration::from_millis(500)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(WatchEvent::Changed(changes)) => {
+                panic!("a read must not refresh the listing, got {changes:?}")
+            }
+            Ok(WatchEvent::Error(_)) => {}
+            Err(e) => panic!("unexpected channel state: {e}"),
         }
     }
 
