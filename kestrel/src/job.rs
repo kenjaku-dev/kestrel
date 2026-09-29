@@ -317,6 +317,10 @@ impl DecisionSlot {
                 return Some(answer);
             }
             if self.is_cancelled() {
+                // The question is no longer pending: the job it belonged to is
+                // over, so leaving `waiting` set would tell the UI a dialog is
+                // still owed an answer.
+                guard.waiting = false;
                 return None;
             }
             // A bounded wait rather than an unbounded one, so a job whose UI went
@@ -337,14 +341,35 @@ impl DecisionSlot {
     /// known. Recording it in `ask` made the sticky value depend on a worker
     /// thread having parked, which is not a property of the answer at all — and
     /// a test that posted an answer without a parked worker found it.
+    ///
+    /// `None` is a *decision* — "I am not answering, stop" — and it is
+    /// distinguishable from "nothing has been answered yet" only because it sets
+    /// the cancelled flag. Storing it in `answer` as a `None` alone would be
+    /// indistinguishable from an unanswered question: the worker's park loop
+    /// waits for `answer.is_some() || is_cancelled()`, so the job would hang
+    /// until the process exited, with the dialog closed and the status bar stuck.
+    /// That is what the Cancel button of the collision dialog sends, so the bug
+    /// is "close the dialog and the copy never stops".
     pub fn answer(&self, decision: Option<Decision>) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(answer) = decision {
-            if answer.scope == Scope::All {
-                guard.sticky = Some(answer.strategy);
-            }
+        // Cancellation is not an answer, so it must not clobber a sticky
+        // `Scope::All` the user already gave — that answer is what every
+        // *later* item would have been resolved by.
+        if let Some(answer) = &decision
+            && answer.scope == Scope::All
+        {
+            guard.sticky = Some(answer.strategy);
         }
-        guard.answer = decision;
+        if decision.is_none() {
+            self.cancelled.store(true, Ordering::Relaxed);
+            guard.answer = None;
+            guard.waiting = false;
+        } else {
+            guard.answer = decision;
+        }
+        // Notify outside the lock: a woken worker that has to take the mutex
+        // immediately should not have to wait for this thread to drop it.
+        drop(guard);
         self.cv.notify_all();
     }
 
@@ -1145,6 +1170,72 @@ mod tests {
         drain_all(&mut h);
         h.finish();
         assert_eq!(fs::read(dst.path().join("a.txt")).expect("read"), b"new");
+    }
+
+    /// The dialog's Cancel button is `answer(None)`, and it must cancel.
+    ///
+    /// The two buttons that carry a decision both answer `Some(..)`, so the
+    /// `None` path is the one the collision tests never reach — and it is the
+    /// path the user reaches whenever they close a dialog they did not want to
+    /// answer. Before the fix this parked the worker on the condvar for the life
+    /// of the process: no re-park, no `Cancelled`, the status bar stuck on
+    /// "Copy 1 of 1" forever.
+    #[test]
+    fn answering_none_cancels_the_job() {
+        let src = tmp();
+        let dst = tmp();
+        fs::write(src.path().join("a.txt"), b"new").expect("write");
+        fs::write(dst.path().join("a.txt"), b"old").expect("write");
+
+        let mut h = start(
+            Op::Copy,
+            vec![Item::file(src.path().join("a.txt"), Some(3))],
+            Some(dst.path().to_path_buf()),
+        )
+        .expect("start");
+
+        // Wait for the question, then press Cancel.
+        let mut events = Vec::new();
+        let mut asked = false;
+        for _ in 0..500 {
+            h.drain_into(|e| events.push(e));
+            if matches!(events.last(), Some(JobEvent::Collided { .. })) {
+                h.decisions().answer(None);
+                asked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            asked,
+            "a collision must be raised as a question before it can be cancelled"
+        );
+
+        let rest = drain_all(&mut h);
+        events.extend(rest);
+        let cancelled = events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Cancelled { .. }));
+
+        if !cancelled {
+            // The worker is still parked. Dropping or finishing the handle would
+            // join that thread and hang the test instead of failing it, so it is
+            // detached deliberately: this failure mode *is* the bug, and a red
+            // test is more useful than a red suite.
+            std::mem::forget(h);
+            panic!("answering None must cancel the job, not park it forever: {events:?}");
+        }
+
+        h.finish();
+        assert!(
+            !events.iter().any(|e| matches!(e, JobEvent::Done { .. })),
+            "a cancelled job must not claim success: {events:?}"
+        );
+        assert_eq!(
+            fs::read(dst.path().join("a.txt")).expect("read"),
+            b"old",
+            "a cancelled collision must leave the destination alone"
+        );
     }
 
     /// `Scope::All` must not ask twice: the second colliding item is resolved by
