@@ -3086,8 +3086,14 @@ impl KestrelApp {
                 ui.horizontal_centered(|ui| {
                     // §4.4: proximity does the grouping, so separators sit only
                     // between functional groups, never between adjacent buttons.
-                    for (i, b) in btns.iter().enumerate() {
-                        if toolbar::separator_before(i) {
+                    //
+                    // `plan.shows` is the one place that decides whether the
+                    // `Filter` button is drawn: it is drawn only in the stage
+                    // where the field was left out for space, so the two filter
+                    // controls are mutually exclusive rather than both
+                    // appearing because the field "had priority".
+                    for b in btns.iter().filter(|b| plan.shows(b)) {
+                        if toolbar::separator_before(b) {
                             toolbar::separator(ui, &theme);
                         }
                         if toolbar::draw(ui, &theme, *b, ahead, plan.density).clicked() {

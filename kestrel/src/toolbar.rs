@@ -63,8 +63,23 @@ const FILTER_PREF_W: f32 = 220.0;
 /// button is still usable, and it is the point past which the field is a
 /// sliver: 90px of it is the placeholder, and typing replaces the placeholder
 /// immediately so the query is never visible. Below the floor the field goes
-/// away and the `Filter` toolbar button — which keeps its name in *both*
-/// densities — is the way in, so nothing becomes unreachable.
+/// away, and the `Filter` button — which keeps its name in *both* densities —
+/// becomes the *only* way in, so nothing becomes unreachable.
+///
+/// # The button and the field are mutually exclusive
+///
+/// The two controls do the same job, and a labelled `Filter` button sitting
+/// next to a `Filter…` field that is already on screen reads as a mistake
+/// rather than as two things. So exactly one of them is ever in the row, and
+/// which one is not a preference — it falls out of the layout:
+///
+/// * the field is shown when there is room for it, and then
+///   [`Plan::shows`] hides the button;
+/// * the button is shown only in the one stage where the field was left out
+///   for space, and then it is the sole route to the field.
+///
+/// The button earns its place in exactly one situation, and that situation is
+/// also the only one in which it is drawn. See [`Plan::shows`].
 const FILTER_MIN_W: f32 = 120.0;
 
 /// How much of each button the toolbar shows.
@@ -89,6 +104,23 @@ pub struct Plan {
     /// own minimum, and the status bar says so rather than the toolbar
     /// silently clipping.
     pub fits: bool,
+}
+
+impl Plan {
+    /// Whether `button` belongs in the row this plan describes.
+    ///
+    /// Every button, always, except one: the `Filter` button is drawn **only**
+    /// when the field has been left out. See [`FILTER_MIN_W`] for why the two
+    /// are exclusive, and [`plan`] for the arithmetic that decides which.
+    ///
+    /// This is the single place the rule lives. The row builder asks it, the
+    /// tests ask it, and nothing else decides — which is what stops "field
+    /// preferred, button also drawn" from being a second, softer policy that
+    /// drifts.
+    #[must_use]
+    pub fn shows(&self, button: &Button) -> bool {
+        !(button.action == Action::Filter && self.filter.is_some())
+    }
 }
 
 /// A control in the toolbar, with everything needed to paint and describe it.
@@ -238,16 +270,27 @@ pub fn buttons(
     ]
 }
 
-/// Whether a separator is drawn before button `i`.
+/// Whether a separator is drawn before `b`.
 ///
 /// §4.4: "Proximity does the grouping, so separators are only between *groups*,
-/// never between adjacent buttons." The groups are navigation (Back, Forward,
-/// Up), the view switcher (List, Tree), and the app-level controls (Sort,
-/// Filter, Theme, Settings, Help). Four separators, fixed by position, so
-/// adding a button to a group does not move the rules.
+/// never between adjacent buttons." The groups are the navigation cluster
+/// (Back, Forward, Up), the icon row's own breaks, and the filter — a rule
+/// before `Refresh`, before `ViewTree`, and before `Filter`.
+///
+/// The rule identifies a button by *what it is* rather than by where it
+/// happens to sit, because [`Plan::shows`] removes the `Filter` button from the
+/// row whenever the field is drawn. A position-based rule would then draw a
+/// rule beside the wrong control and shift every separator after it; naming the
+/// button means a removed button takes its rule with it and the rest of the
+/// row is untouched.
+///
+/// [`Plan::shows`]: crate::toolbar::Plan::shows
 #[must_use]
-pub fn separator_before(i: usize) -> bool {
-    matches!(i, 3 | 5 | 6)
+pub fn separator_before(b: &Button) -> bool {
+    matches!(
+        b.action,
+        Action::Refresh | Action::ViewTree | Action::Filter
+    )
 }
 
 /// How wide one button is in a given density.
@@ -281,11 +324,41 @@ const SEPARATOR_W: f32 = (border::HAIRLINE + component::TOOLBAR_BTN_SEPARATOR_MA
 /// The toolbar's own inner padding, both sides.
 const FRAME_PAD_X: f32 = space::S2 * 2.0;
 
+/// The width the row needs at one density, with and without the `Filter` button.
+///
+/// Two numbers rather than one because the button and the field are exclusive
+/// and the row has to be measured both ways: with the field drawn the `Filter`
+/// button is not in the row, and with the button drawn there is no field. Adding
+/// a button's width and then also reserving the field's is the arithmetic that
+/// produced a toolbar with two filter controls and a row that overflowed.
+fn row_width(
+    ui: &Ui,
+    theme: &Theme,
+    btns: &[Button],
+    density: Density,
+    with_filter_button: bool,
+) -> f32 {
+    let mut total = FRAME_PAD_X;
+    for b in btns {
+        if b.action == Action::Filter && !with_filter_button {
+            // Skipped, and so is the separator that would have preceded it —
+            // the same decision [`Plan::shows`] makes at paint time.
+            continue;
+        }
+        if separator_before(b) {
+            total += SEPARATOR_W / 3.0;
+        }
+        total += button_width(ui, theme, b, density);
+    }
+    total
+}
+
 /// The space the filter field needs beyond its own width: a separator and the
 /// gap before it.
 const FILTER_CHROME: f32 = border::HAIRLINE + component::TOOLBAR_BTN_SEPARATOR_MARGIN * 2.0;
 
-/// Decides the toolbar's density and filter width for the space it has.
+/// Decides the toolbar's density, filter width, and — by exclusion — whether the
+/// `Filter` button is in the row at all.
 ///
 /// # Why a decision function and not a `clamp`
 ///
@@ -297,49 +370,67 @@ const FILTER_CHROME: f32 = border::HAIRLINE + component::TOOLBAR_BTN_SEPARATOR_M
 ///
 /// The choice is §4.4's own two variants, in priority order:
 ///
-/// 1. Labels on, filter at [`FILTER_PREF_W`] — the wide layout.
+/// 1. Labels on, filter at [`FILTER_PREF_W`] — the wide layout. The `Filter`
+///    button is *not* in this row; the field is the control.
 /// 2. Labels off, filter at [`FILTER_PREF_W`] — §4.4's icon variant. This is
 ///    what happens at 820px, which is where the labelled row stops fitting.
 /// 3. Labels off, filter at whatever is left, down to [`FILTER_MIN_W`].
-/// 4. Labels off, no filter field — the `Filter` button is the way in.
+/// 4. Labels off, no filter field — and *only* now does the `Filter` button
+///    appear, because it is the only remaining way to reach the field.
 ///
 /// The filter field is the thing that gives way, not the buttons: a button that
 /// is not there cannot be pressed, while a narrow filter still filters.
+///
+/// # Why this converges in one pass
+///
+/// Dropping the button frees width, and freed width can promote an earlier
+/// stage — which frees the field's width too, which is a fixed point, because
+/// promoting further would require *more* width than promoting just did. The
+/// stages are therefore tried in order against a *precomputed* measurement of
+/// the row each one would actually draw, rather than against a running total
+/// that is mutated as the answer is discovered. There is no loop to diverge.
+///
+/// [`Plan::shows`] is what makes the two controls exclusive at paint time; the
+/// arithmetic here is what makes it consistent at test time.
 #[must_use]
 pub fn plan(ui: &Ui, theme: &Theme, available: f32, btns: &[Button]) -> Plan {
-    let mut labelled = FRAME_PAD_X;
-    let mut icons = FRAME_PAD_X;
-    for (i, b) in btns.iter().enumerate() {
-        if separator_before(i) {
-            labelled += SEPARATOR_W / 3.0;
-            icons += SEPARATOR_W / 3.0;
-        }
-        labelled += button_width(ui, theme, b, Density::Labelled);
-        icons += button_width(ui, theme, b, Density::Icons);
-    }
+    // Rows *with* the field: the `Filter` button is not drawn, so the row is
+    // whatever is left without it.
+    let labelled = row_width(ui, theme, btns, Density::Labelled, false);
+    let icons = row_width(ui, theme, btns, Density::Icons, false);
+    // The last stage's row: the button is back, and the field is gone.
+    let icons_with_button = row_width(ui, theme, btns, Density::Icons, true);
+
     // The last group is followed by a separator before the filter field, in
     // every density, because the field is chrome rather than a control group.
-    let with_filter = |row: f32| row + FILTER_CHROME + FILTER_PREF_W;
-    if with_filter(labelled) <= available {
+    let with_field = |row: f32| row + FILTER_CHROME + FILTER_PREF_W;
+    if with_field(labelled) <= available {
         return Plan {
             density: Density::Labelled,
             filter: Some(FILTER_PREF_W),
             fits: true,
         };
     }
-    if with_filter(icons) <= available {
+    if with_field(icons) <= available {
         return Plan {
             density: Density::Icons,
             filter: Some(FILTER_PREF_W),
             fits: true,
         };
     }
-    let fits = icons <= available;
     let left = available - icons - FILTER_CHROME;
+    if left >= FILTER_MIN_W {
+        return Plan {
+            density: Density::Icons,
+            filter: Some(left.min(FILTER_PREF_W)),
+            fits: true,
+        };
+    }
+    // Stage 4: the field does not fit, so the `Filter` button is the control.
     Plan {
         density: Density::Icons,
-        filter: (left >= FILTER_MIN_W).then_some(left.min(FILTER_PREF_W)),
-        fits,
+        filter: None,
+        fits: icons_with_button <= available,
     }
 }
 
@@ -560,6 +651,11 @@ mod tests {
         out
     }
 
+    /// The buttons the plan would actually draw, in order.
+    fn visible<'a>(p: &Plan, btns: &'a [Button]) -> Vec<&'a Button> {
+        btns.iter().filter(|b| p.shows(b)).collect()
+    }
+
     // -- the two regressions this function exists to prevent ---------------
 
     /// At 760px the filter field used to lose its right half, because the
@@ -575,15 +671,14 @@ mod tests {
             let Some(field) = p.filter else {
                 panic!("{width}px dropped the filter field; the icon row fits easily there");
             };
-            // The buttons, at whichever density, plus the field's own chrome
-            // plus the frame padding, must fit.
+            // The buttons that are actually drawn, at whichever density, plus the
+            // field's own chrome plus the frame padding, must fit.
             with_ui(width, |ui, theme| {
                 let btns = buttons(true, true, true, false, false);
-                let used: f32 = btns
+                let used: f32 = visible(&p, &btns)
                     .iter()
-                    .enumerate()
-                    .map(|(i, b)| {
-                        let sep = if separator_before(i) {
+                    .map(|b| {
+                        let sep = if separator_before(b) {
                             SEPARATOR_W / 3.0
                         } else {
                             0.0
@@ -604,18 +699,19 @@ mod tests {
     /// The labelled row used to overflow the window and the buttons ran off the
     /// right edge with nothing saying so.
     ///
-    /// The breakpoint is 1060px rather than the ~820px that was reported
-    /// before: adding the Settings and Help buttons made the row wider, and a
-    /// test that asserted the old number would be asserting a bug. What is
-    /// pinned here is the *behaviour* — labels exactly when the labelled row
-    /// fits, icons exactly when it does not — and the number falls out of the
-    /// font, which is the right place for it to live.
+    /// The breakpoint moved from ~1060px to ~975px when the `Filter` button
+    /// stopped sharing the row with the field: the labelled row is ~86px
+    /// narrower without it, so it now fits in a window it used to overflow. A
+    /// test that asserted the old number would be asserting the duplication.
+    /// What is pinned here is the *behaviour* — labels exactly when the labelled
+    /// row fits, icons exactly when it does not — and the number falls out of
+    /// the font, which is the right place for it to live.
     #[test]
     fn the_labelled_row_is_used_exactly_when_it_fits() {
-        for width in [1600.0, 1400.0, 1200.0, 1100.0] {
+        for width in [1600.0, 1400.0, 1200.0, 1100.0, 1000.0] {
             assert_eq!(plan_at(width).density, Density::Labelled, "{width}px");
         }
-        for width in [1000.0, 900.0, 820.0, 760.0, 700.0, 640.0] {
+        for width in [960.0, 900.0, 820.0, 760.0, 700.0, 640.0] {
             let p = plan_at(width);
             assert_eq!(p.density, Density::Icons, "{width}px");
             assert!(p.fits, "{width}px fits the icon row");
@@ -634,22 +730,13 @@ mod tests {
             let w = width as f32;
             with_ui(w, |ui, theme| {
                 let btns = buttons(true, true, true, false, false);
+                // The row as it would be drawn with the field in it: no
+                // `Filter` button, plus the field's separator and chrome.
                 let row = |density: Density| -> f32 {
-                    btns.iter()
-                        .enumerate()
-                        .map(|(i, b)| {
-                            (if separator_before(i) {
-                                SEPARATOR_W / 3.0
-                            } else {
-                                0.0
-                            }) + button_width(ui, theme, b, density)
-                        })
-                        .sum::<f32>()
-                        + FRAME_PAD_X
-                        + FILTER_CHROME
+                    row_width(ui, theme, &btns, density, false) + FILTER_CHROME + FILTER_PREF_W
                 };
                 let p = plan(ui, theme, w, &btns);
-                if row(Density::Labelled) + FILTER_PREF_W <= w {
+                if row(Density::Labelled) <= w {
                     assert_eq!(p.density, Density::Labelled, "{w}px: it fits");
                 } else {
                     assert_eq!(p.density, Density::Icons, "{w}px: it does not fit");
@@ -658,14 +745,14 @@ mod tests {
         }
     }
 
-    /// The icon row is 10 * 28px plus four separators; a window narrower than
+    /// The icon row is 10 * 28px plus separators; a window narrower than
     /// that cannot show the toolbar at all, and the plan says so rather than
     /// letting the buttons be clipped without comment.
     #[test]
     fn a_window_narrower_than_the_icon_row_is_reported() {
         with_ui(200.0, |ui, theme| {
             let p = plan(ui, theme, 200.0, &buttons(true, true, true, false, false));
-            assert!(!p.fits, "200px cannot fit ten 28px buttons and four rules");
+            assert!(!p.fits, "200px cannot fit ten 28px buttons and their rules");
             assert_eq!(p.density, Density::Icons, "icons are already the floor");
             assert_eq!(p.filter, None, "and the field is the first thing to go");
         });
@@ -685,11 +772,11 @@ mod tests {
             // Somewhere between the icon row and `FILTER_PREF_W`.
             let icons: f32 = btns
                 .iter()
-                .enumerate()
-                .map(|(i, _)| {
+                .filter(|b| b.action != Action::Filter)
+                .map(|b| {
                     // The icon row's width does not depend on which button it
                     // is: every one is `toolbar.btn-width`.
-                    (if separator_before(i) {
+                    (if separator_before(b) {
                         SEPARATOR_W / 3.0
                     } else {
                         0.0
@@ -708,6 +795,121 @@ mod tests {
             let p = plan(ui, theme, narrow - 1.0, &btns);
             assert_eq!(p.filter, None, "one pixel below the floor it is gone");
         });
+    }
+
+    // -- the duplicated filter control this file's layout exists to prevent --
+
+    /// The `Filter` button and the `Filter…` field are the same job, and a
+    /// labelled button beside a field that is already on screen reads as a
+    /// mistake. They are mutually exclusive: the field is the control whenever
+    /// it fits, and the button is drawn only in the one stage where the field
+    /// was dropped for space.
+    ///
+    /// The widths are the ones the report named, plus a sweep, because a rule
+    /// that holds at five widths is a coincidence rather than a rule.
+    #[test]
+    fn the_filter_button_and_the_field_are_never_both_present() {
+        for width in [320.0, 500.0, 760.0, 1000.0, 1400.0] {
+            let p = plan_at(width);
+            let btns = buttons(true, true, true, false, false);
+            let shown = visible(&p, &btns);
+            let button = shown.iter().any(|b| b.action == Action::Filter);
+            assert!(
+                !(button && p.filter.is_some()),
+                "{width}px: button={button}, field={:?} — exactly one, never both",
+                p.filter
+            );
+        }
+        for width in (200..=1600).step_by(3) {
+            let w = width as f32;
+            let p = plan_at(w);
+            let btns = buttons(true, true, true, false, false);
+            let button = visible(&p, &btns)
+                .iter()
+                .any(|b| b.action == Action::Filter);
+            assert_eq!(
+                button,
+                p.filter.is_none(),
+                "{w}px: the button is the way in exactly when the field is out"
+            );
+        }
+    }
+
+    /// The two controls are not merely "field preferred" — the button is *only*
+    /// in the row when the field is out, so the field's presence removes a
+    /// button rather than sitting next to one.
+    #[test]
+    fn the_filter_button_appears_only_where_the_field_was_dropped() {
+        // 1000px: the field is at its preferred width and the button is gone.
+        let wide = plan_at(1000.0);
+        assert_eq!(wide.filter, Some(FILTER_PREF_W));
+        let btns = buttons(true, true, true, false, false);
+        assert!(
+            !visible(&wide, &btns)
+                .iter()
+                .any(|b| b.action == Action::Filter),
+            "1000px shows the field, so the button must not be in the row"
+        );
+
+        // Far enough down that the field is dropped, the button is the control.
+        let narrow = plan_at(440.0);
+        assert_eq!(narrow.filter, None, "440px has no room for the field");
+        assert!(
+            visible(&narrow, &btns)
+                .iter()
+                .any(|b| b.action == Action::Filter),
+            "with the field gone the button is the only way to it"
+        );
+    }
+
+    /// Dropping the button frees width, which could in principle promote an
+    /// earlier stage, which frees more. It has to settle: at every width the
+    /// row the plan chose actually fits, and the stage it chose is the first
+    /// one that does.
+    #[test]
+    fn the_stages_settle_in_one_pass() {
+        for width in (200..=1600).step_by(3) {
+            let w = width as f32;
+            let p = plan_at(w);
+            with_ui(w, |ui, theme| {
+                let btns = buttons(true, true, true, false, false);
+                let drawn: f32 = visible(&p, &btns)
+                    .iter()
+                    .map(|b| {
+                        (if separator_before(b) {
+                            SEPARATOR_W / 3.0
+                        } else {
+                            0.0
+                        }) + button_width(ui, theme, b, p.density)
+                    })
+                    .sum::<f32>()
+                    + FRAME_PAD_X
+                    + p.filter.unwrap_or(0.0)
+                    + if p.filter.is_some() {
+                        FILTER_CHROME
+                    } else {
+                        0.0
+                    };
+                if p.fits {
+                    assert!(
+                        drawn <= w + 0.5,
+                        "{w}px: the row it chose ({drawn}px) overflows"
+                    );
+                }
+                // A strictly smaller width must never also have been acceptable,
+                // or the stage order is not a total order and the result is not
+                // a fixed point.
+                if let Some(f) = p.filter {
+                    let shrunk = row_width(ui, theme, &btns, p.density, false)
+                        + FILTER_CHROME
+                        + f.min(FILTER_PREF_W);
+                    assert!(
+                        shrunk <= w + 0.5,
+                        "{w}px: it chose a layout that needs {shrunk}px"
+                    );
+                }
+            });
+        }
     }
 
     /// The plan never proposes a density the spec does not define, and never a
