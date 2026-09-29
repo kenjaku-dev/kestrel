@@ -15,21 +15,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The em dash the spec uses for "not applicable".
 ///
 /// §4.2's caveat: `FileEntry::size` for a *directory* is that directory's own
-/// `lstat` length (typically 4096), **not** a recursive total. Printing `4.0 KB`
+/// `lstat` length (typically 4096), **not** a recursive total. Printing `4.0 KiB`
 /// there is a lie, so directories render this instead.
 pub const NOT_APPLICABLE: &str = "\u{2014}";
 
-/// Formats a byte count with a binary-prefix suffix.
+/// Formats a byte count with a **binary** prefix suffix.
 ///
 /// Tabular-figure alignment is the reason for a fixed one-decimal format rather
 /// than egui's stock `{}` on a `String`: the decimal point must land in the same
 /// column on every row or the column stops being scannable.
 ///
-/// Uses 1024-based units, which is what a file manager should show — the OS
-/// reports bytes and users compare against `ls -h`.
+/// # `KiB`, not `KB`
+///
+/// The divisor is 1024, so the honest suffix is `KiB`/`MiB`/… — an SI `KB` is
+/// 1000 bytes, and labelling a 1024-byte count `1.0 KB` states a number that is
+/// 2.4% wrong. IEC names are also what `ls --si` and every modern disk tool
+/// prints, so the column matches what the user sees elsewhere. The alternative
+/// — switching the divisor to 1000 — was rejected: a file manager's job is to
+/// report the size the filesystem actually reports, in the unit the platform
+/// measures in, and a 1000-based "size" disagrees with `stat`, `ls -l` and every
+/// property dialog on the machine.
 #[must_use]
 pub fn bytes(value: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut size = value as f64;
     let mut unit = 0usize;
     while size >= 1024.0 && unit < UNITS.len() - 1 {
@@ -144,13 +152,25 @@ mod tests {
     fn bytes_scales_through_the_units() {
         assert_eq!(bytes(0), "0 B");
         assert_eq!(bytes(999), "999 B");
-        assert_eq!(bytes(1024), "1.0 KB");
-        assert_eq!(bytes(1536), "1.5 KB");
-        assert_eq!(bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
-        assert_eq!(bytes(1024u64.pow(5)), "1.0 PB");
+        // Binary divisors, so the labels are the IEC ones. `1.0 KB` for 1024
+        // bytes would be a 2.4% lie in the one column a user checks.
+        assert_eq!(bytes(1024), "1.0 KiB");
+        assert_eq!(bytes(1536), "1.5 KiB");
+        assert_eq!(bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+        assert_eq!(bytes(1024u64.pow(5)), "1.0 PiB");
         // The largest unit must not be exceeded by an absurd value.
-        assert!(bytes(u64::MAX).ends_with(" PB"));
+        assert!(bytes(u64::MAX).ends_with(" PiB"));
+    }
+
+    #[test]
+    fn a_kibibyte_is_exactly_1024_bytes() {
+        // The reason the suffix is `KiB`: the divisor and the label agree, so a
+        // value can be read back without knowing which convention was used.
+        assert_eq!(bytes(1023), "1023 B");
+        assert_eq!(bytes(1024), "1.0 KiB");
+        assert_eq!(bytes(1025), "1.0 KiB");
+        assert_eq!(bytes(1024 * 1024 - 1), "1024.0 KiB");
     }
 
     #[test]

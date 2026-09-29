@@ -36,90 +36,77 @@ pub fn show(ui: &mut Ui, theme: &mut Theme, mode: &mut ThemeMode) {
                     ui.set_max_width(content_w);
 
                     header(ui, &theme, mode);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before surfaces avail={:.1}", ui.available_width());
-                    }
+                    trace("surfaces", ui);
                     surfaces(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before text avail={:.1}", ui.available_width());
-                    }
+                    trace("text", ui);
                     text(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before borders avail={:.1}", ui.available_width());
-                    }
+                    trace("borders", ui);
                     borders(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before states avail={:.1}", ui.available_width());
-                    }
+                    trace("states", ui);
                     states(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!(
-                            "DBG before accent_and_status avail={:.1}",
-                            ui.available_width()
-                        );
-                    }
+                    trace("accent_and_status", ui);
                     accent_and_status(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before icons avail={:.1}", ui.available_width());
-                    }
+                    trace("icons", ui);
                     icons(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before type_scale avail={:.1}", ui.available_width());
-                    }
+                    trace("type_scale", ui);
                     type_scale(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before sidebar_items avail={:.1}", ui.available_width());
-                    }
+                    trace("sidebar_items", ui);
                     sidebar_items(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before file_rows avail={:.1}", ui.available_width());
-                    }
+                    trace("file_rows", ui);
                     file_rows(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before breadcrumb avail={:.1}", ui.available_width());
-                    }
+                    trace("breadcrumb", ui);
                     breadcrumb(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before toolbar avail={:.1}", ui.available_width());
-                    }
+                    trace("toolbar", ui);
                     toolbar(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before status_bar avail={:.1}", ui.available_width());
-                    }
+                    trace("status_bar", ui);
                     status_bar(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before menu avail={:.1}", ui.available_width());
-                    }
+                    trace("menu", ui);
                     menu(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before dialog avail={:.1}", ui.available_width());
-                    }
+                    trace("dialog", ui);
                     dialog(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!(
-                            "DBG before elevation_overlay avail={:.1}",
-                            ui.available_width()
-                        );
-                    }
+                    trace("elevation_overlay", ui);
                     elevation_overlay(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before inputs avail={:.1}", ui.available_width());
-                    }
+                    trace("inputs", ui);
                     inputs(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!(
-                            "DBG before spacing_radii_motion avail={:.1}",
-                            ui.available_width()
-                        );
-                    }
+                    trace("spacing_radii_motion", ui);
                     spacing_radii_motion(ui, &theme, content_w);
-                    if std::env::var_os("KESTREL_DEBUG_LAYOUT").is_some() {
-                        eprintln!("DBG before provenance avail={:.1}", ui.available_width());
-                    }
+                    trace("provenance", ui);
                     provenance(ui, &theme, content_w);
                 });
         });
 }
+
+/// The env var that turns [`trace`] on.
+///
+/// Named rather than inlined so the release stub below and the debug build
+/// cannot disagree about what the switch is called.
+const DEBUG_LAYOUT_ENV: &str = "KESTREL_DEBUG_LAYOUT";
+
+/// Reports the content `Ui`'s available width at each section boundary.
+///
+/// # The gallery is a layout instrument, and the instrument is dev-only
+///
+/// Each §4 section is a `horizontal` that egui widens to its widest child, so
+/// `available_width()` after a section says how wide that section *painted*,
+/// not how wide the viewport is. That is how the gallery's own width regression
+/// (1200 -> 1564) was found, and it is the reason the widths have to be
+/// threaded through every section as `content_w` rather than re-read.
+///
+/// But an `eprintln!` on the frame path is a defect in a shipped binary: the
+/// output is meaningless to a user, and the branch is a per-frame environment
+/// lookup inside a scroll handler. The variable stays the documented switch and
+/// the dev build keeps the tool; the whole call compiles to a no-op in a release
+/// build, so it cannot ship.
+#[cfg(debug_assertions)]
+fn trace(label: &str, ui: &Ui) {
+    if std::env::var_os(DEBUG_LAYOUT_ENV).is_some() {
+        eprintln!("DBG before {label} avail={:.1}", ui.available_width());
+    }
+}
+
+/// The release stub for [`trace`]. Present so every call site needs no `cfg`.
+#[cfg(not(debug_assertions))]
+fn trace(_label: &str, _ui: &Ui) {}
 
 /// A section heading, and the gallery's width anchor.
 ///
@@ -1042,7 +1029,7 @@ fn status_bar(ui: &mut Ui, theme: &Theme, content_w: f32) {
             y - 14.0,
         ),
         Align2::RIGHT_CENTER,
-        "128 GB free",
+        "128 GiB free",
         tokens::font(component::STATUSBAR_LABEL, theme),
         theme.text.tertiary,
     );

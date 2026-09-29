@@ -209,7 +209,7 @@ impl JobProgress {
         self.finished
     }
 
-    /// The status-bar summary, e.g. `Copy 3 of 9 · 12 items/s · 1.2 MB`.
+    /// The status-bar summary, e.g. `Copy 3 of 9 · 12 items/s · 1.2 MiB`.
     fn summary(&self) -> String {
         let mut parts = vec![job::summary(self.op, self.done, self.total)];
         let rate = job::format_rate(self.done, self.elapsed());
@@ -2365,7 +2365,7 @@ impl KestrelApp {
                 );
                 // "stops at" rather than "reads at most": both numbers are
                 // rounded to one decimal, so a file 4 KiB over the cap formatted
-                // as "1.0 MB — the preview reads at most 1.0 MB", which reads as
+                // as "1.0 MiB — the preview reads at most 1.0 MiB", which reads as
                 // a contradiction. Naming the second number as the *threshold*
                 // keeps the sentence true at every size.
                 ui.label(

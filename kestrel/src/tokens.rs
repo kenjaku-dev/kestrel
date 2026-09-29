@@ -1197,8 +1197,20 @@ impl Theme {
                 panel: Color32::from_rgb(0x19, 0x18, 0x17),  // #191817
                 chrome: Color32::from_rgb(0x13, 0x12, 0x11), // #131211
                 list: Color32::from_rgb(0x1E, 0x1C, 0x1A),   // #1E1C1A
-                raised: n::N800,                             // #24221F
-                input: Color32::from_rgb(0x1E, 0x1C, 0x1A),  // #1E1C1A
+                // `surface.raised` — `neutral.800`, #2B2824.
+                //
+                // §3.1's dark column prints `#24221F` here, which is **not a
+                // value in §2.1's ramp** and is in fact `state.hover`'s value
+                // in §3.4 — the spec contradicts itself two sections apart. The
+                // code keeps `neutral.800`, because a menu or dialog raised on a
+                // hover tint would sit *below* the rows it overlays rather than
+                // above them, and `neutral.800` is the only ramp step that puts
+                // `surface.raised` above both `surface.panel` (#191817) and
+                // `surface.list` (#1E1C1A) while staying distinguishable from
+                // them. The spec is being corrected to `#2B2824` to match; the
+                // value in the code is authoritative and is not changing.
+                raised: n::N800,
+                input: Color32::from_rgb(0x1E, 0x1C, 0x1A), // #1E1C1A
                 input_disabled: Color32::from_rgb(0x19, 0x18, 0x17), // #191817
                 scrim: elevation::scrim(true),
             },
