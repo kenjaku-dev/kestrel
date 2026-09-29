@@ -105,8 +105,11 @@ pub fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>, options: CopyOptions) 
     let cancel = options.cancel.clone().unwrap_or_default();
 
     let metadata = std::fs::symlink_metadata(src).map_err(|e| classify_io(src, e))?;
+    // Before the collision check, and regardless of the policy: `Overwrite` is
+    // an answer to "replace what is at the destination", and the source is not
+    // something the user was ever offered as a thing to replace.
+    guard_against_self_destination(src, dst, metadata.is_dir())?;
     check_collision(dst, options.collision)?;
-    guard_against_self_nesting(src, dst, metadata.is_dir())?;
 
     let mut counter = CopyCounter { cancelled: false };
     copy_recursive(src, dst, &metadata, &options, &cancel, 0, &mut counter)?;
@@ -147,6 +150,21 @@ pub fn move_(
 ) -> Result<()> {
     let (src, dst) = (src.as_ref(), dst.as_ref());
     let metadata = std::fs::symlink_metadata(src).map_err(|e| classify_io(src, e))?;
+    guard_against_self_destination(src, dst, metadata.is_dir())?;
+
+    // `Skip` means the same thing here as it does for `copy`: the destination is
+    // left exactly as it was. It has to be decided *before* either side is
+    // touched, because a move is two operations and "skip" has to mean that
+    // neither of them ran.
+    //
+    // This is the check the rename below would otherwise undo. `fs::rename`
+    // replaces the destination unconditionally, so a `Skip` that let it proceed
+    // overwrote the destination and reported success; and the copy-then-delete
+    // path deleted the source after a copy that had written nothing at all. One
+    // question, one answer, no data loss.
+    if options.collision == Collision::Skip && path_entry_exists(dst) {
+        return Ok(());
+    }
 
     if matches!(strategy, MoveStrategy::Auto) {
         // A rename is atomic and free; always try it first. Pre-checks first so
@@ -163,8 +181,23 @@ pub fn move_(
         check_collision(dst, options.collision)?;
     }
 
-    guard_against_self_nesting(src, dst, metadata.is_dir())?;
-    copy(src, dst, options)?;
+    // The cross-device path. The source is removed only once the destination is
+    // known to exist — never on the strength of a `Result` alone, because a
+    // `Skip` deeper in the tree makes `copy` succeed having written nothing, and
+    // a successful `copy` is not the same claim as "the bytes are there".
+    if !path_entry_exists(dst) {
+        copy(src, dst, options)?;
+        if !path_entry_exists(dst) {
+            return Err(KestrelError::InvalidInput {
+                path: dst.to_path_buf(),
+                reason: format!(
+                    "nothing was copied to {}, so {} was left where it is",
+                    dst.display(),
+                    src.display()
+                ),
+            });
+        }
+    }
     delete_recursive(src, None)?;
     Ok(())
 }
@@ -253,34 +286,75 @@ fn check_collision(dst: &Path, collision: Collision) -> Result<()> {
     if collision != Collision::Fail {
         return Ok(());
     }
-    match std::fs::symlink_metadata(dst) {
-        Ok(_) => Err(KestrelError::AlreadyExists {
+    if path_entry_exists(dst) {
+        return Err(KestrelError::AlreadyExists {
             path: dst.to_path_buf(),
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(classify_io(dst, e)),
+        });
     }
+    Ok(())
 }
 
-/// Rejects `dst` being inside `src`, which for a directory copy means
-/// unbounded growth (`cp -r a a/a`).
-fn guard_against_self_nesting(src: &Path, dst: &Path, src_is_dir: bool) -> Result<()> {
-    if !src_is_dir {
-        return Ok(());
+/// `true` if *something* occupies `path`, **without following a final symlink**.
+///
+/// [`Path::exists`] answers for the *target* of a symlink, so a dangling link
+/// reads as absent. That is the wrong answer wherever the question is really
+/// "is this name taken": a dangling link at the destination occupies the name,
+/// `symlink()` on it fails `EEXIST`, and a collision at the top level is not a
+/// collision. `symlink_metadata` answers for the name itself.
+fn path_entry_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Rejects the two destinations that destroy data instead of producing it.
+///
+/// 1. `src` and `dst` are the same file. `copy_file_contents` opens the source
+///    and *then* creates the destination, so an identical pair truncates the
+///    source to zero bytes; the copy-then-delete move path then removes it
+///    outright. The reachable route is mundane: pasting a file into its own
+///    directory computes `dst = dir.join(file_name)`, which is `src`.
+/// 2. `dst` is inside `src` (a directory copy that would grow without bound).
+///
+/// Both are refused **before** [`check_collision`] and regardless of the
+/// policy. `Collision::Overwrite` is the user's answer to "replace what is at
+/// the destination", and the source was never offered as a thing to replace;
+/// letting the policy decide here is what made the bug invisible.
+///
+/// Symlinks are compared by resolved path, so a `dst` that reaches `src`
+/// *through* a symlink is caught too. That is deliberately the conservative
+/// direction: a link copied over a different link to the same target is refused
+/// rather than recreated, which cannot lose anything.
+fn guard_against_self_destination(src: &Path, dst: &Path, src_is_dir: bool) -> Result<()> {
+    // The lexical test first: it is exact, needs no filesystem round-trip, and
+    // is the case a paste into the file's own directory actually produces.
+    if src == dst {
+        return Err(same_destination_error(src));
     }
-    let src_canon = src.canonicalize().map_err(|e| classify_io(src, e))?;
-    // The destination usually does not exist yet, so canonicalise the deepest
-    // ancestor that does and re-attach the rest.
+    // `dst` usually does not exist yet, so canonicalise the deepest ancestor
+    // that does and re-attach the rest. `src` always exists.
+    let Some(src_canon) = canonicalize_with_missing_tail(src) else {
+        return Ok(());
+    };
     let Some(dst_canon) = canonicalize_with_missing_tail(dst) else {
         return Ok(());
     };
-    if dst_canon != src_canon && dst_canon.starts_with(&src_canon) {
+    if src_canon == dst_canon {
+        return Err(same_destination_error(src));
+    }
+    if src_is_dir && dst_canon.starts_with(&src_canon) {
         return Err(KestrelError::InvalidInput {
             path: dst.to_path_buf(),
             reason: format!("cannot copy {} into its own subdirectory", src.display()),
         });
     }
     Ok(())
+}
+
+/// The error for a destination that is the source.
+fn same_destination_error(src: &Path) -> KestrelError {
+    KestrelError::InvalidInput {
+        path: src.to_path_buf(),
+        reason: "the source and the destination are the same file".to_string(),
+    }
 }
 
 /// Canonicalises as much of `path` as exists, then appends the missing tail.
@@ -337,12 +411,12 @@ fn copy_recursive(
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
-        return copy_symlink(src, dst);
+        return copy_symlink(src, dst, options.collision);
     }
 
     let collision = options.collision;
     if file_type.is_dir() {
-        if dst.exists() && collision == Collision::Skip {
+        if path_entry_exists(dst) && collision == Collision::Skip {
             return Ok(());
         }
         match std::fs::create_dir(dst) {
@@ -367,7 +441,7 @@ fn copy_recursive(
             let child_metadata =
                 std::fs::symlink_metadata(&child).map_err(|e| classify_io(&child, e))?;
             let target = dst.join(child.file_name().unwrap_or(child.as_os_str()));
-            if child_metadata.is_dir() && target.exists() {
+            if child_metadata.is_dir() && path_entry_exists(&target) {
                 check_collision(&target, options.collision)?;
             }
             copy_recursive(
@@ -388,7 +462,7 @@ fn copy_recursive(
         return Ok(());
     }
 
-    if dst.exists() {
+    if path_entry_exists(dst) {
         match collision {
             Collision::Skip => return Ok(()),
             Collision::Fail => {
@@ -436,25 +510,70 @@ fn copy_file_contents(src: &Path, dst: &Path) -> Result<()> {
 /// Copying the *link* rather than its target is what stops a copy of `~/` from
 /// dragging in whatever the link happens to reach, and what keeps cycles
 /// impossible.
+///
+/// The collision policy is honoured here, which needs saying because this
+/// function used to be reached *before* the caller's collision match: a
+/// symlink never consulted the policy at all, and unlinked the destination
+/// unconditionally. Under [`Collision::Skip`] that destroyed the very file the
+/// policy exists to protect.
+///
+/// The link is created under a temporary name and then renamed into place, so
+/// the destination is never in a state where it has been removed but not yet
+/// replaced. Unlink-then-link has a window — a crash, a cancel, another reader
+/// of the tree — in which the link is simply gone.
 #[cfg(unix)]
-fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
-    let target = std::fs::read_link(src).map_err(|e| classify_io(src, e))?;
-    if dst.exists() {
-        // `symlink` refuses an existing path; remove it first so Overwrite works.
-        std::fs::remove_file(dst).map_err(|e| classify_io(dst, e))?;
+fn copy_symlink(src: &Path, dst: &Path, collision: Collision) -> Result<()> {
+    // Consult the policy on the *name*, not on what it points at: a dangling
+    // link occupies the destination even though `Path::exists` says otherwise,
+    // and `symlink` on that name fails `EEXIST`.
+    if path_entry_exists(dst) {
+        match collision {
+            Collision::Skip => return Ok(()),
+            Collision::Fail => {
+                return Err(KestrelError::AlreadyExists {
+                    path: dst.to_path_buf(),
+                });
+            }
+            Collision::Overwrite => {}
+        }
     }
-    std::os::unix::fs::symlink(&target, dst).map_err(|e| classify_io(dst, e))
+
+    let target = std::fs::read_link(src).map_err(|e| classify_io(src, e))?;
+    let temp = temporary_link_name(dst);
+    std::os::unix::fs::symlink(&target, &temp).map_err(|e| classify_io(dst, e))?;
+    // `rename` replaces an existing entry — file, link, or dangling link — in
+    // one step, so `Overwrite` no longer needs the destination destroyed first.
+    if let Err(e) = std::fs::rename(&temp, dst) {
+        // The temporary link is ours and nobody else can want it; leaving it
+        // would be litter in the user's directory.
+        let _ = std::fs::remove_file(&temp);
+        return Err(classify_io(dst, e));
+    }
+    Ok(())
+}
+
+/// A sibling name for [`copy_symlink`]'s create-then-rename step.
+///
+/// In the destination's own directory so the rename stays within one
+/// filesystem, and prefixed so it cannot collide with a name the user made.
+#[cfg(unix)]
+fn temporary_link_name(dst: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".kestrel-link-");
+    if let Some(stem) = dst.file_name() {
+        name.push(stem);
+    }
+    dst.with_file_name(name)
 }
 
 /// On platforms without a stable symlink-creation API in `std`, copying a link
 /// copies what it points at. Slightly different semantics, documented in the
 /// module docs.
 #[cfg(not(unix))]
-fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
+fn copy_symlink(src: &Path, dst: &Path, collision: Collision) -> Result<()> {
     let metadata = std::fs::metadata(src).map_err(|e| classify_io(src, e))?;
     let counter = &mut CopyCounter { cancelled: false };
     let options = CopyOptions {
-        collision: Collision::Overwrite,
+        collision,
         preserve_permissions: false,
         cancel: None,
     };
@@ -759,5 +878,345 @@ mod tests {
         assert!(!is_cross_device(&std::io::Error::from(
             std::io::ErrorKind::PermissionDenied
         )));
+    }
+    #[test]
+    fn copying_a_file_onto_itself_is_refused() {
+        for collision in [Collision::Fail, Collision::Overwrite] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let src = tmp.path().join("a.txt");
+            fs::write(&src, b"precious").expect("write");
+
+            let err = copy(
+                &src,
+                &src,
+                CopyOptions {
+                    collision,
+                    ..CopyOptions::default()
+                },
+            )
+            .expect_err("a file cannot be copied onto itself");
+            assert!(
+                matches!(err, KestrelError::InvalidInput { .. }),
+                "got {err}"
+            );
+            assert_eq!(
+                fs::read(&src).expect("read"),
+                b"precious",
+                "the source must survive {collision:?}"
+            );
+        }
+    }
+
+    /// The same refusal for a move, across both strategies: `Auto` reaches
+    /// `rename` and `CopyThenDelete` reaches the copy-then-delete path, and the
+    /// second one used to destroy the file outright.
+    #[test]
+    fn moving_a_file_onto_itself_is_refused() {
+        for collision in [Collision::Fail, Collision::Overwrite] {
+            for strategy in [MoveStrategy::Auto, MoveStrategy::CopyThenDelete] {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let src = tmp.path().join("a.txt");
+                fs::write(&src, b"precious").expect("write");
+
+                let err = move_(
+                    &src,
+                    &src,
+                    CopyOptions {
+                        collision,
+                        ..CopyOptions::default()
+                    },
+                    strategy,
+                )
+                .expect_err("a file cannot be moved onto itself");
+                assert!(
+                    matches!(err, KestrelError::InvalidInput { .. }),
+                    "got {err}"
+                );
+                assert_eq!(
+                    fs::read(&src).expect("read"),
+                    b"precious",
+                    "the source must survive {collision:?}/{strategy:?}"
+                );
+            }
+        }
+    }
+
+    /// A directory onto itself is the same bug one level down: the engine
+    /// "merged" the tree into itself and truncated every file it found. Into a
+    /// descendant is the `cp -r a a/a` case, which the existing guard covers —
+    /// both are asserted here together, under both policies, because the guard
+    /// is a precondition and a precondition cannot depend on the policy.
+    #[test]
+    fn a_directory_is_never_copied_into_itself_or_a_descendant() {
+        for collision in [Collision::Fail, Collision::Overwrite] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let src = tmp.path().join("src");
+            fs::create_dir_all(src.join("inner")).expect("mkdir");
+            fs::write(src.join("a.txt"), b"precious").expect("write");
+
+            for dst in [src.clone(), src.join("inner/src")] {
+                let err = copy(
+                    &src,
+                    &dst,
+                    CopyOptions {
+                        collision,
+                        ..CopyOptions::default()
+                    },
+                )
+                .expect_err("a directory cannot be copied into itself");
+                assert!(
+                    matches!(err, KestrelError::InvalidInput { .. }),
+                    "got {err}"
+                );
+            }
+            assert_eq!(
+                fs::read(src.join("a.txt")).expect("read"),
+                b"precious",
+                "the tree must survive {collision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn move_with_skip_leaves_both_source_and_destination() {
+        for strategy in [MoveStrategy::Auto, MoveStrategy::CopyThenDelete] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let src = tmp.path().join("src");
+            let dst = tmp.path().join("dst");
+            fs::create_dir_all(src.join("sub")).expect("mkdir");
+            fs::write(src.join("a.txt"), b"new").expect("write");
+            fs::write(src.join("sub/b.txt"), b"new").expect("write");
+            fs::create_dir_all(&dst).expect("mkdir");
+            fs::write(dst.join("a.txt"), b"old").expect("write");
+
+            move_(
+                &src,
+                &dst,
+                CopyOptions {
+                    collision: Collision::Skip,
+                    ..CopyOptions::default()
+                },
+                strategy,
+            )
+            .expect("skip is a valid answer, not an error");
+
+            assert_eq!(
+                fs::read(dst.join("a.txt")).expect("read"),
+                b"old",
+                "the destination must be untouched ({strategy:?})"
+            );
+            assert!(
+                src.exists(),
+                "a skipped move must not delete the source ({strategy:?})"
+            );
+            assert_eq!(
+                fs::read(src.join("a.txt")).expect("read"),
+                b"new",
+                "the source must be intact ({strategy:?})"
+            );
+            assert_eq!(
+                fs::read(src.join("sub/b.txt")).expect("read"),
+                b"new",
+                "the whole source tree must be intact ({strategy:?})"
+            );
+        }
+    }
+
+    /// The cross-device path is where the destruction happened: the copy
+    /// returned early having written nothing, and the source was deleted
+    /// anyway. This drives that fallback directly, because a single-filesystem
+    /// test box cannot produce a real `EXDEV`.
+    #[test]
+    fn move_across_devices_with_skip_does_not_delete_the_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(src.join("sub")).expect("mkdir");
+        fs::write(src.join("a.txt"), b"new").expect("write");
+        fs::write(src.join("sub/b.txt"), b"new").expect("write");
+        fs::create_dir_all(&dst).expect("mkdir");
+        fs::write(dst.join("a.txt"), b"old").expect("write");
+
+        move_(
+            &src,
+            &dst,
+            CopyOptions {
+                collision: Collision::Skip,
+                ..CopyOptions::default()
+            },
+            MoveStrategy::CopyThenDelete,
+        )
+        .expect("skip");
+
+        assert!(
+            src.join("sub/b.txt").exists(),
+            "the source must survive a skipped cross-device move"
+        );
+        assert_eq!(fs::read(dst.join("a.txt")).expect("read"), b"old");
+    }
+
+    /// A dangling link at the destination occupies the name, and `Skip` has to
+    /// respect that. `Path::exists` follows the link and reports `false`, so
+    /// this is the case that used to reach `symlink()` and fail `EEXIST` — or,
+    /// worse, unlink the destination on the way.
+    #[test]
+    #[cfg(unix)]
+    fn a_dangling_link_at_the_destination_is_still_a_collision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target.txt");
+        fs::write(&target, b"payload").expect("write");
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        let dst = tmp.path().join("dst.txt");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &dst).expect("dangling");
+
+        copy(
+            &link,
+            &dst,
+            CopyOptions {
+                collision: Collision::Skip,
+                ..CopyOptions::default()
+            },
+        )
+        .expect("skip");
+        assert!(
+            fs::symlink_metadata(&dst)
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "the existing link must still be a link"
+        );
+        assert_eq!(
+            fs::read_link(&dst).expect("readlink"),
+            tmp.path().join("gone"),
+            "Skip must leave the destination link alone"
+        );
+    }
+
+    /// A symlink at the top of a copy must consult the collision policy like
+    /// any other file.
+    ///
+    /// `copy_recursive` returns to `copy_symlink` *before* the caller's
+    /// collision match, so the link never saw the policy and unlinked the
+    /// destination unconditionally — including under [`Collision::Skip`], whose
+    /// entire purpose is to leave the destination alone. The destination here
+    /// is a real file with real bytes, and the assertion is that it is still
+    /// there.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_copy_obeys_the_collision_policy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("t.txt");
+        fs::write(&target, b"payload").expect("write");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        let dst = tmp.path().join("dst");
+        fs::write(&dst, b"in the way").expect("write");
+
+        copy(
+            &link,
+            &dst,
+            CopyOptions {
+                collision: Collision::Skip,
+                ..CopyOptions::default()
+            },
+        )
+        .expect("skip");
+        assert_eq!(
+            fs::read(&dst).expect("read"),
+            b"in the way",
+            "Skip must not remove the destination of a symlink copy"
+        );
+        assert!(
+            !fs::symlink_metadata(&dst)
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "Skip must not have replaced the destination with a link"
+        );
+
+        // `Overwrite` is the answer that *does* replace the destination — and it
+        // must still work, now via create-then-rename.
+        copy(
+            &link,
+            &dst,
+            CopyOptions {
+                collision: Collision::Overwrite,
+                ..CopyOptions::default()
+            },
+        )
+        .expect("overwrite");
+        assert!(
+            fs::symlink_metadata(&dst)
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "Overwrite must replace the file with a link"
+        );
+        assert_eq!(fs::read(&dst).expect("read"), b"payload");
+
+        let leftovers: Vec<String> = fs::read_dir(tmp.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".kestrel-link-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the create-then-rename step left litter behind: {leftovers:?}"
+        );
+    }
+
+    /// A symlink *inside* a copied tree, replacing a colliding file.
+    ///
+    /// Note what this does and does not cover. `Skip` on a colliding symlink
+    /// child is unreachable: `copy_recursive` skips a whole pre-existing
+    /// directory subtree before it reaches any child, so the only way a child
+    /// link meets an occupied name is `Overwrite`. That is what this asserts.
+    /// The `Skip` data-loss case is
+    /// [`a_symlink_copy_obeys_the_collision_policy`], where the link is the
+    /// root of the copy and no directory sits above it.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_child_overwrites_its_colliding_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(src.join("sub")).expect("mkdir");
+        fs::write(tmp.path().join("t.txt"), b"payload").expect("write");
+        std::os::unix::fs::symlink(tmp.path().join("t.txt"), src.join("sub/l")).expect("link");
+        fs::create_dir_all(dst.join("sub")).expect("mkdir");
+        fs::write(dst.join("sub/l"), b"in the way").expect("write");
+
+        copy(
+            &src,
+            &dst,
+            CopyOptions {
+                collision: Collision::Overwrite,
+                ..CopyOptions::default()
+            },
+        )
+        .expect("overwrite");
+        assert!(
+            fs::symlink_metadata(dst.join("sub/l"))
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "Overwrite must replace the file with a link"
+        );
+        assert_eq!(fs::read(dst.join("sub/l")).expect("read"), b"payload");
+
+        // The create-then-rename step must not leave a temporary link behind,
+        // here or in the directory the link was created in.
+        let leftovers: Vec<String> = fs::read_dir(dst.join("sub"))
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".kestrel-link-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the create-then-rename step left litter behind: {leftovers:?}"
+        );
     }
 }
