@@ -272,14 +272,30 @@ impl Kind {
                 dst,
                 remaining,
             } => {
+                // `format::plural` already appends the noun, so the count is
+                // rendered bare and the noun written here. Passing the noun
+                // twice produced "(3 names more names left in this job.)",
+                // which is the kind of sentence a reconstructed module writes
+                // and nobody catches until it is rendered.
                 let scope = match remaining {
                     1 => "1 more name".to_string(),
-                    n => format!("{} more names", plural(*n, "name", "names")),
+                    n => format!("{} more names", grouped(*n)),
+                };
+                // When the two files have the same name — the ordinary case,
+                // because a collision is usually a copy into a directory that
+                // already holds it — quoting both names reads as a tautology:
+                // "report.txt already exists at report.txt." The destination then
+                // gets its **path**, which is the thing that actually differs and
+                // the thing the user has to decide about.
+                let src_name = display_name(src);
+                let dst_name = if display_name(dst) == src_name {
+                    dst.display().to_string()
+                } else {
+                    display_name(dst)
                 };
                 format!(
-                    "{} already exists at {}. Replace it? ({scope} left in this job.)",
-                    display_name(src),
-                    display_name(dst)
+                    "{src_name} already exists at {dst_name}. Replace it? \
+                     ({scope} left in this job.)"
                 )
             }
             Self::Failed { op, reason, .. } => {
@@ -295,11 +311,10 @@ impl Kind {
                 current,
                 ..
             } => {
-                let counts = format!(
-                    "{} of {}",
-                    plural(*done, "item", "items"),
-                    plural(*total, "item", "items")
-                );
+                // "7 of 24 items", not "7 items of 24 items". The noun belongs to
+                // the total only: both numbers count the same things, so saying
+                // it twice is not emphasis, it is a sentence with two subjects.
+                let counts = format!("{} of {}", grouped(*done), plural(*total, "item", "items"));
                 if rate.is_empty() {
                     format!("{counts} — {}", display_name(current))
                 } else {
@@ -468,6 +483,14 @@ fn reversible_sentence(op: Op, count: usize) -> String {
 /// arms.
 fn plural(count: usize, singular: &'static str, plural: &'static str) -> String {
     format::plural(count, singular, plural)
+}
+
+/// `count` on its own, thousands-separated.
+///
+/// For a sentence that supplies its own noun — "3 more names", where the noun
+/// is part of the phrase and not a plural of anything the count decides.
+fn grouped(count: usize) -> String {
+    format::plural(count, "", "").trim().to_string()
 }
 
 /// The last path component, for a sentence.
@@ -1219,6 +1242,143 @@ mod tests {
         };
         assert_ne!(failed.icon(), icons::WARNING, "a failure is not a warning");
         assert_eq!(failed.icon(), icons::X_CIRCLE);
+    }
+
+    /// Every sentence a dialog can say, rendered. The wording is the §4.7 copy
+    /// rule, and a copy rule that is only ever asserted by substring is a copy
+    /// rule nobody reads.
+    ///
+    /// It exists because the strings were **reconstructed**, not recovered: a
+    /// sentence that reads "7 items of 24 items" or "(3 names more names left in
+    /// this job.)" is grammatical enough to compile and wrong enough that only
+    /// looking at it catches it. Printed whole, the awkwardness is obvious.
+    #[test]
+    fn every_sentence_reads_as_a_sentence() {
+        let shown: Vec<String> = [
+            trash().body(),
+            delete().body(),
+            Kind::Collision {
+                src: PathBuf::from("/home/a/report.txt"),
+                dst: PathBuf::from("/home/b/report.txt"),
+                remaining: 1,
+            }
+            .body(),
+            Kind::Collision {
+                src: PathBuf::from("/home/a/report.txt"),
+                dst: PathBuf::from("/home/b/report.txt"),
+                remaining: 3,
+            }
+            .body(),
+            Kind::Failed {
+                op: Op::Move,
+                path: PathBuf::from("/home/a/locked"),
+                reason: "Permission denied (os error 13)".to_string(),
+            }
+            .body(),
+            Kind::Progress {
+                op: Op::Copy,
+                done: 7,
+                total: 24,
+                bytes: 0,
+                total_bytes: None,
+                current: PathBuf::from("/home/a/assets"),
+                rate: "12 items/s".to_string(),
+            }
+            .body(),
+            Kind::Progress {
+                op: Op::Copy,
+                done: 0,
+                total: 1,
+                bytes: 0,
+                total_bytes: None,
+                current: PathBuf::from("/home/a/one.txt"),
+                rate: String::new(),
+            }
+            .body(),
+        ]
+        .into_iter()
+        .collect();
+
+        for sentence in &shown {
+            // No doubled noun: "3 names more names", "7 items of 24 items".
+            for word in ["items", "names", "item", "name"] {
+                let count = sentence.split_whitespace().filter(|w| *w == word).count();
+                assert!(count <= 1, "a sentence says {word:?} twice: {sentence:?}");
+            }
+            // No doubled phrase: the reconstructed copy said the consequence
+            // twice, once in the sentence and once in the line under it.
+            assert!(
+                sentence.matches("cannot be undone").count() <= 1,
+                "the consequence is stated twice: {sentence:?}"
+            );
+            // No space before punctuation and no doubled space: the two
+            // typographic tells that a string was assembled rather than
+            // written. (Terminal punctuation is deliberately *not* asserted: a
+            // sentence can end in a filename, an OS error string or a throughput
+            // figure, none of which this module gets to punctuate. The exact
+            // strings below are what pin the endings.)
+            assert!(
+                !sentence.contains(" ."),
+                "space before a full stop: {sentence:?}"
+            );
+            assert!(
+                !sentence.contains(", "),
+                "space before a comma: {sentence:?}"
+            );
+            assert!(!sentence.contains("  "), "a doubled space: {sentence:?}");
+        }
+
+        assert_eq!(
+            shown[0],
+            "Move 3 items to the Trash. You can restore them later."
+        );
+        assert_eq!(
+            shown[1],
+            "Permanently delete 3 items. This cannot be undone."
+        );
+        assert_eq!(
+            shown[2],
+            "report.txt already exists at /home/b/report.txt. Replace it? (1 more \
+             name left in this job.)"
+        );
+        assert_eq!(
+            shown[3],
+            "report.txt already exists at /home/b/report.txt. Replace it? (3 more \
+             names left in this job.)"
+        );
+        assert_eq!(
+            shown[4],
+            "Move could not finish. Permission denied (os error 13)"
+        );
+        assert_eq!(shown[5], "7 of 24 items — assets — 12 items/s");
+        assert_eq!(shown[6], "0 of 1 item — one.txt");
+    }
+
+    /// Two files with different names are named by name; two with the same name
+    /// get the destination's path, because "x already exists at x" is a sentence
+    /// that says nothing.
+    #[test]
+    fn a_collision_names_the_destination_usefully() {
+        let same = Kind::Collision {
+            src: PathBuf::from("/home/a/report.txt"),
+            dst: PathBuf::from("/home/b/report.txt"),
+            remaining: 1,
+        };
+        assert!(
+            same.body().contains("at /home/b/report.txt"),
+            "{}",
+            same.body()
+        );
+        let different = Kind::Collision {
+            src: PathBuf::from("/home/a/report.txt"),
+            dst: PathBuf::from("/home/b/report (1).txt"),
+            remaining: 1,
+        };
+        assert!(
+            different.body().contains("at report (1).txt"),
+            "a differently-named destination does not need its whole path: {}",
+            different.body()
+        );
     }
 
     /// A root directory has no file name; the sentence must not say `""`.

@@ -66,6 +66,20 @@ const PASSES: usize = 3;
 /// instead of hanging the review.
 const SETTLE_BUDGET_MS: u64 = 5_000;
 
+/// Where the capture's synthetic clock starts, in seconds.
+///
+/// Arbitrary but *late*: long enough to be past the longest animation the app
+/// has (the 380ms §2.11 `motion.deliberate`), so a capture is the settled frame
+/// and never a frame caught mid-fade. See [`run_frame`].
+const CAPTURE_TIME_BASE: f64 = 10.0;
+
+/// How far the capture's clock advances per frame, in seconds.
+///
+/// 50ms: long enough that the settling loop gets past every animation in a few
+/// frames, short enough that fifty of them is 2.5s of virtual time for a run
+/// that takes a few hundred milliseconds of real time.
+const CAPTURE_STEP: f64 = 0.05;
+
 /// Renders the app and writes a PNG to `path`.
 ///
 /// # Errors
@@ -131,18 +145,23 @@ pub fn render(opts: Options, scene: Scene, size: Option<Vec2>) -> std::io::Resul
     // once the scan has delivered. Applying the scene before the listing arrives
     // would silently select nothing — and a capture that quietly reviews the
     // wrong state is worse than one that fails.
-    if !settle_until(&ctx, &mut app, size, &mut textures, |a| a.is_listed()) {
+    let mut clock = CAPTURE_TIME_BASE;
+    if !settle_until(&ctx, &mut app, size, &mut textures, &mut clock, |a| {
+        a.is_listed()
+    }) {
         return Err(timed_out(scene, "the listing"));
     }
     if scene != Scene::Browser {
         app.apply_scene(scene);
     }
-    if !settle_until(&ctx, &mut app, size, &mut textures, |a| a.is_settled()) {
+    if !settle_until(&ctx, &mut app, size, &mut textures, &mut clock, |a| {
+        a.is_settled()
+    }) {
         return Err(timed_out(scene, "the scene"));
     }
 
     for _ in 0..PASSES {
-        let mut output = run_frame(&ctx, &mut app, size);
+        let mut output = run_frame(&ctx, &mut app, size, &mut clock);
         textures.absorb(&output.textures_delta);
         let shapes = std::mem::take(&mut output.shapes);
         let ppp = output.pixels_per_point;
@@ -158,9 +177,31 @@ pub fn render(opts: Options, scene: Scene, size: Option<Vec2>) -> std::io::Resul
 }
 
 /// One frame of the app, with the input a capture always supplies.
-fn run_frame(ctx: &Context, app: &mut KestrelApp, size: Vec2) -> egui::FullOutput {
+///
+/// `clock` advances by a fixed step per frame rather than tracking the wall
+/// clock, so the capture is reproducible *and* animations are settled. See
+/// [`CAPTURE_TIME_BASE`].
+fn run_frame(ctx: &Context, app: &mut KestrelApp, size: Vec2, clock: &mut f64) -> egui::FullOutput {
+    let now = *clock;
+    *clock += CAPTURE_STEP;
     let raw = egui::RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+        // §4.7 gives a dialog a 140ms enter animation and a 260ms scrim fade,
+        // and egui's `Area` fades whatever it owns. A capture is three frames
+        // drawn in microseconds, so with the clock at zero every dialog rendered
+        // at roughly a tenth of its opacity — the fill measured 232 where
+        // `surface.raised` is 255, and the scrim measured 209 where the spec's
+        // 38% over the list is 165. Every colour anyone reviewed in a dialog
+        // capture was wrong, and it looked like a theming problem rather than a
+        // timing one.
+        //
+        // A *constant* clock is the other half of the bug and just as
+        // confusing: egui computes a fade as `time - last_became_visible_at`,
+        // and an `Area` stamps that on the frame it first appears — so a clock
+        // that never moves leaves every dialog pinned at zero opacity for ever.
+        // The clock therefore has to move, and it moves by a fixed step from a
+        // base past every animation the app has. Deterministic, and settled.
+        time: Some(now),
         // No `pixels_per_point` override: egui 0.36's `RawInput` has no such
         // field — the scale comes from `Context::pixels_per_point`, which
         // defaults to 1.0 for a `Context::default()`. That is exactly what
@@ -183,11 +224,12 @@ fn settle_until(
     app: &mut KestrelApp,
     size: Vec2,
     textures: &mut TextureBook,
+    clock: &mut f64,
     ready: impl Fn(&KestrelApp) -> bool,
 ) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(SETTLE_BUDGET_MS);
     loop {
-        let output = run_frame(ctx, app, size);
+        let output = run_frame(ctx, app, size, clock);
         // The texture book is shared with the drawing passes, and it has to be:
         // the font atlas is *built* by the frames that lay the UI out, and it is
         // delivered one frame late. Discarding the settling frames' deltas
@@ -821,6 +863,59 @@ mod tests {
         }
     }
 
+    /// A dialog renders at full opacity, and only one scrim is painted.
+    ///
+    /// Two separate bugs, both invisible in a screenshot a person is *looking*
+    /// at rather than measuring, and both of which made every colour in every
+    /// dialog review wrong:
+    ///
+    /// * the app painted `ui.max_rect()` as a scrim **and** left `egui::Modal`'s
+    ///   own default backdrop in place, so the window was darkened twice (0.62 ×
+    ///   0.61 ≈ 0.38 of the original) — and the hand-painted rect was the *list*
+    ///   rectangle, so it never covered the toolbar or the status bar anyway;
+    /// * a capture drew three frames in microseconds with the clock at zero, and
+    ///   `egui::Area` fades what it owns, so the dialog itself rendered at about
+    ///   a tenth of its opacity. `surface.raised` in light is white; it measured
+    ///   232.
+    ///
+    /// So: the dialog's own fill must be `surface.raised`, and the surface behind
+    /// it must be the spec's scrim over the list — which is darker than the raw
+    /// list and lighter than a doubly-scrimmed one.
+    #[test]
+    fn a_dialog_renders_at_full_opacity_over_one_scrim() {
+        let image = render(
+            app::Options {
+                theme: crate::tokens::ThemeMode::Light,
+                ..app::Options::default()
+            },
+            Scene::ConfirmPermanent,
+            Some(BROWSER_SIZE),
+        )
+        .expect("render");
+        let w = image.width();
+        let h = image.height();
+        let px = |x: usize, y: usize| {
+            let p = image.pixels[y * w + x];
+            (p.r(), p.g(), p.b())
+        };
+        // `surface.raised`, light: `#FFFFFF`. The rasteriser's bilinear tap of
+        // `WHITE_UV` costs a few levels on a large flat fill, hence the slack.
+        let dialog = px(w / 2, h / 2 - 20);
+        assert!(
+            dialog.0 > 245 && dialog.1 > 245 && dialog.2 > 245,
+            "the dialog's own surface is {dialog:?}, not `surface.raised` — the \
+             dialog is being drawn at less than full opacity"
+        );
+        // The scrim over the list: §3.1's `#1C1A17` at 38%, so roughly 0.62 of
+        // `surface.list` (`#FCFBF9`) plus a little premultiplied ink.
+        let behind = px(w / 2 - 300, h / 2);
+        assert!(
+            (150..200).contains(&behind.0),
+            "the surface behind the dialog is {behind:?}, which is not `surface.scrim` \
+             over `surface.list`"
+        );
+    }
+
     /// The list must never draw into the preview pane.
     ///
     /// The reported defect was the `Modified` column being clipped at the pane's
@@ -973,15 +1068,28 @@ mod tests {
             },
         );
         let mut textures = TextureBook::default();
+        let mut clock = CAPTURE_TIME_BASE;
         assert!(
-            settle_until(&ctx, &mut app, BROWSER_SIZE, &mut textures, |a| a
-                .is_listed()),
+            settle_until(
+                &ctx,
+                &mut app,
+                BROWSER_SIZE,
+                &mut textures,
+                &mut clock,
+                |a| a.is_listed(),
+            ),
             "the fixture listing never arrived"
         );
         app.apply_scene(Scene::PreviewText);
         assert!(
-            settle_until(&ctx, &mut app, BROWSER_SIZE, &mut textures, |a| a
-                .is_settled()),
+            settle_until(
+                &ctx,
+                &mut app,
+                BROWSER_SIZE,
+                &mut textures,
+                &mut clock,
+                |a| a.is_settled(),
+            ),
             "the preview scene never settled"
         );
         assert!(

@@ -1714,6 +1714,16 @@ pub mod component {
     pub const DIALOG_BTN_PADDING_X: f32 = 14.0;
     /// `dialog.btn-radius`
     pub const DIALOG_BTN_RADIUS: f32 = radius::MD;
+    /// `dialog.btn-label` — `type.ui`, **500**.
+    ///
+    /// The spec writes the size from one token and the weight from another:
+    /// `type.ui` is 13px/400 and this row says 500. `ty::UI_STRONG` is 13px/500,
+    /// so it is the token that matches the row exactly — a 13px label at 400 is
+    /// a label at the wrong *weight* rather than the right one, and the fill and
+    /// the text end up disagreeing about which button is the one. Named here
+    /// because the button was reaching for a bare `ty::UI`, which is the layer
+    /// rule's failure mode: a §4 component value with no §4 component token.
+    pub const DIALOG_BTN_LABEL: TypeToken = ty::UI_STRONG;
     /// Gallery-only: the block the §4.7 dialog is drawn inside, scrim included.
     /// Not a spec value — a layout convenience so the gallery can allocate one
     /// rectangle instead of nesting five `allocate_ui` calls.
@@ -2210,6 +2220,20 @@ pub mod fonts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn probe_theme() {
+        for (name, t) in [("dark", Theme::dark()), ("light", Theme::light())] {
+            eprintln!(
+                "PROBE {name} raised={:?} scrim={:?} hover={:?} app={:?} strong={:?}",
+                t.surfaces.raised.to_array(),
+                t.surfaces.scrim.to_array(),
+                t.state.hover.to_array(),
+                t.surfaces.app.to_array(),
+                t.borders.strong.to_array(),
+            );
+        }
+    }
+
     #[test]
     fn probe_glyphs() {
         let ctx = crate::shot::ctx_with_fonts();

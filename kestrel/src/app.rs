@@ -1849,12 +1849,6 @@ impl KestrelApp {
             return;
         };
         let theme = self.theme;
-        // A scrim over everything, and it eats clicks: `Modal` does the latter,
-        // this rect does the former.
-        let full = ui.max_rect();
-        ui.painter()
-            .rect_filled(full, radius::all(radius::NONE), dialog::scrim(&theme));
-
         let buttons = dialog::buttons_for(&kind);
         // Keep the focus index inside the button list: the list changes shape
         // between dialog kinds, and a stale index would index out of bounds.
@@ -1876,8 +1870,20 @@ impl KestrelApp {
         let focused_button = buttons[self.modal_focus];
 
         let mut clicked: Option<DlgButton> = None;
+        // `dialog.scrim` is `egui::Modal`'s **backdrop colour**, which is the
+        // one thing that draws it — not a second rect painted here.
+        //
+        // The previous version painted `ui.max_rect()` itself and left
+        // `Modal`'s own default backdrop in place, so the window behind the
+        // dialog was darkened *twice* (38% + 39%: 0.62 x 0.61 = 0.38 of the
+        // original, against the 0.62 the spec asks for), and the painted rect
+        // was the *list* rectangle rather than the window, so it did not even
+        // cover the toolbar and the status bar. `Modal`'s backdrop covers
+        // `ctx.content_rect()`, which is what "a scrim over everything" means,
+        // and it also eats the clicks — the hand-painted rect never did.
         egui::Modal::new(egui::Id::new("kestrel-dialog"))
             .frame(egui::Frame::NONE)
+            .backdrop_color(dialog::scrim(&theme))
             .show(ui.ctx(), |ui| {
                 // The area's own top-left, and a *finite* height. An infinite
                 // one is the obvious way to say "as tall as it needs", and egui
@@ -2047,7 +2053,10 @@ impl KestrelApp {
     /// One dialog button, with `dialog.btn-focus-ring` on the focused one.
     fn dialog_button(&self, ui: &mut Ui, b: DlgButton, focused: bool, op: job::Op) -> bool {
         let theme = self.theme;
-        let font = tokens::font(ty::UI, &theme);
+        // §4.7 `dialog.btn-label` is "`type.ui`, **500**" — see
+        // `component::DIALOG_BTN_LABEL` for why that is `ty::UI_STRONG` and not
+        // `ty::UI`.
+        let font = tokens::font(component::DIALOG_BTN_LABEL, &theme);
         let text_w = crate::widgets::text_width(ui, b.label(), font.clone());
         // `dialog.btn-padding-x` on each side, from the token, not from a
         // multiple of the height: 14 x 2 is 28, and `BTN_HEIGHT * 0.9` was 27.
