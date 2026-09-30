@@ -50,6 +50,68 @@ body {
   white-space: nowrap;
 }
 
+/* Breadcrumb: buttons with margins (no flex gap); current segment is text. */
+#crumbs {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.k-crumb {
+  font: inherit;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: #0b5cc0;
+  text-decoration: underline;
+}
+
+.k-crumb.is-current {
+  color: #1a1a1a;
+  text-decoration: none;
+  cursor: default;
+}
+
+.k-sep {
+  color: #999;
+  margin: 0 2px;
+}
+
+/* Filter / sort controls: margins instead of flex gap for WebKitGTK. */
+#filter {
+  font: inherit;
+  font-size: 13px;
+  width: 160px;
+  margin-left: 8px;
+  padding: 2px 6px;
+}
+
+#sort-key {
+  font: inherit;
+  font-size: 13px;
+  margin-left: 8px;
+  padding: 2px 4px;
+}
+
+#sort-dir {
+  font: inherit;
+  margin-left: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+#hidden-wrap {
+  font-size: 13px;
+  margin-left: 8px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
 /* Viewport: the scroll container. Fixed height via flex; rows windowed. */
 #viewport {
   position: relative;

@@ -52,7 +52,33 @@ export type ScanEventDto =
 
 export interface ScanOptionsDto {
   recursive: boolean;
+  /** Emit dotfiles. Backend default `true`; the UI default matches. */
+  showHidden?: boolean;
+  /** Sort order, or `null`/`undefined` for readdir order. Backend default:
+   *  engine default (name, ascending, dirs first). */
+  sort?: SortSpecDto | null;
 }
+
+/** Sort column as the backend expects it (lowercase wire form). */
+export type SortKeyDto = "name" | "size" | "modified" | "kind";
+
+/** Full sort spec. Mirrors `SortSpecDto` (dto.rs): camelCase `dirsFirst`. */
+export interface SortSpecDto {
+  key: SortKeyDto;
+  ascending: boolean;
+  dirsFirst: boolean;
+}
+
+/** Default sort: name, ascending, directories first. Survives every toggle. */
+export function defaultSort(): SortSpecDto {
+  return { key: "name", ascending: true, dirsFirst: true };
+}
+
+/** Watch event over the `watch_subscribe` channel (frozen contract,
+ * internally tagged with "type", like ScanEventDto). */
+export type WatchEventDto =
+  | { type: "changed"; dirs: string[] }
+  | { type: "error"; error: CmdError };
 
 export type JobId = number; // u64 on the Rust side; always backend-minted
 

@@ -1,4 +1,6 @@
 //! Phase 1 IPC commands: `scan_start`, `scan_cancel`, `stat`, `open_path`.
+//! Phase 2 adds `watch_subscribe` / `watch_unsubscribe` (live directory
+//! watching over the one shared `DirWatcher`).
 //!
 //! Final signatures (Tauri-injected `AppHandle` / `State` params are invisible
 //! to JS; the JS-visible contract is the remaining params, all camelCase):
@@ -8,10 +10,15 @@
 //! scan_cancel(id: number): Promise<void>
 //! stat(path: string): Promise<FileEntryDto>
 //! open_path(path: string): Promise<{ enteredDir: boolean }>
+//! watch_subscribe(path: string, events: Channel<WatchEventDto>): Promise<number>
+//! watch_unsubscribe(id: number): Promise<void>
 //! ```
 //!
 //! No blocking `list_dir`: the streaming `scan_start` with
 //! `recursive: false` **is** the listing, so the two UIs share one code path.
+//! A `changed` watch event carries the stale directories and the frontend
+//! answers by re-running `scan_start` for the directory it is viewing —
+//! deliberately no incremental patching, for the same one-code-path reason.
 //!
 //! ## Backpressure (load-bearing)
 //!
@@ -22,18 +29,28 @@
 //! `Channel::send`, whose error the pump deliberately ignores. The engine can
 //! never see a failed send until `scan_cancel`/completion drops the handle,
 //! which is the intentional cancel — never a busy frontend.
+//!
+//! The watch relay is the same posture with the roles shifted: the engine
+//! talks `mpsc` to the relay's receiver (broadcast to every subscriber), and
+//! the relay drains that receiver with `recv_timeout` and forwards to the
+//! `Channel`, discarding `Channel::send` results. A slow or absent frontend
+//! therefore never stops the shared watcher and never spins the relay — the
+//! relay idles in `recv_timeout` until the next engine event or cancel.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use kestrel_fs::error::classify_io;
-use kestrel_fs::model::FileEntry;
+use kestrel_fs::model::{CancellationToken, FileEntry};
 use kestrel_fs::scan::{self, ScanEvent, ScanHandle};
+use kestrel_fs::watcher::{ChangeSet, WatchEvent};
 use tauri::{AppHandle, Manager, Runtime, async_runtime, ipc::Channel};
 
-use crate::dto::{CmdError, FileEntryDto, OpenResultDto, ScanEventDto, ScanOptionsDto};
-use crate::state::{Backend, JobId};
+use crate::dto::{
+    CmdError, FileEntryDto, OpenResultDto, ScanEventDto, ScanOptionsDto, WatchEventDto,
+};
+use crate::state::{Backend, JobId, WatchRelay};
 
 /// How long one pump iteration waits for the next engine event. Short enough
 /// that `scan_cancel` (which needs the same per-job lock) never waits long,
@@ -175,6 +192,154 @@ pub(crate) fn pump_scan_loop(handle: &Arc<Mutex<ScanHandle>>, events: &Channel<S
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// ---------------------------------------------------------------------------
+// watch_subscribe / watch_unsubscribe
+// ---------------------------------------------------------------------------
+
+/// Subscribes to live changes for one directory. Returns the backend-minted
+/// [`JobId`]; changes arrive on `events` as [`WatchEventDto`] (`changed`
+/// carrying the stale directories, `error` carrying a watcher failure). The
+/// caller must invoke `watch_unsubscribe` once it navigates away — the relay
+/// runs until cancelled, exactly like a scan runs until `scan_cancel`.
+///
+/// Fails fast (no job minted) when the directory cannot even be `lstat`ed or
+/// the platform backend refuses the watch.
+///
+/// Every subscription shares the ONE long-lived watcher in [`Backend`]:
+/// no per-subscription thread is ever spawned, and unsubscribing never drops
+/// the watcher, so it never blocks (MIGRATION.md §3).
+#[tauri::command]
+pub fn watch_subscribe<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    events: Channel<WatchEventDto>,
+) -> Result<JobId, CmdError> {
+    let dir = PathBuf::from(&path);
+    if let Err(e) = std::fs::symlink_metadata(&dir) {
+        return Err(CmdError::from_kestrel(&classify_io(&dir, e)));
+    }
+    let backend = app.state::<Backend>();
+    let id = backend.mint();
+    let rx = backend
+        .add_watch(&dir)
+        .map_err(|e| CmdError::from_kestrel(&e))?;
+    let cancel = CancellationToken::new();
+    let relay_events = Arc::new(Mutex::new(rx));
+    backend.register_watch(
+        id,
+        WatchRelay {
+            dir: dir.clone(),
+            events: Arc::clone(&relay_events),
+            cancel: cancel.clone(),
+        },
+    );
+
+    // `spawn_blocking`, not `spawn`: the relay is synchronous blocking code
+    // (`recv_timeout` loop) and must not stall the async executor.
+    // `AppHandle` is `'static`, so state re-resolves inside for the
+    // post-loop cleanup — a no-op when `watch_unsubscribe` already ran.
+    async_runtime::spawn_blocking(move || {
+        pump_watch_loop(&relay_events, &dir, &events, &cancel);
+        app.state::<Backend>().cancel_watch(id);
+    });
+    Ok(id)
+}
+
+/// Unsubscribes a watch. Unknown ids are a silent no-op (the relay already
+/// exited and cleaned itself up, or the id never existed). Never blocks: see
+/// [`Backend::cancel_watch`].
+#[tauri::command]
+pub fn watch_unsubscribe<R: Runtime>(app: AppHandle<R>, id: JobId) {
+    app.state::<Backend>().cancel_watch(id);
+}
+
+// ---------------------------------------------------------------------------
+// the watch relay
+// ---------------------------------------------------------------------------
+
+/// How long one relay iteration waits for the next engine event. Short enough
+/// that `watch_unsubscribe` (which sets the cancel token) takes effect
+/// promptly, long enough not to spin: with no events the relay idles here.
+const WATCH_PUMP_WAIT: Duration = Duration::from_millis(50);
+
+/// Drains one watch relay into its `Channel` until cancelled or the engine's
+/// senders go away (backend shutdown).
+///
+/// Send failures (closed/slow webview) are **ignored on purpose**, exactly
+/// like the scan pump: the engine talks `mpsc` to this relay's receiver, not
+/// `Channel` to the browser, so as long as this loop keeps draining, the
+/// engine never sees a failed send. Stopping the drain — or propagating the
+/// `Channel` error back — is what would let a busy browser silently kill the
+/// shared watcher for every other subscriber.
+pub(crate) fn pump_watch_loop(
+    receiver: &Mutex<std::sync::mpsc::Receiver<WatchEvent>>,
+    dir: &Path,
+    events: &Channel<WatchEventDto>,
+    cancel: &CancellationToken,
+) {
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let event = lock(receiver).recv_timeout(WATCH_PUMP_WAIT);
+        match event {
+            Ok(WatchEvent::Changed(changes)) => {
+                // The engine broadcasts every change to every subscriber, so
+                // most events are for directories this relay does not watch.
+                // Forward only what touches our directory; the frontend
+                // re-scans when any listed dir is the one it is viewing.
+                if !watch_touches(&changes, dir) {
+                    continue;
+                }
+                let mut dirs: Vec<String> = changes
+                    .dirs
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                // Guarantee the exact-match the frontend waits for: a fresh
+                // `mkdir` may report only the new directory itself (it exists
+                // by flush time, so it maps to itself rather than its
+                // parent), while the frontend is viewing the parent.
+                let dir_str = dir.to_string_lossy().into_owned();
+                if !dirs.contains(&dir_str) {
+                    dirs.push(dir_str);
+                }
+                // Discarded on purpose: a failed send means the webview is
+                // gone or busy, never a reason to stop draining.
+                let _ = events.send(WatchEventDto::Changed { dirs });
+            }
+            Ok(WatchEvent::Error(err)) => {
+                let _ = events.send(WatchEventDto::Error {
+                    error: CmdError::from_kestrel(&err),
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Idle: no engine event this window, loop back and re-check
+                // the cancel token. This is what keeps a quiet relay from
+                // spinning.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The shared watcher is gone (backend shutdown). Nothing left
+                // to drain; the post-loop cleanup handles the map entry.
+                break;
+            }
+        }
+    }
+}
+
+/// Whether an engine change set concerns `dir`: it names the directory
+/// itself, or any path inside it (a changed file's parent is `dir`, and a
+/// freshly created subdirectory reports its own path, which starts with
+/// `dir`). Component-wise [`Path::starts_with`], so `/foo` never matches
+/// `/foobar`.
+fn watch_touches(changes: &ChangeSet, dir: &Path) -> bool {
+    if changes.touches(dir) {
+        return true;
+    }
+    changes.paths.iter().any(|p| p.starts_with(dir))
+        || changes.dirs.iter().any(|d| d.starts_with(dir))
 }
 
 // ---------------------------------------------------------------------------
@@ -442,5 +607,253 @@ mod tests {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime")
+    }
+
+    // ------------------------------------------------------------------
+    // watch relay tests (Phase 2)
+    // ------------------------------------------------------------------
+
+    use crate::dto::WatchEventDto;
+    use crate::state::WatchRelay;
+    use kestrel_fs::model::CancellationToken;
+    use kestrel_fs::watcher::WatchEvent;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn watch_backend() -> Backend {
+        Backend::try_new_watching(std::env::temp_dir(), Duration::from_millis(50)).expect("backend")
+    }
+
+    fn register_watch_on(backend: &Backend, dir: &Path) -> (JobId, CancellationToken) {
+        let rx = backend.add_watch(dir).expect("add_watch");
+        let cancel = CancellationToken::new();
+        let id = backend.mint();
+        backend.register_watch(
+            id,
+            WatchRelay {
+                dir: dir.to_path_buf(),
+                events: Arc::new(Mutex::new(rx)),
+                cancel: cancel.clone(),
+            },
+        );
+        (id, cancel)
+    }
+
+    /// Builds a `Channel` that records every message as JSON (exactly what the
+    /// frontend would receive) and answers each send with `respond`.
+    fn recording_channel(
+        seen: &Arc<Mutex<Vec<serde_json::Value>>>,
+        respond: impl Fn() -> tauri::Result<()> + Send + Sync + 'static,
+    ) -> Channel<WatchEventDto> {
+        let seen_clone = Arc::clone(seen);
+        Channel::new(move |body| {
+            let json = match &body {
+                InvokeResponseBody::Json(s) => s.clone(),
+                InvokeResponseBody::Raw(_) => panic!("DTOs must encode as JSON"),
+            };
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            seen_clone.lock().expect("lock").push(value);
+            respond()
+        })
+    }
+
+    fn wait_for_changed(
+        seen: &Arc<Mutex<Vec<serde_json::Value>>>,
+        what: &str,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let guard = seen.lock().expect("lock");
+                if let Some(v) = guard
+                    .iter()
+                    .find(|v| v["type"] == serde_json::json!("changed"))
+                {
+                    return v.clone();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no changed event within the deadline ({what}): {:?}",
+                seen.lock().expect("lock")
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Each subscription mints a distinct id; unsubscribing an unknown id (or
+    /// twice) is a silent no-op, matching `scan_cancel`'s race safety.
+    #[test]
+    fn watch_ids_are_unique_and_unsubscribe_is_race_safe() {
+        let backend = watch_backend();
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        let (id_a, _) = register_watch_on(&backend, a.path());
+        let (id_b, _) = register_watch_on(&backend, b.path());
+        assert_ne!(id_a, id_b, "minted watch ids must be unique");
+        assert_ne!(id_a, 0);
+        assert_ne!(id_b, 0);
+        backend.cancel_watch(id_a);
+        // Racing cancels and unknown ids are silent no-ops, never panics.
+        backend.cancel_watch(id_a);
+        backend.cancel_watch(u64::MAX);
+        // The sibling subscription survives its neighbour's cancel.
+        assert!(lock(&backend.watches).contains_key(&id_b));
+        backend.cancel_watch(id_b);
+        assert!(lock(&backend.watches).is_empty());
+    }
+
+    /// THE load-bearing test, mirroring
+    /// `absent_consumer_does_not_cancel_a_scan`: the frontend is gone (every
+    /// `Channel::send` fails, as when the webview is closed or too busy to
+    /// eval), and the relay must still forward attempts without stopping the
+    /// shared watcher.
+    #[test]
+    fn absent_consumer_does_not_stop_the_watcher() {
+        let backend = watch_backend();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let rx = backend.add_watch(&dir).expect("add_watch");
+        let relay_events = Arc::new(Mutex::new(rx));
+        let cancel = CancellationToken::new();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = Arc::clone(&attempts);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = recording_channel(&seen, move || {
+            attempts_clone.fetch_add(1, Ordering::SeqCst);
+            Err(tauri::Error::Io(io_error()))
+        });
+
+        let cancel_clone = cancel.clone();
+        let dir_clone = dir.clone();
+        let pump = std::thread::spawn(move || {
+            pump_watch_loop(&relay_events, &dir_clone, &events, &cancel_clone);
+        });
+
+        fs::write(tmp.path().join("newfile.txt"), b"x").expect("write");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while attempts.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the relay never attempted a send, even with nobody listening"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The shared watcher is still alive: an independent subscriber sees
+        // the next change. A relay that propagated the frontend failure into
+        // the engine (e.g. by dropping the watcher) fails here.
+        let probe = lock(&backend.watcher).subscribe();
+        fs::write(tmp.path().join("second.txt"), b"y").expect("write");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match probe.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(WatchEvent::Changed(_)) => break,
+                Ok(WatchEvent::Error(_)) => {}
+                Err(e) => panic!("shared watcher stopped delivering: {e}"),
+            }
+        }
+
+        cancel.cancel();
+        let started = Instant::now();
+        pump.join().expect("pump thread joins");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a cancelled relay must exit promptly, not spin"
+        );
+    }
+
+    /// A relay forwards an engine change as exactly one `changed` event whose
+    /// `dirs` carries the watched directory.
+    #[test]
+    fn relay_forwards_a_change_as_one_changed_event() {
+        let backend = watch_backend();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let rx = backend.add_watch(&dir).expect("add_watch");
+        let relay_events = Arc::new(Mutex::new(rx));
+        let cancel = CancellationToken::new();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = recording_channel(&seen, || Ok(()));
+        let cancel_clone = cancel.clone();
+        let dir_clone = dir.clone();
+        let pump = std::thread::spawn(move || {
+            pump_watch_loop(&relay_events, &dir_clone, &events, &cancel_clone);
+        });
+
+        fs::write(tmp.path().join("newfile.txt"), b"x").expect("write");
+        let first = wait_for_changed(&seen, "write a file");
+        let dirs = first["dirs"]
+            .as_array()
+            .expect("changed carries a dirs array");
+        assert!(
+            dirs.iter()
+                .any(|d| d.as_str() == Some(dir.to_string_lossy().as_ref())),
+            "changed must carry the watched directory, got {first}"
+        );
+
+        // One coalesced event, not one per inotify report: after several
+        // debounce windows there must still be exactly one `changed`.
+        std::thread::sleep(Duration::from_millis(500));
+        cancel.cancel();
+        pump.join().expect("pump thread joins");
+        let guard = seen.lock().expect("lock");
+        let changed = guard
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("changed"))
+            .count();
+        assert_eq!(changed, 1, "one change must forward as exactly one event");
+    }
+
+    /// A freshly created subdirectory may report only itself (it exists by
+    /// flush time, so the engine maps it to itself rather than its parent).
+    /// The relay must still carry the watched parent, or the frontend's
+    /// exact-match rescan would miss every `mkdir`.
+    #[test]
+    fn relay_forwards_a_new_directory_carrying_the_watched_parent() {
+        let backend = watch_backend();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let rx = backend.add_watch(&dir).expect("add_watch");
+        let relay_events = Arc::new(Mutex::new(rx));
+        let cancel = CancellationToken::new();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = recording_channel(&seen, || Ok(()));
+        let cancel_clone = cancel.clone();
+        let dir_clone = dir.clone();
+        let pump = std::thread::spawn(move || {
+            pump_watch_loop(&relay_events, &dir_clone, &events, &cancel_clone);
+        });
+
+        fs::create_dir(tmp.path().join("newdir")).expect("mkdir");
+        let first = wait_for_changed(&seen, "mkdir");
+        let dirs = first["dirs"]
+            .as_array()
+            .expect("changed carries a dirs array");
+        assert!(
+            dirs.iter()
+                .any(|d| d.as_str() == Some(dir.to_string_lossy().as_ref())),
+            "mkdir must still carry the watched parent, got {first}"
+        );
+        cancel.cancel();
+        pump.join().expect("pump thread joins");
+    }
+
+    /// `DirWatcher::drop` joins its debouncer thread, so unsubscribing must
+    /// never drop the shared watcher: it has to be quick on the calling task.
+    #[test]
+    fn watch_unsubscribe_does_not_block_the_calling_task() {
+        let backend = watch_backend();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (id, _) = register_watch_on(&backend, tmp.path());
+        let started = Instant::now();
+        backend.cancel_watch(id);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "unsubscribe must not block the caller"
+        );
+        assert!(!lock(&backend.watches).contains_key(&id));
     }
 }

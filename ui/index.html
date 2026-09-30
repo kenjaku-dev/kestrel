@@ -9,7 +9,24 @@
     <div id="app">
       <div id="toolbar">
         <button id="up-btn" type="button" title="Up one level (Backspace)">Up</button>
-        <span id="path" aria-label="Current path">(no path)</span>
+        <nav id="crumbs" aria-label="Breadcrumbs"></nav>
+        <input
+          id="filter"
+          type="search"
+          placeholder="Filter…"
+          aria-label="Filter by name"
+          autocomplete="off"
+        />
+        <select id="sort-key" aria-label="Sort key">
+          <option value="name" selected>Name</option>
+          <option value="size">Size</option>
+          <option value="modified">Date</option>
+          <option value="kind">Kind</option>
+        </select>
+        <button id="sort-dir" type="button" title="Toggle sort direction">↑</button>
+        <label id="hidden-wrap" title="Show hidden files">
+          <input id="hidden-toggle" type="checkbox" checked /> Hidden
+        </label>
       </div>
       <div id="viewport" tabindex="0" role="listbox" aria-label="Directory listing">
         <div id="spacer"></div>

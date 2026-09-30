@@ -25,9 +25,12 @@ import type {
   OpenPathResult,
   ScanEventDto,
   ScanOptionsDto,
+  SortSpecDto,
+  WatchEventDto,
 } from "./types";
 
 export type ScanEventHandler = (event: ScanEventDto) => void;
+export type WatchEventHandler = (event: WatchEventDto) => void;
 
 export interface KestrelIpc {
   readonly backend: "tauri" | "mock";
@@ -39,6 +42,10 @@ export interface KestrelIpc {
   scanCancel(id: JobId): Promise<void>;
   stat(path: string): Promise<FileEntryDto>;
   openPath(path: string): Promise<OpenPathResult>;
+  /** Frozen Phase 2 contract: subscribe to change events for `path`. */
+  watchSubscribe(path: string, onEvent: WatchEventHandler): Promise<JobId>;
+  /** Frozen Phase 2 contract: drop a subscription. Never rejects. */
+  watchUnsubscribe(id: JobId): Promise<void>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -187,6 +194,40 @@ export function normalizeScanEvent(raw: unknown): ScanEventDto | null {
   return null;
 }
 
+/**
+ * Watch wire form (frozen Phase 2 contract, internally tagged like scan):
+ *   {"type":"changed","dirs":[…]} | {"type":"error",path,kind,message}
+ * (flat error, same shape as scan errors). Tolerates the mock/fixture
+ * capitalised variants the way normalizeScanEvent does.
+ */
+export function normalizeWatchEvent(raw: unknown): WatchEventDto | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  // Tolerate a nested mock naming ({Changed: […]}), mirroring scan shapes.
+  if (obj["Changed"] && Array.isArray(obj["Changed"])) {
+    return { type: "changed", dirs: stringsOf(obj["Changed"]) };
+  }
+  if (typeof obj["type"] !== "string") return null;
+  const t = (obj["type"] as string).toLowerCase();
+  if (t === "changed") {
+    const rawDirs = obj["dirs"];
+    if (!Array.isArray(rawDirs)) return null;
+    return { type: "changed", dirs: stringsOf(rawDirs) };
+  }
+  if (t === "error") {
+    const error = normalizeError(obj);
+    return error ? { type: "error", error } : null;
+  }
+  return null;
+}
+
+function stringsOf(raw: unknown[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < raw.length; i++)
+    if (typeof raw[i] === "string") out.push(raw[i] as string);
+  return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* Tauri backend                                                       */
 /* ------------------------------------------------------------------ */
@@ -246,6 +287,27 @@ class TauriIpc implements KestrelIpc {
     const entered = res["enteredDir"] !== undefined ? res["enteredDir"] : res["entered_dir"];
     return { entered_dir: entered === true };
   }
+
+  async watchSubscribe(
+    path: string,
+    onEvent: WatchEventHandler
+  ): Promise<JobId> {
+    const { invoke, Channel } = await this.load();
+    // Same backpressure deal as scan: the Channel callback stays cheap and
+    // sync — the browser re-scans on a later task, never here.
+    const events = new Channel((raw: unknown) => {
+      const ev = normalizeWatchEvent(raw);
+      if (ev) onEvent(ev);
+    });
+    // Argument keys must match the Rust parameter names exactly.
+    const id = await invoke<JobId>("watch_subscribe", { path, events });
+    return typeof id === "number" ? id : Number(id);
+  }
+
+  async watchUnsubscribe(id: JobId): Promise<void> {
+    const { invoke } = await this.load();
+    await invoke("watch_unsubscribe", { id });
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -270,27 +332,46 @@ class MockIpc implements KestrelIpc {
   readonly backend = "mock" as const;
   private nextId = 1;
   private cancelled = new Set<JobId>();
+  private watches = new Map<JobId, { path: string; onEvent: WatchEventHandler }>();
 
   async scanStart(
     path: string,
-    _options: ScanOptionsDto,
+    options: ScanOptionsDto,
     onEvent: ScanEventHandler
   ): Promise<JobId> {
     const id = this.nextId++;
-    // Emit asynchronously in chunks so the streaming path (Entry…BatchEnd…
+    // Honour the same query parameters the real backend takes, so the UI is
+    // testable standalone: hidden filtering and backend-side sorting happen
+    // here exactly where scan.rs does them in production.
+    const showHidden =
+      options.showHidden === undefined ? true : options.showHidden;
+    const sort: SortSpecDto =
+      options.sort === undefined || options.sort === null
+        ? { key: "name", ascending: true, dirsFirst: true }
+        : options.sort;
+    const names = [".hidden-note", "README.md", "src", "docs", "assets"];
+    const all: FileEntryDto[] = [];
+    for (let i = 0; i < names.length + 40; i++) {
+      const name = i < names.length ? names[i] : "file-" + i + ".txt";
+      const e = mockEntry(path, name, i);
+      if (!showHidden && e.hidden) continue;
+      all.push(e);
+    }
+    mockSort(all, sort);
+    // Emit asynchronously in chunks so the streaming path (Entries…
     // Complete) is exercised exactly like the real backend. Each timer
     // callback stays cheap: at most one small batch per macrotask.
-    const names = [".hidden-note", "README.md", "src", "docs", "assets"];
     let i = 0;
+    let errorSent = false;
     const step = () => {
       if (this.cancelled.has(id)) return;
       const BATCH = 200;
-      for (let k = 0; k < BATCH && i < names.length + 40; k++, i++) {
-        const name = i < names.length ? names[i] : "file-" + i + ".txt";
-        onEvent({ type: "Entry", entry: mockEntry(path, name, i) });
-      }
+      const slice: FileEntryDto[] = [];
+      for (let k = 0; k < BATCH && i < all.length; k++, i++) slice.push(all[i]);
+      if (slice.length > 0) onEvent({ type: "Entries", entries: slice });
       // One synthetic permission error proves error rows render.
-      if (i >= 10 && i - BATCH < 10) {
+      if (!errorSent && i >= 10) {
+        errorSent = true;
         onEvent({
           type: "Error",
           error: {
@@ -301,10 +382,10 @@ class MockIpc implements KestrelIpc {
         });
       }
       onEvent({ type: "BatchEnd" });
-      if (i < names.length + 40) {
+      if (i < all.length) {
         setTimeout(step, 0);
       } else {
-        onEvent({ type: "Complete", total: i });
+        onEvent({ type: "Complete", total: all.length });
       }
     };
     setTimeout(step, 0);
@@ -333,6 +414,91 @@ class MockIpc implements KestrelIpc {
     void path;
     return { entered_dir: false };
   }
+
+  async watchSubscribe(
+    path: string,
+    onEvent: WatchEventHandler
+  ): Promise<JobId> {
+    const id = this.nextId++;
+    this.watches.set(id, { path, onEvent });
+    return id;
+  }
+
+  async watchUnsubscribe(id: JobId): Promise<void> {
+    this.watches.delete(id);
+  }
+
+  /**
+   * Dev-only liveness hook: simulate a backend `changed` event, delivered to
+   * every live subscription whose path is listed (the browser re-scans only
+   * when the viewed directory is among them — the same rule as production).
+   * No backend needed; wire it to a button or `__kestrel` in main.ts.
+   */
+  simulateChanged(dirs: string[]): void {
+    const live = Array.from(this.watches.entries());
+    for (let i = 0; i < live.length; i++) {
+      const sub = live[i][1];
+      let hit = false;
+      for (let k = 0; k < dirs.length; k++)
+        if (sameDir(dirs[k], sub.path)) {
+          hit = true;
+          break;
+        }
+      if (hit) sub.onEvent({ type: "changed", dirs: dirs.slice() });
+    }
+  }
+
+  /** Introspection for tests / devtools: live subscription count. */
+  watchCount(): number {
+    return this.watches.size;
+  }
+}
+
+/** Trailing-slash-insensitive directory comparison. */
+function sameDir(a: string, b: string): boolean {
+  return stripSlash(a) === stripSlash(b);
+}
+
+function stripSlash(p: string): string {
+  let s = p;
+  while (s.length > 1 && s.charAt(s.length - 1) === "/") s = s.slice(0, -1);
+  return s;
+}
+
+/**
+ * Backend-side sort for the mock path only: mirrors scan.rs semantics —
+ * directories first, then the column, nulls (unknown size/date) last,
+ * ascending flag applied to the column comparison only.
+ */
+export function mockSort(rows: FileEntryDto[], sort: SortSpecDto): void {
+  rows.sort((a, b) => {
+    if (sort.dirsFirst) {
+      const ad = a.descendable ? 1 : 0;
+      const bd = b.descendable ? 1 : 0;
+      if (ad !== bd) return bd - ad;
+    }
+    let c = 0;
+    if (sort.key === "name") c = cmpStr(a.name, b.name);
+    else if (sort.key === "size") c = cmpNullNum(a.size, b.size);
+    else if (sort.key === "modified") c = cmpNullNum(a.modified, b.modified);
+    else c = cmpStr(a.kind, b.kind);
+    return sort.ascending ? c : -c;
+  });
+}
+
+function cmpStr(a: string, b: string): number {
+  const al = a.toLowerCase();
+  const bl = b.toLowerCase();
+  if (al < bl) return -1;
+  if (al > bl) return 1;
+  return 0;
+}
+
+/** Nulls sort last regardless of direction (matches the engine). */
+function cmpNullNum(a: number | null, b: number | null): number {
+  if (a === null || a === undefined) return b === null || b === undefined ? 0 : 1;
+  if (b === null || b === undefined) return -1;
+  return a - b;
 }
 
 /* ------------------------------------------------------------------ */

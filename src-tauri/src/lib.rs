@@ -99,6 +99,8 @@ pub fn run() {
             commands::scan_cancel,
             commands::stat,
             commands::open_path,
+            commands::watch_subscribe,
+            commands::watch_unsubscribe,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

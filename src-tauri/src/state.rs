@@ -54,12 +54,19 @@ pub struct OpJob {
 /// [`DirWatcher`]. Phase 1 only reserves the map slot; Phase 2 pumps the
 /// receiver into a `Channel`.
 pub struct WatchRelay {
-    /// The directory being relayed.
+    /// The directory being relayed, exactly as subscribed (the frontend
+    /// compares these strings against the viewed directory, so the raw
+    /// subscribed path is kept — never canonicalised).
     pub dir: PathBuf,
-    /// The subscriber's receiving end. `Receiver` is `Send` but **not**
-    /// `Sync`, so the `Mutex` is the same mechanical adapter as everywhere
-    /// else in this module.
-    pub events: Mutex<Receiver<WatchEvent>>,
+    /// The subscriber's receiving end on the shared watcher. `Receiver` is
+    /// `Send` but **not** `Sync`, so the `Mutex` is the same mechanical
+    /// adapter as everywhere else in this module; the `Arc` lets the pump
+    /// task hold the receiver while the map owns the relay, mirroring the
+    /// per-job `Arc<Mutex<ScanHandle>>` pattern.
+    pub events: Arc<Mutex<Receiver<WatchEvent>>>,
+    /// Stops the pump task. Set by [`Backend::cancel_watch`]; the pump also
+    /// exits when the engine's senders go away (backend shutdown).
+    pub cancel: CancellationToken,
 }
 
 /// Shared backend state, managed once at startup. See the module docs for why
@@ -91,18 +98,29 @@ pub struct Backend {
 impl Backend {
     /// Creates the backend and its one long-lived [`DirWatcher`].
     ///
-    /// The watcher has to watch *something* from birth even though Phase 1
-    /// issues no watches: it is homed on the system temp directory (which
-    /// always exists) and Phase 2 re-homes real subscriptions onto it with
-    /// `add_path` / `remove_path`. Watching temp is inert: nothing subscribes
-    /// to it, so its debouncer thread idles.
+    /// The watcher is homed on `$HOME`: the file manager opens there, so the
+    /// root watch is the one subscription the app always needs and every
+    /// other viewed directory is added with [`add_path`](DirWatcher::add_path)
+    /// as navigation happens. When `$HOME` is unset or missing (CI, minimal
+    /// containers), it falls back to the system temp directory, which always
+    /// exists; either way the home is inert until subscribed — nothing reads
+    /// from a root nobody subscribed to, so its debouncer thread idles.
+    ///
+    /// There is exactly one watcher for the whole process: each
+    /// `WatchSubscription` would spawn its own `DirWatcher` and thread, and
+    /// `DirWatcher::drop` joins that thread, so per-subscription watchers
+    /// would mean N threads and blocking drops (MIGRATION.md §3).
     ///
     /// # Errors
     ///
     /// Returns the engine's [`KestrelError::Watch`] if the platform backend
-    /// refuses even the placeholder watch (exhausted inotify limits, ...).
+    /// refuses even the home watch (exhausted inotify limits, ...).
     pub fn try_new() -> Result<Self, KestrelError> {
-        Self::try_new_watching(std::env::temp_dir(), DEFAULT_DEBOUNCE)
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir());
+        let root = home.unwrap_or_else(std::env::temp_dir);
+        Self::try_new_watching(root, DEFAULT_DEBOUNCE)
     }
 
     /// Same as [`try_new`](Self::try_new) but watching `dir`, for tests.
@@ -137,6 +155,69 @@ impl Backend {
     pub fn cancel_scan(&self, id: JobId) {
         if let Some(handle) = lock(&self.scans).remove(&id) {
             lock(&handle).cancel();
+        }
+    }
+
+    /// Subscribes `dir` on the ONE shared watcher and returns the receiving
+    /// end for a [`WatchRelay`].
+    ///
+    /// The receiver is created *before* `add_path` so no change can slip
+    /// through between starting the inotify watch and listening. When `dir`
+    /// is the watcher's own root it is already watched from birth and only
+    /// the subscription is needed. A failed `add_path` (vanished directory,
+    /// exhausted watches) drops the fresh receiver — the next engine
+    /// broadcast prunes its orphaned sender — and reports the engine error,
+    /// so the caller mints no job for a directory that cannot be watched.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the engine's [`KestrelError::Watch`] when the path cannot
+    /// be watched.
+    pub fn add_watch(&self, dir: &std::path::Path) -> Result<Receiver<WatchEvent>, KestrelError> {
+        let is_root = lock(&self.watcher).root().to_path_buf() == *dir;
+        let rx = lock(&self.watcher).subscribe();
+        if is_root {
+            return Ok(rx);
+        }
+        if let Err(e) = lock(&self.watcher).add_path(dir) {
+            drop(rx);
+            return Err(e);
+        }
+        Ok(rx)
+    }
+
+    /// Registers a freshly subscribed watch relay under `id`.
+    pub fn register_watch(&self, id: JobId, relay: WatchRelay) {
+        lock(&self.watches).insert(id, relay);
+    }
+
+    /// Removes a watch relay and stops its pump, if it is still present.
+    /// Unknown ids are a no-op so a racing frontend (a change arriving while
+    /// the user navigates away) cannot error — the same posture as
+    /// [`cancel_scan`](Self::cancel_scan).
+    ///
+    /// Never blocks: cancelling is an atomic store, and neither the shared
+    /// `DirWatcher` (which stays alive in `self`) nor any thread is dropped
+    /// here — `DirWatcher::drop` joins its debouncer thread, which is why the
+    /// watcher is shared rather than per-subscription. The inotify watch for
+    /// `dir` is released only when no remaining relay uses it (and never for
+    /// the watcher's own root, which is permanent); the release is a quick
+    /// `unwatch` syscall under a short-held lock, and failures are ignored —
+    /// the directory may already be gone, which needs no action.
+    pub fn cancel_watch(&self, id: JobId) {
+        let Some(relay) = lock(&self.watches).remove(&id) else {
+            return;
+        };
+        relay.cancel.cancel();
+        let still_used = lock(&self.watches)
+            .values()
+            .any(|other| other.dir == relay.dir);
+        if still_used {
+            return;
+        }
+        let is_root = lock(&self.watcher).root().to_path_buf() == relay.dir;
+        if !is_root {
+            let _ = lock(&self.watcher).remove_path(&relay.dir);
         }
     }
 }

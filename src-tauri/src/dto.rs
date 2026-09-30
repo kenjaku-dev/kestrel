@@ -389,6 +389,54 @@ impl Serialize for ScanEventDto {
 }
 
 // ---------------------------------------------------------------------------
+// watch events (backend → frontend)
+//
+// Frozen Phase 2 contract, internally tagged with `"type"` exactly like
+// [`ScanEventDto`]: `{ "type": "changed", "dirs": [...] }` carries the
+// directories whose contents may have changed, and
+// `{ "type": "error", "error": CmdError }` carries a watcher failure.
+// The frontend re-runs `scan_start` for the current directory when any
+// listed dir is the one it is viewing — deliberately no incremental
+// patching, so both UIs share the one scan code path.
+// ---------------------------------------------------------------------------
+
+/// One message sent over a `watch_subscribe` [`Channel`](tauri::ipc::Channel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchEventDto {
+    /// Directories whose listing may be stale, as lossy absolute paths.
+    Changed {
+        /// Every directory that may need re-listing.
+        dirs: Vec<String>,
+    },
+    /// The watcher reported an error. Nested under `"error"` (unlike scan
+    /// errors, which are flat rows) — this nesting is the frozen Phase 2
+    /// contract, so do not flatten it.
+    Error {
+        /// The watcher failure, as the standard error shape.
+        error: CmdError,
+    },
+}
+
+impl Serialize for WatchEventDto {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Changed { dirs } => {
+                let mut out = s.serialize_struct("WatchEventDto", 2)?;
+                out.serialize_field("type", "changed")?;
+                out.serialize_field("dirs", dirs)?;
+                out.end()
+            }
+            Self::Error { error } => {
+                let mut out = s.serialize_struct("WatchEventDto", 2)?;
+                out.serialize_field("type", "error")?;
+                out.serialize_field("error", error)?;
+                out.end()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // open_path result
 // ---------------------------------------------------------------------------
 
@@ -720,6 +768,28 @@ mod tests {
             assert!(!spec.ascending);
             assert!(!spec.dirs_first);
         }
+    }
+
+    #[test]
+    fn watch_event_dto_wire_tags() {
+        let v = serde_json::to_value(WatchEventDto::Changed {
+            dirs: vec!["/tmp/x".to_string()],
+        })
+        .expect("serialize");
+        assert_eq!(
+            v,
+            serde_json::json!({"type": "changed", "dirs": ["/tmp/x"]})
+        );
+        let err = CmdError::custom("watch", Some(Path::new("/tmp/x")), "gone".to_string());
+        let v = serde_json::to_value(WatchEventDto::Error { error: err }).expect("serialize");
+        assert_eq!(v["type"], serde_json::json!("error"));
+        assert_eq!(v["error"]["kind"], serde_json::json!("watch"));
+        assert_eq!(v["error"]["path"], serde_json::json!("/tmp/x"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty())
+        );
     }
 
     #[test]
