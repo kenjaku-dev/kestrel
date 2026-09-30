@@ -326,6 +326,15 @@ pub struct Xdg {
     /// `$XDG_CURRENT_DESKTOP`, lowercased — the `$desktop` in
     /// `$desktop-mimeapps.list`.
     desktops: Vec<String>,
+    /// `$HOME/.config` when it differs from `config_home`.
+    ///
+    /// GLib keeps reading `~/.config/mimeapps.list` even when
+    /// `XDG_CONFIG_HOME` points elsewhere (verified with
+    /// `xdg-mime query default` against an empty `XDG_CONFIG_HOME` tree),
+    /// so this is consulted as a lower-precedence fallback. `None` in the
+    /// normal case where `config_home` already *is* `$HOME/.config`, which
+    /// keeps the search list duplicate-free.
+    fallback_config_home: Option<PathBuf>,
 }
 
 impl Xdg {
@@ -340,9 +349,12 @@ impl Xdg {
                 None => default.iter().map(PathBuf::from).collect(),
             }
         };
+        let config_home: PathBuf =
+            std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home.join(".config"), PathBuf::from);
+        let legacy = home.join(".config");
+        let fallback_config_home = (legacy != config_home).then_some(legacy);
         Self {
-            config_home: std::env::var_os("XDG_CONFIG_HOME")
-                .map_or_else(|| home.join(".config"), PathBuf::from),
+            config_home,
             config_dirs: split("XDG_CONFIG_DIRS", &["/etc/xdg"]),
             data_home: std::env::var_os("XDG_DATA_HOME")
                 .map_or_else(|| home.join(".local/share"), PathBuf::from),
@@ -354,6 +366,7 @@ impl Xdg {
                 .filter(|d| !d.is_empty())
                 .map(str::to_lowercase)
                 .collect(),
+            fallback_config_home,
         }
     }
 
@@ -371,6 +384,11 @@ impl Xdg {
             data_home: root.join("share"),
             data_dirs: vec![root.join("usr-share")],
             desktops: vec!["kestreltest".to_string()],
+            // The `$HOME/.config` analogue inside the isolated tree: a
+            // sibling of `config/` that never exists unless a test creates
+            // it, so every pre-existing `isolated` test sees the same files
+            // as before.
+            fallback_config_home: Some(root.join(".config")),
         }
     }
 
@@ -379,7 +397,14 @@ impl Xdg {
     /// The order is §3 of the mime-apps spec verbatim, including the
     /// `$desktop-mimeapps.list` variants before the bare name and the deprecated
     /// `$XDG_DATA_HOME/applications` entries — a real desktop that wrote its
-    /// defaults there still has them honoured.
+    /// defaults there still has them honoured — plus one deliberate addition:
+    /// `$HOME/.config` is consulted right after `config_home` (and before the
+    /// system `config_dirs`), because GLib keeps reading `~/.config` even when
+    /// `XDG_CONFIG_HOME` points elsewhere. It ranks below `config_home` so an
+    /// explicit `XDG_CONFIG_HOME` registration still wins, but above the
+    /// system directories because a user-level file outranks a system one. It
+    /// is skipped when it is the same path as `config_home`, so the normal
+    /// case has no duplicate entries.
     #[must_use]
     fn mimeapps_files(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
@@ -391,6 +416,11 @@ impl Xdg {
             out.push(dir.join("mimeapps.list"));
         };
         push(&self.config_home, "");
+        if let Some(fallback) = &self.fallback_config_home {
+            if fallback != &self.config_home {
+                push(fallback, "");
+            }
+        }
         for dir in &self.config_dirs {
             push(dir, "");
         }
@@ -421,6 +451,24 @@ impl Xdg {
         let mut out = vec![self.data_home.join("applications")];
         out.extend(self.data_dirs.iter().map(|d| d.join("applications")));
         out
+    }
+
+    /// Where [`set_default`] writes.
+    ///
+    /// Whichever of `config_home` / the `$HOME/.config` fallback already
+    /// holds a `mimeapps.list` wins — preferring `config_home` when both
+    /// do — and `config_home` when neither does. See [`set_default`] for
+    /// why this deliberate GLib-matching deviation exists.
+    fn default_write_dir(&self) -> PathBuf {
+        if self.config_home.join("mimeapps.list").is_file() {
+            return self.config_home.clone();
+        }
+        if let Some(fallback) = &self.fallback_config_home {
+            if fallback.join("mimeapps.list").is_file() {
+                return fallback.clone();
+            }
+        }
+        self.config_home.clone()
     }
 }
 
@@ -846,27 +894,37 @@ pub fn default_for(xdg: &Xdg, mime: &str) -> Option<String> {
 
 /// Sets `id` as the default for `mime`, system-wide.
 ///
-/// Writes `~/.config/mimeapps.list` (mechanism (a): direct edit, not
+/// Writes `mimeapps.list` (mechanism (a): direct edit, not
 /// `xdg-mime`), creating it and its directory when absent, and preserving
 /// every other line for every other type. A `[Removed Associations]` entry
 /// for the same pair is dropped, since it would otherwise keep suppressing
 /// the default just written. Other desktop environments read the same file,
 /// so the choice applies outside this app too.
 ///
+/// Which file is written is deliberate: when `XDG_CONFIG_HOME` points away
+/// from `~/.config` but the user's associations already live in
+/// `~/.config/mimeapps.list` (the GLib behaviour — GLib keeps reading
+/// `~/.config` regardless of `XDG_CONFIG_HOME`), a write to
+/// `$XDG_CONFIG_HOME` would land where no other program looks and the
+/// feature would appear to do nothing. So the write goes to whichever of
+/// `config_home` / `$HOME/.config` already holds a `mimeapps.list`,
+/// preferring `config_home` when both do, and to `config_home` when neither
+/// does. This is a conscious deviation from a strict XDG reading, kept
+/// because matching GLib is what makes the setting stick.
+///
 /// Direct edit rather than shelling out to `xdg-mime` because a rewrite of
 /// one line cannot truncate a hand-maintained file, needs no external binary,
 /// and reports a real `io::Error` when the directory is not writable instead
 /// of failing silently.
 pub fn set_default(xdg: &Xdg, mime: &str, id: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(&xdg.config_home)?;
-    let path = xdg.config_home.join("mimeapps.list");
+    let dir = xdg.default_write_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("mimeapps.list");
     let current = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = apply_default(&current, mime, id);
     // Same directory plus rename: either the whole new file lands or nothing
     // does, never a half-written list.
-    let tmp = xdg
-        .config_home
-        .join(format!(".mimeapps.list.tmp-{}", std::process::id()));
+    let tmp = dir.join(format!(".mimeapps.list.tmp-{}", std::process::id()));
     std::fs::write(&tmp, updated)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
@@ -2195,6 +2253,239 @@ mod tests {
         for want in ["Images", "Video", "Audio", "PDF", "Text", "Archives"] {
             assert!(names.contains(&want), "no {want} row: {names:?}");
         }
+    }
+
+    // -- the $HOME/.config fallback (GLib behaviour) -------------------------
+
+    /// The user's shape: `XDG_CONFIG_HOME` points at a tree whose
+    /// `mimeapps.list` knows `text/plain` but has no `video/mp4`, while
+    /// `$HOME/.config/mimeapps.list` registers `video/mp4`. GLib (and
+    /// `xdg-mime query default`) still resolves the video handler; so must
+    /// this engine.
+    #[test]
+    fn home_config_fallback_resolves_a_type_missing_from_config_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "mpv.desktop",
+            &entry_file("mpv", "mpv %U", "video/mp4"),
+        );
+        desktop(
+            dir.path(),
+            "kate.desktop",
+            &entry_file("Kate", "kate %U", "text/plain"),
+        );
+        let fallback = xdg.fallback_config_home.clone().expect("isolated fallback");
+        std::fs::create_dir_all(&xdg.config_home).expect("mkdir");
+        std::fs::write(
+            xdg.config_home.join("mimeapps.list"),
+            "[Default Applications]\ntext/plain=kate.desktop\n",
+        )
+        .expect("write");
+        std::fs::create_dir_all(&fallback).expect("mkdir");
+        std::fs::write(
+            fallback.join("mimeapps.list"),
+            "[Default Applications]\nvideo/mp4=mpv.desktop\n",
+        )
+        .expect("write");
+
+        assert_eq!(
+            handler_for(&xdg, "video/mp4")
+                .expect("fallback resolves")
+                .id,
+            "mpv.desktop",
+            "video/mp4 lives only in the $HOME/.config fallback"
+        );
+        assert_eq!(
+            handler_for(&xdg, "text/plain")
+                .expect("config_home still resolves")
+                .id,
+            "kate.desktop"
+        );
+    }
+
+    /// When both files name a default for the same type, `config_home` wins:
+    /// the fallback ranks below it, never above.
+    #[test]
+    fn config_home_beats_the_home_config_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "first.desktop",
+            &entry_file("First", "first %f", "video/mp4"),
+        );
+        desktop(
+            dir.path(),
+            "second.desktop",
+            &entry_file("Second", "second %f", "video/mp4"),
+        );
+        let fallback = xdg.fallback_config_home.clone().expect("isolated fallback");
+        std::fs::create_dir_all(&xdg.config_home).expect("mkdir");
+        std::fs::write(
+            xdg.config_home.join("mimeapps.list"),
+            "[Default Applications]\nvideo/mp4=first.desktop\n",
+        )
+        .expect("write");
+        std::fs::create_dir_all(&fallback).expect("mkdir");
+        std::fs::write(
+            fallback.join("mimeapps.list"),
+            "[Default Applications]\nvideo/mp4=second.desktop\n",
+        )
+        .expect("write");
+
+        assert_eq!(
+            handler_for(&xdg, "video/mp4").expect("found").id,
+            "first.desktop",
+            "config_home outranks the fallback"
+        );
+        assert_eq!(
+            default_for(&xdg, "video/mp4").as_deref(),
+            Some("first.desktop")
+        );
+    }
+
+    /// The normal case — `config_home` already *is* `$HOME/.config` — must
+    /// not list the same file twice.
+    #[test]
+    fn no_duplicate_entry_when_config_home_is_home_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut xdg = Xdg::isolated(dir.path());
+        xdg.fallback_config_home = Some(xdg.config_home.clone());
+        let files = xdg.mimeapps_files();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|p| *p == &xdg.config_home.join("mimeapps.list"))
+                .count(),
+            1,
+            "same path listed once, not twice: {files:?}"
+        );
+        // And the `None` form (what `from_env` builds in the normal case)
+        // is duplicate-free by construction.
+        xdg.fallback_config_home = None;
+        let files = xdg.mimeapps_files();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|p| *p == &xdg.config_home.join("mimeapps.list"))
+                .count(),
+            1,
+            "no fallback, no duplicate: {files:?}"
+        );
+    }
+
+    /// A default set while the associations live in `$HOME/.config` must be
+    /// written there — writing to an empty `XDG_CONFIG_HOME` would land
+    /// where no other program looks and appear to do nothing.
+    #[test]
+    fn set_default_writes_where_the_associations_already_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "mpv.desktop",
+            &entry_file("mpv", "mpv %U", "video/mp4"),
+        );
+        let fallback = xdg.fallback_config_home.clone().expect("isolated fallback");
+        // Associations live in the fallback only; `config_home` has no file.
+        std::fs::create_dir_all(&fallback).expect("mkdir");
+        std::fs::write(
+            fallback.join("mimeapps.list"),
+            "[Default Applications]\naudio/mpeg=tune.desktop\n",
+        )
+        .expect("write");
+
+        set_default(&xdg, "video/mp4", "mpv.desktop").expect("set");
+
+        assert!(
+            !xdg.config_home.join("mimeapps.list").exists(),
+            "nothing stray in config_home"
+        );
+        let text = std::fs::read_to_string(fallback.join("mimeapps.list")).expect("read");
+        assert!(
+            text.contains("video/mp4=mpv.desktop"),
+            "the fallback file gained the default: {text:?}"
+        );
+        assert_eq!(
+            default_for(&xdg, "video/mp4").as_deref(),
+            Some("mpv.desktop")
+        );
+    }
+
+    /// With no `mimeapps.list` anywhere, the write goes to `config_home`.
+    #[test]
+    fn set_default_falls_back_to_config_home_when_neither_file_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "mpv.desktop",
+            &entry_file("mpv", "mpv %U", "video/mp4"),
+        );
+
+        set_default(&xdg, "video/mp4", "mpv.desktop").expect("set");
+
+        assert_eq!(
+            default_for(&xdg, "video/mp4").as_deref(),
+            Some("mpv.desktop")
+        );
+        assert!(
+            xdg.config_home.join("mimeapps.list").is_file(),
+            "written to config_home"
+        );
+    }
+
+    /// Line surgery in the fallback file: an unrelated MIME's association
+    /// passes through byte-identical.
+    #[test]
+    fn set_default_in_the_fallback_preserves_other_types_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "mpv.desktop",
+            &entry_file("mpv", "mpv %U", "video/mp4"),
+        );
+        desktop(
+            dir.path(),
+            "tune.desktop",
+            &entry_file("Tune", "tune %f", "audio/mpeg"),
+        );
+        let fallback = xdg.fallback_config_home.clone().expect("isolated fallback");
+        std::fs::create_dir_all(&fallback).expect("mkdir");
+        std::fs::write(
+            fallback.join("mimeapps.list"),
+            "# kept comment\n[Default Applications]\naudio/mpeg=tune.desktop\n",
+        )
+        .expect("write");
+        let before = std::fs::read_to_string(fallback.join("mimeapps.list")).expect("read");
+
+        set_default(&xdg, "video/mp4", "mpv.desktop").expect("set");
+
+        let after = std::fs::read_to_string(fallback.join("mimeapps.list")).expect("read");
+        let before_audio = before
+            .lines()
+            .find(|l| l.starts_with("audio/mpeg="))
+            .expect("audio line before");
+        let after_audio = after
+            .lines()
+            .find(|l| l.starts_with("audio/mpeg="))
+            .expect("audio line after");
+        assert_eq!(
+            before_audio, after_audio,
+            "the unrelated association is byte-identical"
+        );
+        assert!(
+            after.lines().any(|l| l == "# kept comment"),
+            "comments survive: {after:?}"
+        );
+        assert_eq!(
+            default_for(&xdg, "audio/mpeg").as_deref(),
+            Some("tune.desktop"),
+            "the pre-existing association still resolves"
+        );
     }
 }
 
