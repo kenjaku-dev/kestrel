@@ -373,7 +373,13 @@ const FILTER_CHROME: f32 = border::HAIRLINE + component::TOOLBAR_BTN_SEPARATOR_M
 /// 1. Labels on, filter at [`FILTER_PREF_W`] — the wide layout. The `Filter`
 ///    button is *not* in this row; the field is the control.
 /// 2. Labels off, filter at [`FILTER_PREF_W`] — §4.4's icon variant. This is
-///    what happens at 820px, which is where the labelled row stops fitting.
+///    what happens below ~912px available, which is where the labelled row
+///    stops fitting: the ten drawn buttons (≈624.9px of icon + label at a 4px
+///    `toolbar.btn-gap`) plus 16px frame padding, two 17px separators, 17px
+///    filter chrome and the 220px field total ≈911.9px. Do not trust the
+///    number — recompute it by sweeping `plan` over widths (see
+///    `labels_are_used_exactly_when_the_labelled_row_fits`), because it moves
+///    with the font metrics and the gap token.
 /// 3. Labels off, filter at whatever is left, down to [`FILTER_MIN_W`].
 /// 4. Labels off, no filter field — and *only* now does the `Filter` button
 ///    appear, because it is the only remaining way to reach the field.
@@ -708,10 +714,17 @@ mod tests {
     /// the font, which is the right place for it to live.
     #[test]
     fn the_labelled_row_is_used_exactly_when_it_fits() {
-        for width in [1600.0, 1400.0, 1200.0, 1100.0, 1000.0] {
+        // Boundary is ~912px available (ten labelled buttons ≈ 624.9px + 16px
+        // frame + two 17px separators + 17px filter chrome + 220px field ≈
+        // 911.9px). Was ~972px before the `toolbar.btn-gap` trim; the lists
+        // below moved with it, and the invariant test underneath pins the rule
+        // rather than any one number.
+        for width in [
+            1600.0, 1400.0, 1200.0, 1100.0, 1000.0, 972.0, 960.0, 940.0, 920.0,
+        ] {
             assert_eq!(plan_at(width).density, Density::Labelled, "{width}px");
         }
-        for width in [960.0, 900.0, 820.0, 760.0, 700.0, 640.0] {
+        for width in [900.0, 820.0, 760.0, 700.0, 640.0] {
             let p = plan_at(width);
             assert_eq!(p.density, Density::Icons, "{width}px");
             assert!(p.fits, "{width}px fits the icon row");
@@ -743,6 +756,29 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// The user's case: at a 972px window the labelled row must survive.
+    ///
+    /// Pinned because a 972px window once fell back to icons — several of
+    /// which (Sort, Theme, Settings, Help) are ambiguous without text — while
+    /// the stale doc comment claimed the labelled row survived down to 820px.
+    /// Before the `toolbar.btn-gap` trim (6px → 4px) the row needed ~971.9px,
+    /// so 972px passed by a tenth of a pixel and any sub-pixel variance in a
+    /// real window flipped it to icons. The 960px assertion is the part that
+    /// actually failed before the fix; it pins the ~60px of margin the trim
+    /// bought, so rounding can never flip the density at the user's size.
+    #[test]
+    fn labels_survive_a_972px_window() {
+        let p = plan_at(972.0);
+        assert_eq!(p.density, Density::Labelled, "972px must keep labels");
+        assert!(p.fits, "972px fits the labelled row");
+        assert_eq!(p.filter, Some(FILTER_PREF_W));
+        assert_eq!(
+            plan_at(960.0).density,
+            Density::Labelled,
+            "960px must keep labels with margin to spare"
+        );
     }
 
     /// The icon row is 10 * 28px plus separators; a window narrower than

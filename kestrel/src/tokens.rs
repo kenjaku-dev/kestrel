@@ -1626,7 +1626,13 @@ pub mod component {
     pub const TOOLBAR_BTN_HEIGHT: f32 = 28.0;
     pub const TOOLBAR_BTN_WIDTH: f32 = 28.0;
     /// `toolbar.btn-gap` (icon + label).
-    pub const TOOLBAR_BTN_LABEL_GAP: f32 = space::S1_5;
+    ///
+    /// Spec row says 6px (`space.1.5`); this is 4px (`space.1`) instead — a
+    /// deliberate divergence, still on the §2.5 scale. The labelled row carries
+    /// three of these gaps per button (left pad, icon–label gap, right pad),
+    /// so 2px × 3 × 10 buttons = 60px buys the labels room at a 972px window
+    /// (threshold ~972px → ~912px). See [`crate::toolbar::plan`].
+    pub const TOOLBAR_BTN_LABEL_GAP: f32 = space::S1;
     /// `toolbar.btn-radius`
     pub const TOOLBAR_BTN_RADIUS: f32 = radius::MD;
     /// `toolbar.btn-icon-size`

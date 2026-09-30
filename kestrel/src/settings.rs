@@ -42,6 +42,7 @@ use egui::{Align2, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
 use kestrel_fs::model::{SortKey, SortSpec};
 use serde::{Deserialize, Serialize};
 
+use crate::default_apps::DefaultApps;
 use crate::icons;
 use crate::tokens::{self, Theme, ThemeMode, border, component, radius, space, ty};
 use crate::widgets;
@@ -373,13 +374,14 @@ pub fn draw(
     ui: &mut Ui,
     theme: &Theme,
     stored: &mut Stored,
+    defaults: &mut DefaultApps,
     _motion: crate::motion::Motion,
 ) -> Action {
     let mut action = Action::None;
     // The band, then the body. `Action` is only read at the end, so every
     // control in the screen can write to it without a borrow of `ui` escaping.
     header(ui, theme, &mut action);
-    body(ui, theme, stored, &mut action);
+    body(ui, theme, stored, defaults, &mut action);
     action
 }
 
@@ -430,7 +432,13 @@ fn header(ui: &mut Ui, theme: &Theme, action: &mut Action) {
 }
 
 /// The scrolling body, capped at a reading measure and centred.
-fn body(ui: &mut Ui, theme: &Theme, stored: &mut Stored, action: &mut Action) {
+fn body(
+    ui: &mut Ui,
+    theme: &Theme,
+    stored: &mut Stored,
+    defaults: &mut DefaultApps,
+    action: &mut Action,
+) {
     let fill = theme.surfaces.app;
     let available = ui.available_width();
     egui::CentralPanel::default()
@@ -645,6 +653,8 @@ fn body(ui: &mut Ui, theme: &Theme, stored: &mut Stored, action: &mut Action) {
                                     inner,
                                     "F1",
                                 );
+
+                                defaults_section(ui, theme, inner, defaults);
 
                                 ui.add_space(space::S6);
                                 let _ = action;
@@ -1019,6 +1029,113 @@ fn key_hint(ui: &mut Ui, theme: &Theme, row: Row<'_>, width: f32, key: &str) {
         theme.text.primary,
     );
     response.on_hover_text("Opens the keyboard shortcut list");
+}
+
+/// The "default applications" section: one dropdown per file type.
+///
+/// A pick writes `~/.config/mimeapps.list` **immediately** — there is no save
+/// button, because the mental model is "I picked it, it's set" — and the
+/// confirmation (or the failure, in the app's error style) appears under the
+/// rows. The state itself lives in [`DefaultApps`], loaded when the screen
+/// opens; this function only draws it.
+fn defaults_section(ui: &mut Ui, theme: &Theme, width: f32, defaults: &mut DefaultApps) {
+    section(ui, theme, "Default applications");
+    if defaults.rows.is_empty() || defaults.is_empty() {
+        // Honest rather than inert: with nothing installed for these types a
+        // row of empty dropdowns would promise a choice that is not there.
+        // (The engine needs no `xdg-mime` binary to write the file, so an
+        // empty screen is about missing applications, never about a missing
+        // tool — and it says exactly that.)
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(width, component::SETTINGS_ROW_H), Sense::hover());
+        label(
+            ui,
+            theme,
+            rect,
+            &Row {
+                label: "No applications found",
+                help: Some(
+                    "Nothing installed declares these file types, so there is \
+                     nothing to choose yet. Installing a viewer adds it here.",
+                ),
+            },
+        );
+        return;
+    }
+    let mut pick: Option<(usize, String)> = None;
+    for (i, row) in defaults.rows.iter().enumerate() {
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(width, component::SETTINGS_ROW_TOTAL_H), Sense::hover());
+        let stacked = is_narrow(width);
+        let (label_rect, control_rect) = split(rect, stacked);
+        let mimes = row.kind.mimes.join(", ");
+        label(
+            ui,
+            theme,
+            label_rect,
+            &Row {
+                label: row.kind.name,
+                help: Some(&mimes),
+            },
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(control_rect), |ui| {
+            ui.add_space((control_rect.height() - component::INPUT_HEIGHT).max(0.0) / 2.0);
+            let chosen = egui::ComboBox::from_id_salt(("defaults-pick", row.kind.name))
+                .selected_text(row.current_name())
+                .width(control_rect.width().max(120.0))
+                .show_ui(ui, |ui| {
+                    let mut chosen: Option<String> = None;
+                    if row.candidates.is_empty() {
+                        ui.label("No applications installed");
+                    }
+                    for c in &row.candidates {
+                        let selected = row.current.as_deref() == Some(c.id.as_str());
+                        if ui.selectable_label(selected, &c.name).clicked() {
+                            chosen = Some(c.id.clone());
+                        }
+                    }
+                    chosen
+                })
+                .inner
+                .flatten();
+            if let Some(id) = chosen {
+                if row.current.as_deref() != Some(id.as_str()) {
+                    pick = Some((i, id));
+                }
+            }
+        });
+    }
+    if let Some((at, id)) = pick {
+        defaults.apply(at, &id);
+    }
+    // The confirmation of the last pick, or why it failed — never a success
+    // state for a failed write. Painted, not laid out as a row: it is a
+    // sentence, and sentences wrap.
+    if let Some(notice) = defaults.notice.clone() {
+        status_line(ui, theme, width, &notice, theme.status.success_text);
+    }
+    if let Some(error) = defaults.error.clone() {
+        status_line(ui, theme, width, &error, theme.status.danger_text);
+    }
+}
+
+/// One full-width sentence under the dropdowns, in a status colour.
+fn status_line(ui: &mut Ui, theme: &Theme, width: f32, text: &str, color: egui::Color32) {
+    let font = tokens::font(ty::CAPTION, theme);
+    let height = ui
+        .painter()
+        .layout(text.to_owned(), font.clone(), color, width)
+        .size()
+        .y
+        .max(16.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    ui.painter().text(
+        pos2(rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
 }
 
 /// A segment's horizontal padding, either side of the glyph and its label.
@@ -1451,7 +1568,14 @@ mod tests {
             },
             |ui| {
                 let theme = Theme::dark();
-                let _ = draw(ui, &theme, &mut stored, crate::motion::Motion::Full);
+                let mut defaults = crate::default_apps::DefaultApps::default();
+                let _ = draw(
+                    ui,
+                    &theme,
+                    &mut stored,
+                    &mut defaults,
+                    crate::motion::Motion::Full,
+                );
             },
         );
         // The font atlas the first pass built has to be consumed or egui panics
@@ -1461,6 +1585,84 @@ mod tests {
             stored.theme,
             Mode::Dark,
             "drawing the screen must not edit the settings"
+        );
+    }
+
+    #[test]
+    fn the_defaults_section_renders_empty_and_populated() {
+        use crate::default_apps::{DefaultApps, Row};
+        use kestrel_fs::open::{self, Candidate};
+        // Empty: the honest "nothing installed" state, at a narrow width where
+        // every row stacks.
+        let ctx = crate::shot::ctx_with_fonts();
+        let mut stored = Stored::default();
+        let mut defaults = DefaultApps::default();
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(360.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let theme = Theme::dark();
+                let _ = draw(
+                    ui,
+                    &theme,
+                    &mut stored,
+                    &mut defaults,
+                    crate::motion::Motion::Full,
+                );
+            },
+        );
+        out.drop_without_applying_deltas();
+        // Populated: one row with a pick, one without, at full width.
+        let mut full = DefaultApps {
+            rows: open::file_types()
+                .into_iter()
+                .take(2)
+                .map(|kind| Row {
+                    current: Some("viewer.desktop".to_string()),
+                    candidates: vec![Candidate {
+                        id: "viewer.desktop".to_string(),
+                        name: "Viewer".to_string(),
+                        exec: "viewer %U".to_string(),
+                    }],
+                    kind,
+                })
+                .collect(),
+            notice: Some("Viewer now opens images".to_string()),
+            error: None,
+        };
+        // The second row has no current pick: the dropdown must say so rather
+        // than echo the first row's.
+        full.rows[1].current = None;
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(700.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let theme = Theme::dark();
+                let _ = draw(
+                    ui,
+                    &theme,
+                    &mut stored,
+                    &mut full,
+                    crate::motion::Motion::Full,
+                );
+            },
+        );
+        out.drop_without_applying_deltas();
+        assert_eq!(full.rows[0].current_name(), "Viewer");
+        assert_eq!(full.rows[1].current_name(), "Not set");
+        assert!(
+            full.notice.is_some(),
+            "rendering must not clear the confirmation"
         );
     }
 }

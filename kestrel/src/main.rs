@@ -55,6 +55,7 @@
 mod app;
 mod clipboard;
 mod columns;
+mod default_apps;
 mod dialog;
 mod disk;
 mod filetype;

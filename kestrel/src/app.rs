@@ -2478,16 +2478,27 @@ impl KestrelApp {
         // which is what gets saved), so there is nothing to confirm and a
         // confirm would be §4.7's rule applied to a non-destructive action.
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            Self::drop_default_apps_cache(ui);
             self.close_settings();
             return;
         }
         let theme = self.theme;
         let motion = self.motion;
         let before = self.settings;
-        if settings::draw(ui, &theme, &mut self.settings, motion) == settings::Action::Close {
+        // The default-application picks live in egui's temp data, not on the
+        // app: they are system state (`mimeapps.list`), loaded once per entry
+        // and dropped on exit, so reopening always shows what is true now.
+        // Loading walks the desktop directories — once per entry, never per
+        // frame — and a pick writes through immediately inside `draw`.
+        let mut defaults = Self::default_apps_cache(ui);
+        if settings::draw(ui, &theme, &mut self.settings, &mut defaults, motion)
+            == settings::Action::Close
+        {
+            Self::drop_default_apps_cache(ui);
             self.close_settings();
             return;
         }
+        Self::store_default_apps_cache(ui, defaults);
         if self.settings != before {
             // A changed setting that needs a rescan applies immediately rather
             // than on close: `show_hidden` is a scan option, so waiting for the
@@ -2504,6 +2515,39 @@ impl KestrelApp {
     fn close_settings(&mut self) {
         self.apply_settings();
         self.screen = Screen::Browser;
+    }
+
+    /// The temp-data slot holding the default-application picks.
+    fn default_apps_slot() -> egui::Id {
+        egui::Id::new("settings-default-apps")
+    }
+
+    /// The cached picks, or freshly loaded ones on first entry.
+    ///
+    /// A clone out of egui's temp data: the screen draws from the clone and
+    /// writes it back with [`Self::store_default_apps_cache`], so a pick's
+    /// confirmation survives across frames without any per-frame I/O.
+    fn default_apps_cache(ui: &mut Ui) -> crate::default_apps::DefaultApps {
+        if let Some(cached) = ui.data(|data| {
+            data.get_temp::<crate::default_apps::DefaultApps>(Self::default_apps_slot())
+        }) {
+            return cached;
+        }
+        let mut fresh = crate::default_apps::DefaultApps::default();
+        fresh.refresh();
+        fresh
+    }
+
+    /// Writes the picks back for the next frame.
+    fn store_default_apps_cache(ui: &mut Ui, defaults: crate::default_apps::DefaultApps) {
+        ui.data_mut(|data| data.insert_temp(Self::default_apps_slot(), defaults));
+    }
+
+    /// Forgets the picks, so the next entry reloads from the system.
+    fn drop_default_apps_cache(ui: &mut Ui) {
+        ui.data_mut(|data| {
+            data.remove::<crate::default_apps::DefaultApps>(Self::default_apps_slot());
+        });
     }
 
     /// Opens the settings screen.

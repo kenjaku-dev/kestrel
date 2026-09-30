@@ -412,8 +412,12 @@ impl Xdg {
     }
 
     /// The directories `.desktop` files are installed in, most specific first.
+    ///
+    /// `pub` because the settings screen enumerates installed applications
+    /// from them (see [`candidates_for`]); the search order is most specific
+    /// first for the same reason [`Xdg::mimeapps_files`] is ordered.
     #[must_use]
-    fn applications_dirs(&self) -> Vec<PathBuf> {
+    pub fn applications_dirs(&self) -> Vec<PathBuf> {
         let mut out = vec![self.data_home.join("applications")];
         out.extend(self.data_dirs.iter().map(|d| d.join("applications")));
         out
@@ -588,6 +592,396 @@ fn find_desktop_file(xdg: &Xdg, id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Default applications: listing, reading and setting them
+// ---------------------------------------------------------------------------
+
+/// One row of the "default applications" settings screen: a human name and
+/// the MIME types it covers.
+///
+/// The membership mirrors the extension table in `kestrel/src/filetype.rs` —
+/// images are the extensions `filetype` classifies as `Image`, archives the
+/// ones it classifies as `Archive`, and so on — transcribed here as MIME
+/// types because `mimeapps.list` is keyed by MIME, not by extension. There is
+/// deliberately one table, not two: [`mime_for_extension`] plus the test below
+/// pin the two spellings of the same fact together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileType {
+    /// The human name the settings row shows, e.g. `"Images"`.
+    pub name: &'static str,
+    /// The MIME types the row covers, most common first. The first entry is
+    /// the primary type: the one whose default the row displays.
+    pub mimes: &'static [&'static str],
+}
+
+/// Every file type the settings screen offers a default for, in screen order.
+#[must_use]
+pub fn file_types() -> Vec<FileType> {
+    vec![
+        FileType {
+            name: "Images",
+            mimes: &[
+                "image/png",
+                "image/jpeg",
+                "image/gif",
+                "image/webp",
+                "image/svg+xml",
+                "image/bmp",
+                "image/tiff",
+            ],
+        },
+        FileType {
+            name: "Video",
+            mimes: &[
+                "video/mp4",
+                "video/x-matroska",
+                "video/quicktime",
+                "video/webm",
+                "video/x-msvideo",
+                "video/mpeg",
+            ],
+        },
+        FileType {
+            name: "Audio",
+            mimes: &[
+                "audio/mpeg",
+                "audio/flac",
+                "audio/x-wav",
+                "audio/ogg",
+                "audio/mp4",
+            ],
+        },
+        FileType {
+            name: "PDF",
+            mimes: &["application/pdf"],
+        },
+        FileType {
+            name: "Text",
+            mimes: &["text/plain", "text/markdown"],
+        },
+        FileType {
+            name: "Archives",
+            mimes: &[
+                "application/zip",
+                "application/x-tar",
+                "application/gzip",
+                "application/x-7z-compressed",
+                "application/x-bzip2",
+                "application/x-xz",
+                "application/zstd",
+            ],
+        },
+    ]
+}
+
+/// The MIME type the shared database gives `ext`, by name alone.
+///
+/// The same glob lookup [`mime_of`] falls back to when a file cannot be read,
+/// factored out so the settings table can be checked against the database
+/// rather than maintained as a second copy of it. `None` off unix, where there
+/// is no shared database.
+#[must_use]
+#[cfg(unix)]
+pub fn mime_for_extension(ext: &str) -> Option<String> {
+    let probe = format!("probe.{ext}");
+    let types = MIME_DB.get_mime_types_from_file_name(&probe);
+    let found = types.first()?;
+    (!found.essence_str().eq_ignore_ascii_case(DEFAULT_TYPE)).then(|| found.to_string())
+}
+
+/// The MIME type the shared database gives `ext`, by name alone.
+///
+/// Off unix there is no shared database, so there is no answer.
+#[must_use]
+#[cfg(not(unix))]
+pub fn mime_for_extension(_ext: &str) -> Option<String> {
+    None
+}
+
+/// Every installed application that declares `mime`, for a settings dropdown.
+///
+/// A `.desktop` file counts when it says `Type=Application`, is neither
+/// `NoDisplay=true` nor `Hidden=true`, and lists `mime` in `MimeType=`.
+/// De-duplicated by desktop id and sorted by display name. Empty when nothing
+/// is installed for the type — which is the honest empty state, not an error.
+#[must_use]
+pub fn candidates_for(xdg: &Xdg, mime: &str) -> Vec<Candidate> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for dir in xdg.applications_dirs() {
+        for path in desktop_files(&dir) {
+            let Some(id) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(c) = read_candidate(&path, &id, mime) {
+                out.push(c);
+            }
+        }
+    }
+    out.sort_by(|a: &Candidate, b: &Candidate| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// Every `.desktop` file directly in `dir` or one subdirectory down.
+///
+/// One level, not a walk: the desktop entry spec's `vendor/` layout is a
+/// single nesting, and a full recursive walk of `applications/` would sweep up
+/// versioned subdirectories other tools keep there.
+fn desktop_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(nested) = std::fs::read_dir(&path) {
+                out.extend(
+                    nested
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "desktop")),
+                );
+            }
+        } else if path.is_file() && path.extension().is_some_and(|e| e == "desktop") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Reads one desktop file as a candidate for `mime`, if it qualifies.
+///
+/// [`desktop_entry`] answers the same question for a *named* id during
+/// resolution; this one answers it for a *found* file during enumeration, and
+/// additionally honours `Hidden=true`, which resolution deliberately does not
+/// re-check (see [`handler_for`]).
+fn read_candidate(path: &Path, id: &str, mime: &str) -> Option<Candidate> {
+    let entry = parse_file(path).ok()?;
+    let section = entry.section("Desktop Entry")?;
+    if attribute(section, "Type").is_some_and(|t| t.trim() != "Application") {
+        return None;
+    }
+    if attribute(section, "NoDisplay").is_some_and(|v| v.trim() == "true") {
+        return None;
+    }
+    if attribute(section, "Hidden").is_some_and(|v| v.trim() == "true") {
+        return None;
+    }
+    let handles = attribute(section, "MimeType")
+        .is_some_and(|list| list.split(';').map(str::trim).any(|m| m == mime));
+    if !handles {
+        return None;
+    }
+    Some(Candidate {
+        id: id.to_string(),
+        name: attribute(section, "Name")
+            .or_else(|| attribute(section, "GenericName"))
+            .unwrap_or(id)
+            .to_string(),
+        exec: attribute(section, "Exec").unwrap_or_default().to_string(),
+    })
+}
+
+/// Every installed application that declares any of `mimes`.
+///
+/// The union of [`candidates_for`] over the group, de-duplicated by desktop
+/// id. A viewer that handles `image/jpeg` but not `image/png` still belongs in
+/// the Images row: picking it writes it for every type in the row.
+#[must_use]
+pub fn candidates_for_all(xdg: &Xdg, mimes: &[&str]) -> Vec<Candidate> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for mime in mimes {
+        for c in candidates_for(xdg, mime) {
+            if seen.insert(c.id.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    out.sort_by(|a: &Candidate, b: &Candidate| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// The desktop id currently set as the default for `mime`, if any.
+///
+/// The first id in `[Default Applications]` across the `mimeapps.list` files
+/// in spec order, skipping anything `[Removed Associations]` suppresses.
+/// `None` is "not set", reported honestly rather than guessed from
+/// `[Added Associations]`.
+#[must_use]
+pub fn default_for(xdg: &Xdg, mime: &str) -> Option<String> {
+    let files = xdg.mimeapps_files();
+    let removed = removed_associations(&files, mime);
+    for file in &files {
+        let Ok(entry) = parse_file(file) else {
+            continue;
+        };
+        for key in specificity(mime) {
+            for id in list_for(&entry, "Default Applications", &key) {
+                if removed.iter().any(|r| r == &id) {
+                    continue;
+                }
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Sets `id` as the default for `mime`, system-wide.
+///
+/// Writes `~/.config/mimeapps.list` (mechanism (a): direct edit, not
+/// `xdg-mime`), creating it and its directory when absent, and preserving
+/// every other line for every other type. A `[Removed Associations]` entry
+/// for the same pair is dropped, since it would otherwise keep suppressing
+/// the default just written. Other desktop environments read the same file,
+/// so the choice applies outside this app too.
+///
+/// Direct edit rather than shelling out to `xdg-mime` because a rewrite of
+/// one line cannot truncate a hand-maintained file, needs no external binary,
+/// and reports a real `io::Error` when the directory is not writable instead
+/// of failing silently.
+pub fn set_default(xdg: &Xdg, mime: &str, id: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(&xdg.config_home)?;
+    let path = xdg.config_home.join("mimeapps.list");
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = apply_default(&current, mime, id);
+    // Same directory plus rename: either the whole new file lands or nothing
+    // does, never a half-written list.
+    let tmp = xdg
+        .config_home
+        .join(format!(".mimeapps.list.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, updated)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// The new text of `mimeapps.list` with `mime=id` as a default.
+///
+/// Line surgery, not a re-serialisation: every line that is not this MIME's
+/// default — or this pair's removal — passes through byte-identical, including
+/// comments and blank lines. `mime=id` is replaced in place inside an existing
+/// `[Default Applications]` section, inserted after the header when the section
+/// exists without the key, and appended as a new section when it does not.
+fn apply_default(current: &str, mime: &str, id: &str) -> String {
+    const DEFAULTS: &str = "[Default Applications]";
+    const REMOVED: &str = "[Removed Associations]";
+    // Preamble (lines before the first header) plus one entry per section.
+    let mut preamble: Vec<String> = Vec::new();
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    for line in current.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            sections.push((trimmed.to_string(), Vec::new()));
+        } else if let Some((_, body)) = sections.last_mut() {
+            body.push(line.to_string());
+        } else {
+            preamble.push(line.to_string());
+        }
+    }
+    let mut placed = false;
+    if let Some((_, body)) = sections.iter_mut().find(|(h, _)| h == DEFAULTS) {
+        for line in body.iter_mut() {
+            if !placed && key_matches(line, mime) {
+                *line = format!("{mime}={id}");
+                placed = true;
+            }
+        }
+        if !placed {
+            body.push(format!("{mime}={id}"));
+            placed = true;
+        }
+    }
+    if !placed {
+        sections.push((DEFAULTS.to_string(), vec![format!("{mime}={id}")]));
+    }
+    for (header, body) in sections.iter_mut() {
+        if header == REMOVED {
+            let mut kept = Vec::new();
+            for line in body.iter() {
+                if key_matches(line, mime) {
+                    if let Some(k) = without_removal(line, id) {
+                        kept.push(k);
+                    }
+                } else {
+                    kept.push(line.clone());
+                }
+            }
+            *body = kept;
+        }
+    }
+    // An empty section is dropped, not left behind: the entry parser rejects a
+    // file whose trailing group has no keys (verified against
+    // `freedesktop_entry_parser`), which would make the whole file — including
+    // the default just written — unreadable. A header with no entries carries
+    // no associations, so dropping it preserves meaning.
+    sections.retain(|(_, body)| !body.is_empty());
+    let mut out = preamble;
+    for (i, (header, body)) in sections.iter().enumerate() {
+        if i > 0 || !out.is_empty() {
+            // Blank line between blocks, none leading: `lines()` dropped the
+            // original newlines, and a file is sections separated by blanks,
+            // not blanks followed by sections.
+            if out.last().is_some_and(|l: &String| !l.is_empty()) {
+                out.push(String::new());
+            }
+        }
+        out.push(header.clone());
+        out.extend(body.iter().cloned());
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    text
+}
+
+/// `true` when `line` is a `mime=...` entry for exactly `mime`.
+fn key_matches(line: &str, mime: &str) -> bool {
+    match line.split_once('=') {
+        Some((key, _)) => key.trim() == mime,
+        None => false,
+    }
+}
+
+/// `line` with `id` removed from its `;`-separated value, or `None` when
+/// nothing is left and the line should go rather than linger as an empty key.
+fn without_removal(line: &str, id: &str) -> Option<String> {
+    let (key, _value) = line.split_once('=')?;
+    let kept: Vec<&str> = _value
+        .split(';')
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && *v != id)
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(format!("{}={};", key, kept.join(";")))
+}
+
+/// Sets `id` as the default for every type in `mimes`.
+///
+/// One pick in a group row converges the whole group, so a viewer chosen for
+/// Images opens `image/png` *and* `image/jpeg`. Stops at the first error.
+pub fn set_default_for_all(xdg: &Xdg, mimes: &[&str], id: &str) -> std::io::Result<()> {
+    for mime in mimes {
+        set_default(xdg, mime, id)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1571,6 +1965,236 @@ mod tests {
     fn an_empty_exec_line_is_not_a_handler() {
         assert_eq!(parse_exec("", Path::new("/tmp/a")), None);
         assert_eq!(parse_exec("   ", Path::new("/tmp/a")), None);
+    }
+
+    // -- default applications ------------------------------------------------
+
+    /// The dropdown lists every app that declares the type, and nothing else.
+    #[test]
+    fn candidates_list_every_app_for_the_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "alpha.desktop",
+            &entry_file("Alpha", "alpha %f", "image/png"),
+        );
+        desktop(
+            dir.path(),
+            "beta.desktop",
+            &entry_file("Beta", "beta %f", "image/png"),
+        );
+        desktop(
+            dir.path(),
+            "tune.desktop",
+            &entry_file("Tune", "tune %f", "audio/mpeg"),
+        );
+
+        let got = candidates_for(&xdg, "image/png");
+        let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha.desktop", "beta.desktop"]);
+        assert_eq!(got[0].name, "Alpha");
+        assert!(got[0].exec.contains("alpha"));
+    }
+
+    /// `NoDisplay` and `Hidden` entries are helpers, not choices.
+    #[test]
+    fn hidden_apps_are_not_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "nodisplay.desktop",
+            "[Desktop Entry]\nType=Application\nName=NoDisplay\nExec=nd %f\n\
+             NoDisplay=true\nMimeType=image/png;\n",
+        );
+        desktop(
+            dir.path(),
+            "hidden.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hidden\nExec=h %f\n\
+             Hidden=true\nMimeType=image/png;\n",
+        );
+        desktop(
+            dir.path(),
+            "shown.desktop",
+            &entry_file("Shown", "shown %f", "image/png"),
+        );
+
+        let got = candidates_for(&xdg, "image/png");
+        assert_eq!(got.len(), 1, "only the visible app is offered: {got:?}");
+        assert_eq!(got[0].id, "shown.desktop");
+    }
+
+    /// The same desktop id installed twice is one choice, and the list is
+    /// empty — not an error — when nothing handles the type.
+    #[test]
+    fn candidates_deduplicate_and_empty_is_honest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "dup.desktop",
+            &entry_file("Dup", "dup %f", "image/png"),
+        );
+        // A second copy in a lower-precedence directory.
+        let other = xdg.data_dirs[0].join("applications");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        std::fs::write(
+            other.join("dup.desktop"),
+            entry_file("Dup", "dup %f", "image/png"),
+        )
+        .expect("write");
+
+        let got = candidates_for(&xdg, "image/png");
+        assert_eq!(got.len(), 1, "one id, one choice: {got:?}");
+        assert!(candidates_for(&xdg, "application/x-nothing").is_empty());
+    }
+
+    /// The current default is read back, removals suppress it, and "not set"
+    /// is `None` rather than a guess from added associations.
+    #[test]
+    fn the_current_default_is_read_honestly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "viewer.desktop",
+            &entry_file("Viewer", "viewer %U", "image/png"),
+        );
+        desktop(
+            dir.path(),
+            "added.desktop",
+            &entry_file("Added", "added %f", "image/png"),
+        );
+        std::fs::create_dir_all(&xdg.config_home).expect("mkdir");
+        std::fs::write(
+            xdg.config_home.join("mimeapps.list"),
+            "[Default Applications]\nimage/png=viewer.desktop\n\
+             [Added Associations]\naudio/mpeg=added.desktop\n",
+        )
+        .expect("write");
+
+        assert_eq!(
+            default_for(&xdg, "image/png"),
+            Some("viewer.desktop".to_string())
+        );
+        assert_eq!(
+            default_for(&xdg, "audio/mpeg"),
+            None,
+            "an added association is not a default"
+        );
+    }
+
+    /// Setting a default is visible to `default_for` and to `handler_for`,
+    /// and keeps every other type's association intact.
+    #[test]
+    fn setting_a_default_preserves_other_types() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "viewer.desktop",
+            &entry_file("Viewer", "viewer %U", "image/png"),
+        );
+        desktop(
+            dir.path(),
+            "tune.desktop",
+            &entry_file("Tune", "tune %f", "audio/mpeg"),
+        );
+        std::fs::create_dir_all(&xdg.config_home).expect("mkdir");
+        std::fs::write(
+            xdg.config_home.join("mimeapps.list"),
+            "[Default Applications]\naudio/mpeg=tune.desktop\n",
+        )
+        .expect("write");
+
+        set_default(&xdg, "image/png", "viewer.desktop").expect("set");
+        assert_eq!(
+            default_for(&xdg, "image/png"),
+            Some("viewer.desktop".to_string())
+        );
+        assert_eq!(
+            default_for(&xdg, "audio/mpeg"),
+            Some("tune.desktop".to_string()),
+            "the pre-existing association must survive the write"
+        );
+        assert_eq!(
+            handler_for(&xdg, "image/png").expect("resolves").id,
+            "viewer.desktop"
+        );
+    }
+
+    /// A removal for the same pair would keep suppressing the new default, so
+    /// setting it drops the removal. Setting a type twice replaces the line
+    /// rather than appending a second one.
+    #[test]
+    fn setting_clears_a_removal_and_replaces_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = Xdg::isolated(dir.path());
+        desktop(
+            dir.path(),
+            "one.desktop",
+            &entry_file("One", "one %f", "image/png"),
+        );
+        desktop(
+            dir.path(),
+            "two.desktop",
+            &entry_file("Two", "two %f", "image/png"),
+        );
+        std::fs::create_dir_all(&xdg.config_home).expect("mkdir");
+        std::fs::write(
+            xdg.config_home.join("mimeapps.list"),
+            "[Default Applications]\nimage/png=one.desktop\n\
+             [Removed Associations]\nimage/png=two.desktop\n",
+        )
+        .expect("write");
+
+        set_default(&xdg, "image/png", "two.desktop").expect("set");
+        assert_eq!(
+            default_for(&xdg, "image/png"),
+            Some("two.desktop".to_string())
+        );
+        assert_eq!(
+            handler_for(&xdg, "image/png")
+                .expect("no longer removed")
+                .id,
+            "two.desktop"
+        );
+        let text = std::fs::read_to_string(xdg.config_home.join("mimeapps.list")).expect("read");
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("image/png=")).count(),
+            1,
+            "one line per type, not an append: {text:?}"
+        );
+    }
+
+    /// The file-type table and the shared MIME database agree on the common
+    /// extensions — the check that there is one table, not two.
+    #[cfg(unix)]
+    #[test]
+    fn the_file_type_table_agrees_with_the_shared_database() {
+        for (ext, mime) in [
+            ("png", "image/png"),
+            ("mp4", "video/mp4"),
+            ("mp3", "audio/mpeg"),
+            ("pdf", "application/pdf"),
+            ("zip", "application/zip"),
+            ("txt", "text/plain"),
+        ] {
+            assert_eq!(mime_for_extension(ext).as_deref(), Some(mime), "for .{ext}");
+        }
+        for group in file_types() {
+            assert!(!group.mimes.is_empty(), "{} covers nothing", group.name);
+            assert!(
+                candidates_for_all(&Xdg::isolated(Path::new("/nonexistent")), group.mimes)
+                    .is_empty(),
+                "an empty tree has no candidates"
+            );
+        }
+        let names: Vec<&str> = file_types().iter().map(|g| g.name).collect();
+        for want in ["Images", "Video", "Audio", "PDF", "Text", "Archives"] {
+            assert!(names.contains(&want), "no {want} row: {names:?}");
+        }
     }
 }
 
