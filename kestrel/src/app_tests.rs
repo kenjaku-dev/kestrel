@@ -686,46 +686,196 @@ fn a_fade_does_not_move_anything() {
     );
 }
 
+// -- the pane's width policy -------------------------------------------
+
+/// The width of the right-hand panel, as egui actually painted it.
+///
+/// Read back off the frame's own shapes rather than off the plan, because the
+/// whole bug was that the plan and the painted width were two different things.
+/// The app fills the pane with `surface.panel`, and so does the toolbar and the
+/// status bar — but those span the window, so the panel is the right-anchored
+/// rect that does not.
+fn painted_pane_width(out: &egui::FullOutput, app: &KestrelApp, screen_w: f32) -> f32 {
+    let panel = app.theme.surfaces.panel;
+    out.shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Rect(r) => Some((r.rect, r.fill)),
+            _ => None,
+        })
+        .filter(|(rect, fill)| {
+            *fill == panel
+                && rect.right() >= screen_w - 1.0
+                && rect.width() < screen_w - 4.0
+                && rect.width() > 0.0
+        })
+        .map(|(rect, _)| rect.width())
+        .fold(0.0, f32::max)
+}
+
+/// Runs one frame on a context the caller owns, and returns the painted pane
+/// width.
+///
+/// [`one_frame`] builds a fresh `egui::Context` every call, and that is exactly
+/// what hides this bug: `Panel::outer_size` reads a **persisted** `PanelState`
+/// first, so on a brand new context there is nothing persisted and
+/// `default_size` wins. A real window has memory persistence on and writes the
+/// panel's rect to `app.ron`, so from the second frame — and from the next run
+/// — the stored rect wins and `default_size` is dead code. Holding the context
+/// across frames is what reproduces that.
+fn frame_on(ctx: &egui::Context, app: &mut KestrelApp, at: f64, screen: egui::Vec2) -> f32 {
+    let out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen)),
+            time: Some(at),
+            ..Default::default()
+        },
+        |ui| {
+            app.pump();
+            app.draw(ui);
+        },
+    );
+    let width = painted_pane_width(&out, app, screen.x);
+    out.drop_without_applying_deltas();
+    width
+}
+
+/// The settings stepper changes the pane, from the second frame on.
+///
+/// This is the test for the half of the bug that a screenshot cannot see. The
+/// pane is not resizable and was never going to be, but `default_size` is only
+/// the *first* frame's guess: egui persists the panel's rect and prefers it over
+/// `default_size` from then on, so the app re-asserted its width every frame
+/// into a slot nobody read, and moving the stepper in Settings did nothing at
+/// all. `exact_size` fixes it by making the range a point, which the persisted
+/// value is then clamped into.
+///
+/// A row is focused throughout, so the plan is [`PanePlan::Full`] and the number
+/// under test is the configured one — the rail has its own tests.
+#[test]
+fn the_pane_follows_the_setting_from_the_second_frame_on() {
+    let mut app = minimal_app();
+    // One row, focused: the pane has something to describe, so it is the full
+    // configured width rather than the rail.
+    app.rows = vec![row_at("/r", "/r/a.txt")];
+    app.selection.click(0);
+    assert!(
+        app.has_preview_target(),
+        "the fixture row must be previewable"
+    );
+
+    let ctx = egui::Context::default();
+    crate::tokens::fonts::install(&ctx);
+    let screen = egui::vec2(1200.0, 800.0);
+
+    // The first frame has no stored state, so this one *would* have honoured
+    // `default_size` too — it is here to make the second frame's result
+    // unambiguous rather than to be the assertion.
+    let first = frame_on(&ctx, &mut app, 10.0, screen);
+    assert!(
+        (first - settings::PREVIEW_DEFAULT).abs() <= 4.0,
+        "the first frame paints a {first}px pane, not the {}px default",
+        settings::PREVIEW_DEFAULT
+    );
+
+    // The stepper. Then a second frame, on the *same* context, so egui's stored
+    // panel rect is there to be preferred.
+    app.preview_width = 340.0;
+    let second = frame_on(&ctx, &mut app, 10.05, screen);
+    assert!(
+        (second - 340.0).abs() <= 4.0,
+        "after setting the width to 340 the pane painted at {second}px — the stored \
+         panel rect beat the setting"
+    );
+
+    // And a third, to show it is not a one-frame fluke of the store.
+    app.preview_width = settings::PREVIEW_MIN;
+    let third = frame_on(&ctx, &mut app, 10.1, screen);
+    assert!(
+        (third - settings::PREVIEW_MIN).abs() <= 4.0,
+        "after setting the width to {} the pane painted at {third}px",
+        settings::PREVIEW_MIN
+    );
+}
+
 /// The pane policy at a given window width.
 ///
 /// A file manager with three panes in a 640px window is a file manager showing
 /// 160px of a name column. The list is the reason the app exists, so it is the
 /// last pane to give up space — and this is the rule, as a pure function so it
 /// can be checked at every width rather than at the three that were screenshotted.
+///
+/// **This calls [`preview_plan`] rather than restating it.** The older version
+/// of this module re-implemented the policy as `Option<bool>` — shown, shrunk,
+/// or impossible — which meant it was checking a *paraphrase* of the app and
+/// would have gone on passing if the app changed. It did not go on passing: the
+/// paraphrase had no notion of an empty pane at all, so when the rail arrived
+/// here was a module that agreed with nothing. Calling the real function is the
+/// fix, and it is why the widths below can be asserted to the pixel.
 mod pane_policy {
-    use super::LIST_MIN_W;
+    use super::{LIST_MIN_W, PanePlan, preview_plan};
     use crate::dialog::preview_metrics;
     use crate::tokens::metric;
 
     /// What a window of `width` shows.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     struct Plan {
         sidebar: bool,
-        /// `None` when the pane does not fit at any width.
-        preview: Option<bool>,
+        /// `false` when the user has turned the pane off in Settings.
+        want_preview: bool,
+        /// `None` when the pane is wanted but does not fit at any width.
+        preview: Option<PanePlan>,
     }
 
-    /// The policy, mirroring `KestrelApp::panels`.
-    fn plan(width: f32, want_sidebar: bool, want_preview: bool, preview_w: f32) -> Plan {
+    impl Plan {
+        /// What the pane takes off the window, in pixels.
+        ///
+        /// `Hidden` and "turned off" both take nothing, which is correct and is
+        /// why the two are told apart by `want_preview` rather than by the width
+        /// alone.
+        fn preview_taken(&self) -> f32 {
+            match self.preview {
+                None | Some(PanePlan::Hidden) => 0.0,
+                Some(PanePlan::Strip { width }) | Some(PanePlan::Full { width }) => width,
+            }
+        }
+    }
+
+    /// The policy, mirroring `KestrelApp::panels` and then delegating.
+    ///
+    /// `selected` is the app's `has_preview_target`: a row is focused *and*
+    /// still on screen. It is `false` for every browser that has not been
+    /// clicked, which is the state the rail exists for.
+    fn plan(
+        width: f32,
+        want_sidebar: bool,
+        want_preview: bool,
+        preview_w: f32,
+        selected: bool,
+    ) -> Plan {
         let sidebar = want_sidebar && (width - metric::SIDEBAR_WIDTH >= LIST_MIN_W);
         let after = width - if sidebar { metric::SIDEBAR_WIDTH } else { 0.0 };
         let room = after - LIST_MIN_W;
-        let preview = if !want_preview {
-            Some(false)
-        } else if room < preview_metrics::MIN_WIDTH {
-            None
-        } else {
-            Some(preview_w <= room)
-        };
-        Plan { sidebar, preview }
+        let preview = want_preview.then(|| preview_plan(room, preview_w, selected));
+        Plan {
+            sidebar,
+            want_preview,
+            preview,
+        }
+    }
+
+    /// The old four-argument shape, for the tests that do not care about
+    /// selection.
+    fn with_a_selection(width: f32) -> Plan {
+        plan(width, true, true, 280.0, true)
     }
 
     #[test]
     fn a_wide_window_shows_everything_at_the_size_the_user_asked_for() {
         for w in [1200.0, 1000.0, 800.0] {
-            let p = plan(w, true, true, 280.0);
+            let p = with_a_selection(w);
             assert!(p.sidebar, "{w}");
-            assert_eq!(p.preview, Some(true), "{w}");
+            assert_eq!(p.preview, Some(PanePlan::Full { width: 280.0 }), "{w}");
         }
     }
 
@@ -733,13 +883,17 @@ mod pane_policy {
     fn the_preview_shrinks_before_it_disappears() {
         // 640px: sidebar 200 + list 220 leaves 220 for the preview, which is
         // more than its 180 floor, so it shrinks rather than going.
-        let p = plan(640.0, true, true, 280.0);
+        let p = with_a_selection(640.0);
         assert!(p.sidebar);
-        assert_eq!(p.preview, Some(false), "it shrinks rather than vanishing");
+        assert_eq!(
+            p.preview,
+            Some(PanePlan::Full { width: 220.0 }),
+            "it shrinks rather than vanishing"
+        );
         // 500px: 500 - 200 = 300, minus the list's 220 is 80, which is under
         // the pane's own floor, so it cannot be shown at any width.
-        let p = plan(500.0, true, true, 280.0);
-        assert_eq!(p.preview, None);
+        let p = with_a_selection(500.0);
+        assert_eq!(p.preview, Some(PanePlan::Hidden));
     }
 
     #[test]
@@ -747,59 +901,155 @@ mod pane_policy {
         // 420px is the exact crossing: 420 - 200 (the sidebar) leaves the
         // list's 220 and nothing for the preview, so the sidebar stays and the
         // preview cannot. The list is the reason the app exists.
-        let p = plan(420.0, true, true, 280.0);
+        let p = with_a_selection(420.0);
         assert!(p.sidebar);
-        assert_eq!(p.preview, None);
+        assert_eq!(p.preview, Some(PanePlan::Hidden));
         // 419px: the sidebar no longer fits beside a usable list, so it goes —
         // and the room it vacates is enough for the preview at 199px, which is
         // above its 180 floor. The panes trade places rather than both
         // disappearing, which is the whole point of the order.
-        let p = plan(419.0, true, true, 280.0);
+        let p = with_a_selection(419.0);
         assert!(!p.sidebar);
         assert_eq!(
             p.preview,
-            Some(false),
+            Some(PanePlan::Full { width: 199.0 }),
             "it comes back, shrunk, in the sidebar's place"
         );
         // 400px: 400 - 220 leaves 180, exactly the preview's floor.
-        assert_eq!(plan(400.0, true, true, 280.0).preview, Some(false));
+        assert_eq!(
+            with_a_selection(400.0).preview,
+            Some(PanePlan::Full { width: 180.0 })
+        );
         // 399px: under it, so the preview goes as well and the list has the lot.
-        assert_eq!(plan(399.0, true, true, 280.0).preview, None);
+        assert_eq!(with_a_selection(399.0).preview, Some(PanePlan::Hidden));
+    }
+
+    /// The floor is the same for both states, and the crossing is the same
+    /// pixel for both.
+    ///
+    /// 180 is where the pane *starts* being showable; the rail only changes what
+    /// it shows once it is there, never whether it is. A rail at 80px would fit
+    /// in 100px of room, so this test is the one that says the pane is not
+    /// showing itself just because there is nowhere to put it.
+    #[test]
+    fn the_floor_is_the_same_whether_or_not_a_row_is_selected() {
+        let floor = preview_metrics::MIN_WIDTH;
+        // Either side of the floor, for both states.
+        assert_eq!(
+            preview_plan(floor - 0.5, 280.0, false),
+            PanePlan::Hidden,
+            "an empty pane is not shown below the floor either"
+        );
+        assert_eq!(
+            preview_plan(floor, 280.0, false),
+            PanePlan::Strip { width: 80.0 }
+        );
+        assert_eq!(preview_plan(floor - 0.5, 280.0, true), PanePlan::Hidden);
+        assert_eq!(
+            preview_plan(floor, 280.0, true),
+            PanePlan::Full { width: floor }
+        );
+    }
+
+    /// With nothing selected the pane is 80px, whatever the window is doing.
+    ///
+    /// The rail is not a *narrower version* of the pane — it is a different
+    /// thing, and the whole point is that it does not scale with the setting the
+    /// user chose for a pane they are not looking at.
+    #[test]
+    fn nothing_selected_gives_the_pane_a_rail_not_a_small_pane() {
+        for w in [1600.0, 1200.0, 972.0, 800.0, 640.0, 420.0] {
+            let p = plan(w, true, true, 360.0, false);
+            let strip = preview_metrics::STRIP_WIDTH;
+            match p.preview {
+                Some(PanePlan::Strip { width }) => assert_eq!(width, strip, "{w}"),
+                // Below the floor the pane is gone, which is the window being
+                // narrow, not the row being unselected.
+                other => assert_eq!(other, Some(PanePlan::Hidden), "{w}"),
+            }
+        }
+    }
+
+    /// The transition is between two *widths*, at one frame, with no in-between.
+    ///
+    /// §2.11 rule 1 and rule 2 between them: the width is a pure function of
+    /// scalars, recomputed every frame, so there is no state that could
+    /// interpolate. This pins the two numbers either side of the decision, which
+    /// is the only place that could have hidden an animation.
+    #[test]
+    fn the_rail_and_the_pane_are_one_frame_apart_and_nothing_else() {
+        let empty = preview_plan(600.0, 280.0, false);
+        let selected = preview_plan(600.0, 280.0, true);
+        assert_eq!(empty, PanePlan::Strip { width: 80.0 });
+        assert_eq!(selected, PanePlan::Full { width: 280.0 });
+        // The rail is never a pane at its own floor, and the pane is never a
+        // rail: the two states are distinguished by more than a size.
+        assert_ne!(empty, selected);
     }
 
     #[test]
     fn the_list_always_gets_its_minimum() {
         for w in (320..=1600).step_by(4) {
-            let w = w as f32;
-            let p = plan(w, true, true, 280.0);
-            let used = if p.sidebar {
-                metric::SIDEBAR_WIDTH
-            } else {
-                0.0
-            } + match p.preview {
-                None => 0.0,
-                Some(true) => 280.0,
-                Some(false) => {
-                    w - if p.sidebar {
-                        metric::SIDEBAR_WIDTH
-                    } else {
-                        0.0
-                    } - LIST_MIN_W
-                }
-            };
-            assert!(
-                w - used >= LIST_MIN_W - 0.5,
-                "{w}px: panes take {used}, leaving the list {}",
-                w - used
-            );
+            for selected in [true, false] {
+                let w = w as f32;
+                let p = plan(w, true, true, 280.0, selected);
+                let used = if p.sidebar {
+                    metric::SIDEBAR_WIDTH
+                } else {
+                    0.0
+                } + p.preview_taken();
+                assert!(
+                    w - used >= LIST_MIN_W - 0.5,
+                    "{w}px (selected: {selected}): panes take {used}, leaving the list {}",
+                    w - used
+                );
+            }
         }
+    }
+
+    /// An empty pane must not cost the list the column it was costing it.
+    ///
+    /// This is the bug, in the form that matters: a 972px window with a 280px
+    /// pane left the list ~410px, which is under what the `Modified` timestamp
+    /// needs, so the column disappeared — and it disappeared in a window where
+    /// there was nothing at all to preview.
+    #[test]
+    fn an_empty_pane_returns_the_columns_it_was_costing_the_list() {
+        let window = 972.0;
+        let empty = plan(window, true, true, 280.0, false);
+        let full = plan(window, true, true, 280.0, true);
+        let list_of = |p: &Plan| {
+            window
+                - if p.sidebar {
+                    metric::SIDEBAR_WIDTH
+                } else {
+                    0.0
+                }
+                - p.preview_taken()
+        };
+        assert!(
+            !crate::columns::columns_for(list_of(&full), true).modified,
+            "the premise: a full pane does *not* cost the Modified column at {window}px \
+             (list {}px), so this test is no longer about anything",
+            list_of(&full),
+        );
+        assert!(
+            crate::columns::columns_for(list_of(&empty), true).modified,
+            "and the rail must give it back — the list is {}px with the rail against {}px \
+             with the pane",
+            list_of(&empty),
+            list_of(&full),
+        );
     }
 
     #[test]
     fn a_pane_the_user_turned_off_stays_off() {
         for w in [1200.0, 640.0, 420.0] {
-            assert!(!plan(w, false, true, 280.0).sidebar, "{w}");
-            assert_eq!(plan(w, true, false, 280.0).preview, Some(false), "{w}");
+            assert!(!plan(w, false, true, 280.0, true).sidebar, "{w}");
+            let p = plan(w, true, false, 280.0, true);
+            assert!(!p.want_preview, "{w}");
+            assert_eq!(p.preview, None, "{w}");
+            assert_eq!(p.preview_taken(), 0.0, "{w}");
         }
     }
 }

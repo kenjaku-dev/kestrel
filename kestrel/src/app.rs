@@ -580,10 +580,20 @@ pub struct KestrelApp {
     show_preview: bool,
     /// The preview pane's width, from the settings screen.
     ///
-    /// The panel's `default_size` only, and re-asserted every frame for the
-    /// reason `preview_panel` documents: a non-resizable egui panel keeps
-    /// whatever width its content last had, and the content is a column that
-    /// changes shape with the selection.
+    /// The preview pane's own `default_size` is only ever the *first* frame's
+    /// guess: `Panel::outer_size` (egui 0.36.2, `panel.rs:1064`) reads a
+    /// persisted `PanelState` **first** and only falls back to `default_size`
+    /// when there is none — and egui's memory persistence is on by default, so
+    /// from the second frame onwards, and across restarts, the stored rect wins.
+    /// Re-asserting `.default_size(..)` every frame is therefore a no-op, which
+    /// is why the settings stepper could be moved and nothing happened: the only
+    /// thing that ever moved the pane was dragging its separator.
+    ///
+    /// `Panel::exact_size` is what actually holds the line, and not for the
+    /// reason it reads like it should: it does not make the default win, it sets
+    /// `outer_size_range = Rangef::point(size)`, and the loaded `PanelState` is
+    /// then *clamped into that point*. The stored value is still read; it just
+    /// has nowhere to go.
     preview_width: f32,
     /// Whether the Places sidebar is shown.
     show_sidebar: bool,
@@ -2875,18 +2885,6 @@ impl KestrelApp {
         response.clicked()
     }
 
-    /// The preview pane.
-    ///
-    /// Every token here is **derived** — the spec has no §4 section for a preview
-    /// pane, only a `Space` binding for "Quick look". See
-    /// [`crate::dialog::preview_metrics`], which says which scale each value came
-    /// from, so a future §4 section replaces these rather than having to
-    /// reconcile two sets of numbers.
-    ///
-    /// **Never blank.** §4.2's empty-state rule applies with more force here: a
-    /// preview pane that shows nothing is indistinguishable from a broken one, so
-    /// every path renders *something* — the icon, the type, the size, the modified
-    /// time — and only the body is conditional.
     /// `true` when a sidebar and a usable list both fit in `width`.
     ///
     /// Measured against [`metric::SIDEBAR_WIDTH`] rather than
@@ -2902,35 +2900,89 @@ impl KestrelApp {
         width - metric::SIDEBAR_WIDTH >= LIST_MIN_W
     }
 
+    /// The preview pane.
+    ///
+    /// Every token here is **derived** — the spec has no §4 section for a preview
+    /// pane, only a `Space` binding for "Quick look". See
+    /// [`crate::dialog::preview_metrics`], which says which scale each value came
+    /// from, so a future §4 section replaces these rather than having to
+    /// reconcile two sets of numbers.
+    ///
+    /// **Never blank.** §4.2's empty-state rule applies with more force here: a
+    /// preview pane that shows nothing is indistinguishable from a broken one, so
+    /// every path renders *something* — the icon, the type, the size, the modified
+    /// time — and only the body is conditional.
+    ///
+    /// There are two widths and one of them is not the setting. A focused row
+    /// gets the pane the user asked for; nothing focused gets a rail. The width
+    /// is [`preview_plan`]'s to decide and `exact_size`'s to apply, and the long
+    /// comment at the panel's construction is the one that says why those two
+    /// are the right pair — read it before changing either.
     fn preview_panel(&mut self, ui: &mut Ui) {
         let theme = self.theme;
         // The pane gives way before the list does, and only after it has been
         // asked to. Three panes in a 640px window leave the list 160px — one
         // name column with no room for a size, which is not a file manager, it
-        // is a column of truncated names.
-        //
-        // The order of the two questions is the design: first, can the preview
-        // be *shrunk* to what is left after reserving the list's minimum? If
-        // yes, shrink it. If not, it does not fit at all, and a setting that
-        // says "show the preview" is overridden by a window that cannot hold
-        // one — with a line in the status bar saying so, because a pane that
-        // silently stops appearing is the same hidden-affordance bug as a
-        // button that silently stops working.
+        // is a column of truncated names. That order lives in `preview_plan`;
+        // this is only its caller.
         let available = ui.available_width();
         let room = available - LIST_MIN_W;
-        if room < dialog::preview_metrics::MIN_WIDTH {
-            self.pane_too_narrow = true;
-            return;
-        }
-        // `default_size` is only ever the *first* frame's guess — see the note
-        // below about non-resizable panels keeping their last width — so the
-        // settings value is re-asserted every frame, normalised on load, and
-        // the panel's own min/max still bound it.
-        let width = self.preview_width.min(room);
+        // The predicate is the same test `focused_preview_target` makes, minus
+        // the `PathBuf` copy: focus is set *and* the row is still on screen. The
+        // second half matters — a focus index pointing at a row the filter has
+        // hidden has no preview, so it must size the pane like any other empty
+        // one, or the pane would be full-width and empty. `focus()` is O(1) and
+        // allocates nothing, and it is read here rather than inside the closure
+        // so `&mut self` is still unaliased when the panel is built.
+        let plan = preview_plan(room, self.preview_width, self.has_preview_target());
+        let width = match plan {
+            PanePlan::Hidden => {
+                self.pane_too_narrow = true;
+                return;
+            }
+            PanePlan::Strip { width } | PanePlan::Full { width } => width,
+        };
+        // --- the width policy, in the only three lines that matter -----------
+        //
+        // `exact_size`, not `default_size`, and the difference is the whole bug
+        // this replaced. egui's `Panel::outer_size` (0.36.2, `panel.rs:1064`)
+        // reads a **persisted** `PanelState` first and only falls back to
+        // `default_size` when there is none, then clamps whatever it got into
+        // `outer_size_range`. Panel memory persistence is on by default, so from
+        // the second frame onwards — and across restarts, from `app.ron` — the
+        // stored rect wins and `default_size` is dead code. The Settings stepper
+        // changed `preview_width` and the pane did not move; a drag of the
+        // separator was the only thing that ever moved it.
+        //
+        // `exact_size` does not make the default win. It sets
+        // `outer_size_range = Rangef::point(size)`, and the stored value is
+        // still loaded — it is just clamped into a range one pixel wide. The
+        // stored number cannot be the wrong number in a range that has only one
+        // number in it.
+        //
+        // `resizable(false)` is stated rather than implied. A point range already
+        // makes a drag a no-op, but `Panel::new` defaults to `resizable: true`
+        // and a live drag handle over a pane that cannot be dragged is a lie the
+        // next reader has to disprove by reading egui's source. §2.11 rule 2
+        // covers the motion; this is the honesty.
+        //
+        // Do not reach for `Panel::show_collapsible` / `show_switched`. They
+        // interpolate over `Style::animation_time` (200ms, never overridden here)
+        // by translating the panel toward its fixed edge and letting the
+        // allocation follow — §2.11 rule 2 bans animating `width` and `left`, and
+        // §7.13 repeats it. Worse, at `how_expanded == 0.0` `show_collapsible`
+        // returns `None` and draws no panel at all, which is the blank rectangle
+        // "Never blank" exists to prevent. The strip is a width set by
+        // `preview_plan` and applied with `exact_size`, recomputed every frame
+        // from scalars — it has no state to interpolate, and it snaps on the
+        // same frame the selection does, as §2.11 rule 1 requires.
+        //
+        // `min_size`/`max_size` are gone with it: `exact_size` replaces the whole
+        // range, and leaving a second range behind would be the kind of
+        // near-duplicate a later reader has to reconcile.
         egui::Panel::right("preview")
-            .default_size(width)
-            .min_size(dialog::preview_metrics::MIN_WIDTH)
-            .max_size(dialog::preview_metrics::MAX_WIDTH)
+            .resizable(false)
+            .exact_size(width)
             .frame(
                 egui::Frame::new()
                     .fill(theme.surfaces.panel)
@@ -2942,26 +2994,19 @@ impl KestrelApp {
             .show(ui, |ui| {
                 // Pin the content to the full panel width, every frame.
                 //
-                // A **non-resizable** `egui::Panel` does not keep the width it was
-                // given: `Frame::end` derives the panel's outer rect from the
-                // *content's* min rect, and the result is stored in the panel
-                // state and reused from then on. So `default_size(280)` is only
-                // ever the first frame's guess, and the pane settles on the
-                // narrowest moment its content ever has. Measured: the empty
-                // state and the text preview came out 280 and 233 wide in the
-                // same session, and the 233 stuck for the rest of the run — which
-                // is why the meta line in the text preview was being truncated to
-                // fit a pane that had quietly lost 47px.
-                //
-                // A pane's content is a column that spans the pane, so stating
-                // that is not a workaround; it is what the panel is.
+                // The pane's content is a column that spans the pane, so stating
+                // that is not a workaround; it is what the pane is. It is *not*
+                // how the pane's width is decided — that is `exact_size` and
+                // `preview_plan`, above. This line only stops the content from
+                // being narrower than the pane it lives in, which is what put
+                // the eye icon flush against the strip's left edge.
                 ui.set_min_width(ui.available_width());
                 // The entry's preview *inputs* are read out first, so the loader
                 // can be borrowed mutably. Holding `&FileEntry` across
                 // `self.preview.request(..)` is the borrow checker correctly
                 // pointing out that `self` is aliased.
                 let Some(focus) = self.focused_preview_target() else {
-                    self.preview_nothing(ui, &theme);
+                    self.preview_nothing(ui, &theme, matches!(plan, PanePlan::Strip { .. }));
                     return;
                 };
                 let kind = self
@@ -2972,6 +3017,20 @@ impl KestrelApp {
                 }
                 self.preview_body(ui, &theme, kind);
             });
+    }
+
+    /// Whether there is a row for the pane to describe.
+    ///
+    /// Exactly the condition [`Self::focused_preview_target`] tests, without
+    /// building the `PreviewTarget` — the width decision runs before the panel
+    /// exists and must not allocate a `PathBuf` to find out whether to be
+    /// 80 or 280 pixels wide. Both halves are needed: a focus index is not the
+    /// same as a visible row, and a focus pointing at a row the filter has
+    /// hidden has no preview, so the pane sizes and draws as empty.
+    fn has_preview_target(&self) -> bool {
+        self.selection
+            .focus()
+            .is_some_and(|at| self.visible_row(at).is_some())
     }
 
     /// What the preview needs about the focused row, copied out so the loader
@@ -2994,6 +3053,27 @@ impl KestrelApp {
 
     /// Shown when nothing is focused. Metadata-shaped, never blank.
     ///
+    /// `strip` is `true` when the pane is the narrow rail rather than a full
+    /// pane — see [`PanePlan::Strip`]. This function owns both states on
+    /// purpose: the icon, its centring, and the wording are one design decision,
+    /// and two owners would be two chances to disagree about whether the rail is
+    /// a pane.
+    ///
+    /// # Why the strip drops the words
+    ///
+    /// §2 says a label that cannot fit is a layout defect, not a label. At 80px
+    /// wide, "Nothing selected" is six words' worth of a 22px display face in a
+    /// 55px column: it would wrap to three lines, clip to two, and read as a
+    /// rendering failure rather than as an empty state. The sentence beneath it
+    /// is worse — it is the one element in the app that has to be *read*, and
+    /// there is no width to read it in.
+    ///
+    /// So the rail is the icon, centred, and the sentence moves to a tooltip.
+    /// §7.14 is unambiguous that an affordance nobody can find is an anti-goal,
+    /// and §4.11's convention is that a shortcut is discoverable in exactly one
+    /// place — the tooltip — so the rail says which pane it is and which key
+    /// brings it back.
+    ///
     /// # Why this is centred and not offset
     ///
     /// The previous version did `ui.vertical_centered` and then
@@ -3014,10 +3094,18 @@ impl KestrelApp {
     /// (`type.display`) in `text.primary` and the sentence is
     /// `row.empty-body` in `text.secondary` — the same two roles the file list's
     /// own empty state uses, so the two read as the same idea.
-    fn preview_nothing(&mut self, ui: &mut Ui, theme: &Theme) {
+    fn preview_nothing(&mut self, ui: &mut Ui, theme: &Theme, strip: bool) {
         let icon = component::ROW_EMPTY_ICON_SIZE;
         let title = "Nothing selected";
-        let body = "Choose a file to preview it. Space opens quick look.";
+        // Was: "Choose a file to preview it. Space opens quick look."
+        //
+        // Space does not do that. `Act::QuickLook` is bound to Space and sets
+        // `show_preview = true` — which is already true whenever this pane is on
+        // screen at all, so with the pane visible, Space does *nothing*. It is
+        // a promise the app does not keep, printed in the app's own voice, and
+        // §7.14 is an anti-goal by name. The sentence now says only what is
+        // true: pick a file.
+        let body = "Pick a file to see its details.";
         let title_font = tokens::font(component::ROW_EMPTY_TITLE, theme);
         let body_font = tokens::font(component::ROW_EMPTY_BODY, theme);
         let pane = ui.max_rect();
@@ -3029,27 +3117,43 @@ impl KestrelApp {
         // which puts the block a visible few pixels low. `Painter::layout` is the
         // same galley `ui.label` will lay out, so the number is exact and the
         // galley cache makes it free after the first frame.
-        let title_h = ui
-            .painter()
-            .layout(
-                title.to_string(),
-                title_font.clone(),
-                theme.text.primary,
-                pane.width(),
+        //
+        // A strip has no title and no body, so it measures nothing: its column is
+        // the icon and nothing else, and the icon is still placed by the same
+        // arithmetic as the full block. One centring rule, two states.
+        let (title_h, body_h) = if strip {
+            (0.0, 0.0)
+        } else {
+            (
+                ui.painter()
+                    .layout(
+                        title.to_string(),
+                        title_font.clone(),
+                        theme.text.primary,
+                        pane.width(),
+                    )
+                    .size()
+                    .y,
+                ui.painter()
+                    .layout(
+                        body.to_string(),
+                        body_font.clone(),
+                        theme.text.secondary,
+                        pane.width(),
+                    )
+                    .size()
+                    .y,
             )
-            .size()
-            .y;
-        let body_h = ui
-            .painter()
-            .layout(
-                body.to_string(),
-                body_font.clone(),
-                theme.text.secondary,
-                pane.width(),
-            )
-            .size()
-            .y;
-        let column_h = icon + space::S3 + title_h + space::S1 + body_h;
+        };
+        // The gaps go with their labels. `S3` separated the icon from the
+        // subject and `S1` the subject from the sentence; a strip has neither,
+        // and a trailing `S3` below a lone icon would push it 6px above the
+        // vertical centre — enough to be visible and impossible to explain.
+        let column_h = if strip {
+            icon
+        } else {
+            icon + space::S3 + title_h + space::S1 + body_h
+        };
         let top = ((pane.height() - column_h) / 2.0).max(0.0);
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
@@ -3063,13 +3167,22 @@ impl KestrelApp {
                 // invented fraction of a space that has nothing to do with the
                 // block's height.
                 ui.vertical_centered(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(vec2(icon, icon), Sense::hover());
+                    let (rect, response) = ui.allocate_exact_size(vec2(icon, icon), Sense::hover());
                     tokens::icon_glyph(
                         ui.painter(),
                         rect,
                         icons::EYE,
                         component::icon_at(theme.icon.chrome, component::ROW_EMPTY_ICON_ALPHA),
                     );
+                    if strip {
+                        // The only place in the rail that can name what it is.
+                        // `Ctrl+P` is `Act::TogglePreview` — the key that actually
+                        // brings the pane back once it has been switched off, so
+                        // the tooltip advertises the one shortcut that works here
+                        // rather than the one that does nothing.
+                        response.on_hover_text("Preview · Ctrl+P");
+                        return;
+                    }
                     ui.add_space(space::S3);
                     ui.label(
                         RichText::new(title)
@@ -4780,6 +4893,96 @@ fn trailing_segments(segments: &[Segment], available: f32) -> (Vec<&Segment>, us
         used += width_of(&segments[first].label);
     }
     (segments[first..].iter().collect(), first)
+}
+
+/// What the preview pane does with the room the window has left for it.
+///
+/// Three answers, and the width is the only thing that differs between two of
+/// them. A pane that is a strip and a pane that is full draw different things,
+/// but they draw them from this one decision, made before the panel is built —
+/// see [`preview_plan`] and [`KestrelApp::preview_panel`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PanePlan {
+    /// The window cannot hold the pane at its floor. It is not shown at all,
+    /// and the status bar says so.
+    Hidden,
+    /// Nothing is focused, so there is nothing to describe: a narrow rail
+    /// carrying the empty state's icon.
+    ///
+    /// **Not blank** (§4.2). The icon is the whole of the state, and it is
+    /// centred, so the rail reads as "there is a pane here and it is empty"
+    /// rather than as a border with something clipped inside it.
+    Strip { width: f32 },
+    /// A row is focused: the pane is wide enough to hold a filename, a meta
+    /// line and a preview.
+    Full { width: f32 },
+}
+
+/// The preview pane's plan for one frame, as a pure function of two numbers and
+/// a predicate.
+///
+/// # Why a function and not a field
+///
+/// Because a function has no state, it cannot interpolate. The pane's width
+/// changes on the same frame the selection does and for no other reason, and
+/// §2.11 rule 1 is the app's most important motion decision — *"Selection is
+/// instant (0 ms). A fading selection reads as lag in a file list."* An
+/// animated width would be that lag arriving by a side door: the selection ring
+/// would snap while the pane crawled, and the eye would read the crawl as the
+/// file list being slow.
+///
+/// This is also why the obvious egui API is banned here. `Panel::show_collapsible`
+/// and `show_switched` animate over `Style::animation_time` (200ms, never
+/// overridden in this codebase) by translating the panel toward its fixed edge
+/// and letting the allocation follow — §2.11 rule 2 bans animating `width` and
+/// `left`, and §7.13 ("Layout-animating properties") says the same thing again as
+/// an anti-goal. Worse, at `how_expanded == 0.0` `show_collapsible` returns
+/// `None` and draws **no panel at all**, which is precisely the blank rectangle
+/// §4.2's "Never blank" exists to prevent. The strip is a width this function
+/// returns and `Panel::exact_size` applies: recomputed every frame from scalars,
+/// nothing to interpolate, snapping with the selection.
+///
+/// # The three questions, in this order
+///
+/// 1. Can the pane be *shrunk* to what is left after reserving the list's
+///    minimum? If not it does not fit at all — a setting that says "show the
+///    preview" is overridden by a window that cannot hold one, and the status
+///    bar says so, because a pane that silently stops appearing is the same
+///    hidden-affordance bug as a button that silently stops working.
+/// 2. Is there a row to describe? If not, the strip.
+/// 3. Otherwise the configured width, shrunk to fit if it must be.
+#[must_use]
+pub fn preview_plan(room: f32, preview_width: f32, has_target: bool) -> PanePlan {
+    if room < dialog::preview_metrics::MIN_WIDTH {
+        return PanePlan::Hidden;
+    }
+    if has_target {
+        // Shrink-then-hide: the list's minimum is reserved above, so `room` is
+        // already what the pane may have at most.
+        //
+        // The `clamp` is the tail of the panel's old `min_size`/`max_size`
+        // range, applied here because `exact_size` replaced that range with a
+        // single point. `settings::normalize` already clamps the stored value,
+        // so today the clamp is a no-op — but the plan is the total function
+        // that decides the pane's width, and a plan that trusted its caller to
+        // pre-validate the argument is not one.
+        PanePlan::Full {
+            width: preview_width
+                .clamp(
+                    dialog::preview_metrics::MIN_WIDTH,
+                    dialog::preview_metrics::MAX_WIDTH,
+                )
+                .min(room),
+        }
+    } else {
+        PanePlan::Strip {
+            // The `.min(room)` is not ceremony. `MIN_WIDTH` is 180 and the strip
+            // is 80, so today the strip always fits; if a future floor ever
+            // dropped below the strip this is what stops the pane pushing the
+            // list under `LIST_MIN_W`, which is the one invariant here.
+            width: dialog::preview_metrics::STRIP_WIDTH.min(room),
+        }
+    }
 }
 
 /// The middle-truncation budget for `text` in `max_w` — how many characters of

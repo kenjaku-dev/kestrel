@@ -612,8 +612,17 @@ fn body(ui: &mut Ui, theme: &Theme, stored: &mut Stored, action: &mut Action) {
                                     theme,
                                     Row {
                                         label: "Preview width",
+                                        // Was: "How much of the window the preview pane
+                                        // takes." True of the pane, but it said nothing
+                                        // about the state a user actually spends most
+                                        // of their time in — with nothing selected the
+                                        // pane is a rail, and this setting does not
+                                        // apply to it. §7.14: an affordance nobody can
+                                        // account for is an anti-goal.
                                         help: Some(
-                                            "How much of the window the preview pane takes.",
+                                            "How wide the preview pane is when a file is \
+                                             selected. With nothing selected it is a \
+                                             narrow rail.",
                                         ),
                                     },
                                     inner,
@@ -818,6 +827,12 @@ struct Range {
 }
 
 /// The preview pane's range, in logical pixels.
+///
+/// Bounds the **full** state. The rail that replaces the pane when nothing is
+/// selected is not on this scale — it is
+/// [`crate::dialog::preview_metrics::STRIP_WIDTH`] and it does not move with
+/// the stepper, because a user adjusting the width of a pane they are not
+/// looking at is a setting with nothing to do with what they are looking at.
 const PREVIEW_RANGE: Range = Range {
     min: PREVIEW_MIN,
     max: PREVIEW_MAX,
@@ -1270,6 +1285,12 @@ mod tests {
 
     #[test]
     fn a_hand_edited_width_is_clamped_on_load() {
+        // The clamp is load-bearing twice over, and it is worth saying why,
+        // because the second consumer arrived later. It keeps a corrupt or
+        // hand-edited file from asking the panel for a width outside its own
+        // documented range; and it means `preview_plan` — which re-applies the
+        // same bounds, because a plan that trusted its caller to pre-validate
+        // its argument would not be a plan — is never handed something to fix.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("app.ron");
         for (written, expect) in [
@@ -1292,6 +1313,45 @@ mod tests {
             }
             let got = load(Some(&DiskStore::open(path.clone()))).preview_width;
             assert_eq!(got, expect, "wrote {written}");
+        }
+    }
+
+    /// The width that comes off the disk is the width the pane is given.
+    ///
+    /// The two tests above prove the value survives a restart and survives a
+    /// hand-edited file. Neither proves anybody *uses* it — and for a long time
+    /// nobody did: the app re-asserted `.default_size(preview_width)` every
+    /// frame into a slot egui stopped reading after the first frame, because the
+    /// panel's persisted rect outranks it. The stepper was live, the number
+    /// moved, and the pane did not.
+    ///
+    /// So this closes the loop from the other end: a width that has been
+    /// through `DiskStore` is the width [`crate::app::preview_plan`] hands to
+    /// the panel. If the wiring between the setting and the layout is ever
+    /// broken again, this is the test that says so, and it is here rather than
+    /// in `app` because the thing being protected is the *setting*.
+    #[test]
+    fn the_stored_width_is_the_width_the_pane_is_given() {
+        use crate::app::{PanePlan, preview_plan};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.ron");
+        // 600px of room, which is more than the largest width this setting
+        // allows, so the plan is the setting and nothing else.
+        let room = 600.0;
+        for asked in [PREVIEW_MIN, 240.0, PREVIEW_DEFAULT, PREVIEW_MAX] {
+            let mut stored = edited();
+            stored.preview_width = asked;
+            {
+                let mut store = DiskStore::open(path.clone());
+                eframe::set_value(&mut store, KEY, &stored);
+                eframe::Storage::flush(&mut store);
+            }
+            let loaded = load(Some(&DiskStore::open(path.clone()))).preview_width;
+            assert_eq!(
+                preview_plan(room, loaded, true),
+                PanePlan::Full { width: loaded },
+                "asked for {asked}, read back {loaded}"
+            );
         }
     }
 

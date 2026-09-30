@@ -120,6 +120,23 @@ pub mod preview_metrics {
     pub const MAX_WIDTH: f32 = crate::settings::PREVIEW_MAX;
     /// Inner margin — `space::S2`, the same rung the path-quote uses.
     pub const PADDING: f32 = crate::tokens::space::S2;
+    /// What the pane is when there is nothing to describe: a rail, not a pane.
+    ///
+    /// `row.empty-icon` (48) plus `space::S4` (16) of air on each side. The
+    /// arithmetic is the justification. The hard floor for drawing a 48px glyph
+    /// inside this pane's own `S2` padding is 64, and 64 is too tight — the glyph
+    /// ends up 0.5px from the padding after egui's 1px separator margin, which
+    /// reads as an icon that was clipped rather than a rail that was designed.
+    /// 80 is the next round number on the spacing scale that leaves the glyph
+    /// with 7.5px of clear air on each side, and it is still less than a third
+    /// of [`MIN_WIDTH`] — which is the point of the state: with nothing
+    /// selected, a 180–360px pane is 200–300px of an eye icon and a sentence
+    /// that could have been a strip.
+    ///
+    /// This is the *outer* size, so it is the number handed to
+    /// `egui::Panel::exact_size`; the fill is two pixels narrower.
+    pub const STRIP_WIDTH: f32 =
+        crate::tokens::component::ROW_EMPTY_ICON_SIZE + 2.0 * crate::tokens::space::S4;
     /// One text row — `ty::META`'s line height, so the code view and the
     /// metadata list share a baseline grid.
     pub const LINE_H: f32 = 16.0;

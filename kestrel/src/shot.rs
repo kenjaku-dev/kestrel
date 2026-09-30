@@ -856,6 +856,114 @@ mod tests {
     use super::*;
     use crate::app;
 
+    /// The leftmost interior column of the preview pane, measured from the
+    /// picture.
+    ///
+    /// The search is for the pane's own fill colour down the pane's full height,
+    /// and a *majority* of that height rather than a single pixel of it. The
+    /// majority is what makes this work: `surface.panel` also paints the
+    /// toolbar, the status bar and the column header, so a plain
+    /// "first pixel of this colour to the right of centre" finds the column
+    /// header at x = w/2 and calls a 600px pane. The pane is the only region in
+    /// the right-hand half that is this colour for nearly every row of the band.
+    ///
+    /// The result is the first such column, which is one or two pixels inside
+    /// the pane's stroke and separator. That is deliberate — a caller gets a
+    /// column that is definitely the pane and definitely not a border.
+    ///
+    /// Walking in from the window's right edge — which is what the older version
+    /// of these tests did — measures the pane's 1px frame stroke instead,
+    /// because that stroke is the first pixel from the right that is not the
+    /// fill. Every assertion built on that number was therefore checking a
+    /// 20px sliver at the extreme edge of the window and calling it the pane;
+    /// the list-vs-pane test was, in that reading, checking that the *pane* did
+    /// not paint into the *pane*.
+    fn pane_left(image: &ColorImage) -> usize {
+        let w = image.width();
+        let h = image.height();
+        let px = |x: usize, y: usize| {
+            let p = image.pixels[y * w + x];
+            (p.r(), p.g(), p.b())
+        };
+        let top = crate::tokens::metric::TOOLBAR as usize;
+        let bottom = h - crate::tokens::component::STATUSBAR_HEIGHT as usize;
+        // Well inside the pane vertically, and well inside it horizontally: the
+        // pane is at its narrowest when it is a rail, and 20px from the right
+        // edge is inside all three states.
+        let fill = px(w - 20, top + 20);
+        let majority = (bottom - top) / 2;
+        (w / 2..w)
+            .find(|&x| ((top..bottom).filter(|&y| px(x, y) == fill).count()) > majority)
+            .unwrap_or_else(|| panic!("no preview pane fill found in {w}x{h}"))
+    }
+
+    /// An unselected pane is a rail — and the list gets its columns back.
+    ///
+    /// This is the bug this whole state exists for. The pane used to cost its
+    /// full configured width (280 by default, more after a drag) to hold one eye
+    /// icon and the words "Nothing selected", which starved a 972px window's
+    /// list down to ~410px — and at that width [`columns::columns_for`] drops
+    /// the `Modified` timestamp. The column logic is right; the pane was wrong.
+    ///
+    /// So this measures the picture, not the layout function, and then feeds the
+    /// width it measured back into `columns_for`. The second half is the payoff:
+    /// it says the rail is not merely prettier, it is what puts a column back
+    /// into the list.
+    #[test]
+    fn an_unselected_pane_is_a_narrow_rail() {
+        let strip = crate::dialog::preview_metrics::STRIP_WIDTH;
+        // `Scene::Browser` *is* the no-selection scene — see `apply_scene` — so
+        // it is here as well as `PreviewEmpty` to prove the two agree.
+        for scene in [Scene::Browser, Scene::PreviewEmpty] {
+            let image = render(app::Options::default(), scene, Some(BROWSER_SIZE)).expect("render");
+            let left = pane_left(&image);
+            let fill = (image.width() - left) as f32;
+            assert!(
+                fill <= strip,
+                "{scene:?}: the pane is {fill}px wide with nothing selected, so it is \
+                 still paying full width for an empty state (strip is {strip})"
+            );
+            assert!(
+                fill >= strip - 6.0,
+                "{scene:?}: the pane collapsed to {fill}px, below the {strip}px rail — the \
+                 icon would be clipped rather than centred"
+            );
+            // The point of the rail. The list is what is left of the window once
+            // the sidebar has taken its 200.
+            let list = left as f32 - crate::tokens::metric::SIDEBAR_WIDTH;
+            for show_kind in [false, true] {
+                assert!(
+                    crate::columns::columns_for(list, show_kind).modified,
+                    "{scene:?}: at {list}px of list the Modified column is still dropped — \
+                     the rail did not buy it back (show_kind: {show_kind})"
+                );
+            }
+        }
+    }
+
+    /// A selected row brings the pane straight back to its configured width.
+    ///
+    /// The other half of the transition, and the half that a strip-only test
+    /// would leave uncovered: a pane that only ever collapsed would be a pane
+    /// that could not be read. `PreviewText` has a focused row, so the plan is
+    /// [`PanePlan::Full`], and 280 is `PREVIEW_DEFAULT` — which is also the
+    /// check that the settings stepper's default is what the pane actually uses.
+    #[test]
+    fn a_selected_pane_is_its_configured_width() {
+        let full = crate::settings::PREVIEW_DEFAULT;
+        let image = render(
+            app::Options::default(),
+            Scene::PreviewText,
+            Some(BROWSER_SIZE),
+        )
+        .expect("render");
+        let fill = image.width() - pane_left(&image);
+        assert!(
+            (fill as f32 - full).abs() <= 4.0,
+            "a selected row gives a {fill}px pane, not the configured {full}px"
+        );
+    }
+
     /// Every scene must render, in both themes, without hanging.
     ///
     /// The dialogs had never been rendered at all, which is the whole reason
@@ -993,23 +1101,29 @@ mod tests {
                 let p = image.pixels[y * w + x];
                 (p.r(), p.g(), p.b())
             };
-            // The preview pane's fill, sampled from its own middle. Every pixel of
-            // a pane that is not showing an image or text is this colour, and
-            // `Scene::Browser` focuses nothing, so it is the pane's uniform fill.
-            let pane = px(w - 20, h / 2);
+            // The pane's left edge, from the picture's own fill rather than from
+            // the window's edge — see `pane_left`. Walking in from `w - 1` stopped
+            // on the pane's own 1px frame stroke, so the old version scanned
+            // 20px of *pane* looking for list ink. It could not fail.
+            //
+            // `Scene::Browser` focuses nothing, so the pane is one flat colour,
+            // and since it is now a rail that colour is a narrow band rather than
+            // a third of the window. Which is the point: an 80px rail is a
+            // sharper test of "the list stops at the pane's edge" than a 280px
+            // pane was.
+            let pane_left = pane_left(&image);
             // The list's own surface, sampled well inside the list body and on a
             // row, so it is between two rows rather than on one.
             let list_surface = px(400, 110);
-            // Walk in from the right until the pane's fill starts.
-            let Some(pane_left) = (1..w - 1).rev().find(|x| px(*x, h / 2) == pane) else {
-                panic!("no preview pane found at width {width}");
-            };
             // The list band: below the column header, above the status bar.
             let band = 100..(h - 40);
             let mut worst = 0usize;
             for y in band {
-                for x in pane_left.saturating_sub(80)..pane_left {
-                    // Ink is anything in the list that is not the list surface.
+                // The window stops two columns short of `pane_left`: egui draws a
+                // hairline frame stroke and a dim separator there, and neither is
+                // list ink. A list row that reached *them* would still be a bug,
+                // but this test is about the 78 columns beside them.
+                for x in pane_left.saturating_sub(80)..pane_left.saturating_sub(2) {
                     if px(x, y) != list_surface {
                         worst = worst.max(x);
                     }
@@ -1023,17 +1137,35 @@ mod tests {
         }
     }
 
-    /// The preview pane's empty state is centred in the part of the pane the
-    /// user can see.
+    /// The preview empty state is centred in the part of the pane the user can
+    /// see — and when nothing is selected, that part is a rail.
     ///
-    /// The pane used to be *sized* before the status bar existed — an egui panel
-    /// is measured against whatever the root `Ui` has left when it is shown, and
-    /// the status bar is a full-width band that had not been reserved yet — so
-    /// its rectangle ran 25px under the status bar. Nothing about the fill showed
-    /// it, because the status bar and the pane share `surface.panel`. What it did
-    /// show was anything centred in the pane sitting 15px below the middle of the
-    /// visible area, which is a defect no unit test on the layout function could
-    /// have found.
+    /// # Why this grew a second axis
+    ///
+    /// With nothing selected the pane is [`PanePlan::Strip`], so "centred in the
+    /// pane" now has two readings and both are defects worth catching: a block
+    /// that is vertically centred in a 776px rail but shoved to one side reads
+    /// as a layout bug, and a block that is horizontally centred in a 280px pane
+    /// reads fine while the pane is 200px too wide. So the test measures the
+    /// block's ink in both directions against the rail's own rect, and the rail
+    /// width is asserted to be a rail at all.
+    ///
+    /// §4.2's "Never blank" is the property being protected and it has not been
+    /// weakened: the rail still has to draw something, and the first assertion is
+    /// still "the empty state drew nothing in the pane" failing. What changed is
+    /// the thing being centred — a 48px glyph rather than a glyph with a title
+    /// and a sentence under it — because at 80px wide there is no room for the
+    /// other two and §2 has no smaller font to offer.
+    ///
+    /// The original reason for the test is unchanged and still the reason it
+    /// measures the picture: the pane used to be *sized* before the status bar
+    /// existed — an egui panel is measured against whatever the root `Ui` has
+    /// left when it is shown, and the status bar is a full-width band that had
+    /// not been reserved yet — so its rectangle ran 25px under the status bar.
+    /// Nothing about the fill showed it, because the status bar and the pane
+    /// share `surface.panel`. What it did show was anything centred in the pane
+    /// sitting 15px below the middle of the visible area, which is a defect no
+    /// unit test on the layout function could have found.
     ///
     /// So this measures the picture: the block's ink, against the band between
     /// the column header and the status bar. The band's edges are the tokens:
@@ -1068,18 +1200,18 @@ mod tests {
             };
             // The pane's fill, from its own middle.
             let pane_fill = px(w - 20, h / 2);
-            // The pane's left edge: the first list-surface pixel walking left
-            // from the right-hand side.
-            let pane_left = (1..w - 1)
-                .rev()
-                .find(|x| px(*x, h / 2) != pane_fill)
-                .expect("a list surface at mid-height");
+            // The pane's left edge, from the picture's own fill rather than from
+            // the window's edge — see `pane_left`. Walking in from `w - 1` stopped
+            // on the pane's own 1px frame stroke, which made the box below 20px
+            // wide and the whole measurement a description of the border.
+            let pane_left = pane_left(&image);
             // `top + 1`: the toolbar's bottom border is a hairline that spans the
             // whole window, so it lands on the band's first row inside the
             // pane's own x range. Everything below it in the pane belongs to the
             // block, so the bounding box is min..max of the rest.
+            let pane_x: Vec<usize> = (pane_left + 4..w - 4).collect();
             let rows: Vec<usize> = (top + 1..h - bottom_gap)
-                .filter(|y| (pane_left + 4..w - 4).any(|x| px(x, *y) != pane_fill))
+                .filter(|y| pane_x.iter().any(|x| px(*x, *y) != pane_fill))
                 .collect();
             assert!(
                 !rows.is_empty(),
@@ -1093,6 +1225,34 @@ mod tests {
                 (centre - band_centre).abs() < 8.0,
                 "{theme:?}: the empty state is centred at {centre} (rows {start}..\
                  {end}) but the visible pane is centred at {band_centre}"
+            );
+            // The rail, not a pane. `pane_policy` asserts the same width as a
+            // plan; only the picture proves the panel honoured it.
+            let rail = (w - pane_left) as f32;
+            assert!(
+                rail <= crate::dialog::preview_metrics::STRIP_WIDTH,
+                "{theme:?}: nothing is selected, yet the pane is {rail}px wide"
+            );
+            // And the glyph is centred *in the rail*, which is the new part.
+            // `pane_x` is already the rail's interior, so this is the ink's
+            // middle against the rail's.
+            let cols: Vec<usize> = pane_x
+                .iter()
+                .copied()
+                .filter(|x| ((top + 1)..(h - bottom_gap)).any(|y| px(*x, y) != pane_fill))
+                .collect();
+            assert!(
+                !cols.is_empty(),
+                "{theme:?}: the rail drew rows but no columns — the glyph is a smear"
+            );
+            let first = cols[0];
+            let last = cols[cols.len() - 1];
+            let glyph_centre = (first + last) as f32 / 2.0;
+            let rail_centre = (pane_left as f32 + w as f32) / 2.0;
+            assert!(
+                (glyph_centre - rail_centre).abs() < 8.0,
+                "{theme:?}: the glyph is centred at {glyph_centre} (columns {first}..\
+                 {last}) but the rail is centred at {rail_centre}"
             );
         }
     }
