@@ -6,7 +6,22 @@
     <title>Kestrel</title>
   </head>
   <body>
-    <h1>Kestrel</h1>
+    <div id="app">
+      <div id="toolbar">
+        <button id="up-btn" type="button" title="Up one level (Backspace)">Up</button>
+        <span id="path" aria-label="Current path">(no path)</span>
+      </div>
+      <div id="viewport" tabindex="0" role="listbox" aria-label="Directory listing">
+        <div id="spacer"></div>
+        <div id="rows"></div>
+        <div id="state" style="display: none">Loading…</div>
+      </div>
+      <div id="statusbar">
+        <span id="status">Starting…</span>
+        <span id="backend-tag"></span>
+      </div>
+      <div id="perf" style="display: none"></div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

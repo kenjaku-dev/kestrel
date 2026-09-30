@@ -1,0 +1,185 @@
+/* Kestrel Phase 1 — legibility only. No design tokens (Phase 4).
+ * Safari13-safe: flexbox + absolute positioning, no flex `gap`
+ * (needs Safari 14.1+), no content-visibility, no :has, no container
+ * queries. Row offset via transform: translateY. */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  color: #1a1a1a;
+  background: #fff;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100%;
+  min-height: 100vh;
+}
+
+/* Toolbar: margins instead of flex gap for WebKitGTK. */
+#toolbar {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid #ccc;
+  background: #f4f4f4;
+}
+
+#up-btn {
+  font: inherit;
+  margin-right: 8px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+#path {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Viewport: the scroll container. Fixed height via flex; rows windowed. */
+#viewport {
+  position: relative;
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  outline: none;
+  background: #fff;
+}
+
+#viewport:focus {
+  outline: 2px solid #4a90d9;
+  outline-offset: -2px;
+}
+
+#spacer {
+  position: relative;
+  width: 1px;
+}
+
+#rows {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+}
+
+.k-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  box-sizing: border-box;
+  border-bottom: 1px solid #eee;
+  background: #fff;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.k-row.is-selected {
+  background: #d7e9fd;
+}
+
+.k-glyph {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  width: 20px;
+  margin-right: 8px;
+  text-align: center;
+  color: #666;
+  flex: none;
+}
+
+.k-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.k-meta {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: #666;
+  margin-left: 12px;
+  white-space: nowrap;
+  flex: none;
+}
+
+.k-row.is-error .k-glyph {
+  color: #fff;
+  background: #b00020;
+  border-radius: 50%;
+  font-weight: bold;
+}
+
+.k-row.is-error .k-name {
+  color: #b00020;
+}
+
+/* Loading / empty overlay. Margins, not gap. */
+#state {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  background: rgba(255, 255, 255, 0.7);
+  pointer-events: none;
+}
+
+#statusbar {
+  display: flex;
+  align-items: center;
+  padding: 4px 12px;
+  border-top: 1px solid #ccc;
+  background: #f4f4f4;
+  font-size: 12px;
+  color: #555;
+  min-height: 22px;
+}
+
+#status {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#backend-tag {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  margin-left: 8px;
+  color: #888;
+}
+
+#perf {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 4px 12px;
+  border-top: 1px solid #e0c36a;
+  background: #fff8e1;
+  color: #5d4a00;
+  white-space: pre-wrap;
+}
