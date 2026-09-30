@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Phase 1 scaffold: no permissions granted yet.",
+  "windows": ["main"],
+  "permissions": []
+}

@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["kestrel-fs", "kestrel"]
+members = ["kestrel-fs", "kestrel", "src-tauri"]
+# `src-tauri` is a member but NOT a default member. Without this, every bare
+# `cargo build` / `cargo check` / `cargo run` builds the whole Tauri tree too,
+# which under `lto = "fat"` turns a 40s egui build into a ten-minute one — and
+# the egui app is still the daily driver until the Tauri UI is good enough.
+# `cargo test --workspace` still covers all three, so the safety net is intact;
+# only the *default* target set is narrowed.
+default-members = ["kestrel-fs", "kestrel"]
 
 # `kestrel-fs` deliberately has zero UI dependencies so that the filesystem
 # engine stays headless-testable; `kestrel` is the egui/eframe shell that

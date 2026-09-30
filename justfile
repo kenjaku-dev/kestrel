@@ -179,3 +179,11 @@ screenshots:
 # PNG of the wrong thing.
 scenes:
     cargo test -p kestrel --bin kestrel every_scene_renders
+
+# Phase 1 scaffold: run the Tauri shell in dev mode (Vite on :1420).
+run-tauri:
+    cargo tauri dev
+
+# Install the Tauri CLI locally (pinned to the scaffold's Tauri version).
+install-tauri:
+    cargo install tauri-cli --version "^2" --locked
