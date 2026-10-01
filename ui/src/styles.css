@@ -1,7 +1,30 @@
-/* Kestrel Phase 1 — legibility only. No design tokens (Phase 4).
- * Safari13-safe: flexbox + absolute positioning, no flex `gap`
- * (needs Safari 14.1+), no content-visibility, no :has, no container
- * queries. Row offset via transform: translateY. */
+/* Kestrel web UI — application styles.
+
+ * Every visual value below comes from `tokens.css`, which is the transcription
+ * of `docs/design-tokens.md` (the locked spec, mirrored by `kestrel/src/tokens.rs`).
+ * There are no raw hex colours and no hard-coded pixel measurements in this file.
+ * If a value here is not a token, it is structural: `display`, `position`,
+ * `overflow`, `flex`, `white-space`, and the intrinsic `1px` on the scroll
+ * spacer.
+ *
+ * Safari 13 / WebKitGTK (Tauri's oldest renderer) is the floor:
+ *   * flexbox + absolute positioning, NO flex `gap` (Safari 14.1+) — every gap
+ *     is a margin, which is why this file looks margin-heavy.
+ *   * row offset via `transform: translateY`, not the `translate` property.
+ *   * no `:has()`, no container queries, no `content-visibility`, no `@property`,
+ *     no `conic-gradient`, no `:focus-visible` (15.4), no `inset` shorthand
+ *     (14.1). The focus rules use `:focus` for that reason.
+ *   * custom properties are Safari 9.1+, so the whole token layer is safe.
+ *
+ * `index.html` imports nothing and `main.ts` sets `data-theme` on nothing yet;
+ * the theme hooks live in `tokens.css`.
+ */
+
+@import "./tokens.css";
+
+/* ---------------------------------------------------------------------------
+ * Page and app frame.
+ * ------------------------------------------------------------------------ */
 
 html,
 body {
@@ -11,11 +34,10 @@ body {
 }
 
 body {
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  font-size: 14px;
-  line-height: 1.4;
-  color: #1a1a1a;
-  background: #fff;
+  font: var(--kestrel-text-role-ui-font);
+  color: var(--kestrel-text-primary);
+  background: var(--kestrel-surface-app);
+  -webkit-font-smoothing: antialiased;
 }
 
 #app {
@@ -26,128 +48,209 @@ body {
   min-height: 100vh;
 }
 
-/* Toolbar: margins instead of flex gap for WebKitGTK. */
+/* ---------------------------------------------------------------------------
+ * Toolbar. Margins instead of flex gap for WebKitGTK. A layout sibling with a
+ * 1px border, never an overlay (§2.12).
+ * ------------------------------------------------------------------------ */
+
 #toolbar {
   display: flex;
   align-items: center;
-  padding: 8px 12px;
-  border-bottom: 1px solid #ccc;
-  background: #f4f4f4;
+  padding: var(--kestrel-toolbar-padding-y) var(--kestrel-toolbar-padding-x);
+  border-bottom: var(--kestrel-toolbar-border-bottom-width) solid
+    var(--kestrel-toolbar-border-bottom-color);
+  background: var(--kestrel-toolbar-background);
+  z-index: var(--kestrel-toolbar-layer);
 }
 
 #up-btn {
-  font: inherit;
-  margin-right: 8px;
-  padding: 2px 10px;
+  font: var(--kestrel-toolbar-btn-font);
+  margin-right: var(--kestrel-impl-toolbar-group-gap);
+  padding: var(--kestrel-impl-toolbar-btn-padding-y)
+    var(--kestrel-impl-toolbar-btn-padding-x);
   cursor: pointer;
+  color: var(--kestrel-toolbar-btn-label);
+  background: var(--kestrel-toolbar-btn-bg);
+  border: none;
+  border-radius: var(--kestrel-toolbar-btn-radius);
+}
+
+#up-btn:hover {
+  background: var(--kestrel-toolbar-btn-bg-hover);
+}
+
+#up-btn:focus {
+  outline: var(--kestrel-toolbar-btn-ring-width) solid
+    var(--kestrel-toolbar-btn-ring-color);
+  outline-offset: calc(0px - var(--kestrel-toolbar-btn-ring-width));
 }
 
 #path {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 13px;
+  font: var(--kestrel-impl-toolbar-path-font);
+  font-variant-numeric: var(--kestrel-text-role-numeric);
+  color: var(--kestrel-text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* Breadcrumb: buttons with margins (no flex gap); current segment is text. */
+/* Breadcrumb: buttons with margins (no flex gap); the current segment is text,
+ * not a button, and is not clickable — clicking it does nothing. */
 #crumbs {
   display: flex;
   align-items: center;
   flex: 1;
   overflow: hidden;
   white-space: nowrap;
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 13px;
+  font: var(--kestrel-breadcrumb-segment-font);
 }
 
 .k-crumb {
   font: inherit;
-  background: none;
+  background: var(--kestrel-breadcrumb-segment-bg-hover);
   border: none;
-  padding: 2px 4px;
+  padding: var(--kestrel-impl-breadcrumb-segment-padding-y)
+    var(--kestrel-impl-breadcrumb-segment-padding-x);
   cursor: pointer;
-  color: #0b5cc0;
+  color: var(--kestrel-breadcrumb-segment-text);
+  border-radius: var(--kestrel-breadcrumb-segment-radius);
   text-decoration: underline;
 }
 
+.k-crumb:hover {
+  background: var(--kestrel-breadcrumb-segment-bg-hover);
+}
+
 .k-crumb.is-current {
-  color: #1a1a1a;
+  color: var(--kestrel-breadcrumb-segment-text-current);
+  background: none;
   text-decoration: none;
   cursor: default;
+  font: var(--kestrel-breadcrumb-segment-font-current);
 }
 
 .k-sep {
-  color: #999;
-  margin: 0 2px;
+  color: var(--kestrel-breadcrumb-separator-color);
+  opacity: var(--kestrel-breadcrumb-separator-opacity);
+  margin: 0 var(--kestrel-impl-breadcrumb-separator-margin-x);
 }
 
-/* Filter / sort controls: margins instead of flex gap for WebKitGTK. */
+/* Filter / sort controls. */
 #filter {
-  font: inherit;
-  font-size: 13px;
-  width: 160px;
-  margin-left: 8px;
-  padding: 2px 6px;
+  font: var(--kestrel-impl-toolbar-control-font);
+  width: var(--kestrel-impl-filter-width);
+  margin-left: var(--kestrel-impl-toolbar-group-gap);
+  padding: var(--kestrel-impl-toolbar-control-padding-y)
+    var(--kestrel-impl-toolbar-control-padding-x);
+  color: var(--kestrel-input-color);
+  background: var(--kestrel-input-background);
+  border: var(--kestrel-input-border-width) solid var(--kestrel-input-border);
+  border-radius: var(--kestrel-input-radius);
+}
+
+#filter::placeholder {
+  color: var(--kestrel-input-placeholder-color);
+}
+
+#filter:focus {
+  border-color: var(--kestrel-input-border-focus);
+  outline: var(--kestrel-input-ring-width) solid var(--kestrel-input-ring-color);
+  outline-offset: var(--kestrel-input-ring-offset);
 }
 
 #sort-key {
-  font: inherit;
-  font-size: 13px;
-  margin-left: 8px;
-  padding: 2px 4px;
+  font: var(--kestrel-impl-toolbar-control-font);
+  margin-left: var(--kestrel-impl-toolbar-group-gap);
+  padding: var(--kestrel-impl-toolbar-control-padding-y)
+    var(--kestrel-impl-toolbar-control-padding-x);
+  color: var(--kestrel-input-color);
+  background: var(--kestrel-input-background);
+  border: var(--kestrel-input-border-width) solid var(--kestrel-input-border);
+  border-radius: var(--kestrel-input-radius);
 }
 
 #sort-dir {
-  font: inherit;
-  margin-left: 4px;
-  padding: 2px 8px;
+  font: var(--kestrel-impl-toolbar-control-font);
+  margin-left: var(--kestrel-impl-toolbar-tight-gap);
+  padding: var(--kestrel-impl-toolbar-control-padding-y)
+    var(--kestrel-impl-toolbar-control-padding-x);
   cursor: pointer;
+  color: var(--kestrel-toolbar-btn-label);
+  background: var(--kestrel-toolbar-btn-bg);
+  border: none;
+  border-radius: var(--kestrel-toolbar-btn-radius);
+}
+
+#sort-dir:hover {
+  background: var(--kestrel-toolbar-btn-bg-hover);
 }
 
 #hidden-wrap {
-  font-size: 13px;
-  margin-left: 8px;
+  font: var(--kestrel-impl-toolbar-control-font);
+  margin-left: var(--kestrel-impl-toolbar-group-gap);
   white-space: nowrap;
   cursor: pointer;
+  color: var(--kestrel-toolbar-btn-label);
 }
 
-/* Phase 3a — op buttons ride the existing toolbar row. Margins, not flex
- * gap (WebKitGTK / safari13). No re-theming of the existing chrome. */
+#hidden-toggle {
+  accent-color: var(--kestrel-accent-base);
+  vertical-align: middle;
+}
+
+/* Phase 3a — op buttons ride the existing toolbar row. */
 #ops-buttons {
   display: inline;
-  margin-left: 8px;
+  margin-left: var(--kestrel-impl-toolbar-group-gap);
   white-space: nowrap;
 }
 
 #ops-buttons button {
-  font: inherit;
-  font-size: 13px;
-  margin-left: 4px;
-  padding: 2px 8px;
+  font: var(--kestrel-toolbar-btn-font);
+  margin-left: var(--kestrel-impl-toolbar-tight-gap);
+  padding: var(--kestrel-toolbar-btn-padding-y)
+    var(--kestrel-toolbar-btn-padding-x);
   cursor: pointer;
+  color: var(--kestrel-toolbar-btn-label);
+  background: var(--kestrel-toolbar-btn-bg);
+  border: none;
+  border-radius: var(--kestrel-toolbar-btn-radius);
 }
 
-/* Phase 3a — destination prompt + delete confirm. Plain block layout, no
- * dialog element: 3a ships no modal dialogs (the collision dialog is a
- * later phase). Inline form, always obvious which directory is targeted. */
+#ops-buttons button:hover {
+  background: var(--kestrel-toolbar-btn-bg-hover);
+}
+
+#op-delete:hover {
+  color: var(--kestrel-dialog-btn-destructive-text);
+  background: var(--kestrel-dialog-btn-destructive-bg);
+}
+
+/* ---------------------------------------------------------------------------
+ * Phase 3a — destination prompt + delete confirm. Plain block layout, no dialog
+ * element: 3a ships no modal dialogs. Inline form, always obvious which
+ * directory is targeted.
+ * ------------------------------------------------------------------------ */
+
 #op-panel {
-  padding: 6px 12px;
-  border-bottom: 1px solid #ccc;
-  background: #fafafa;
-  font-size: 13px;
+  padding: var(--kestrel-impl-op-panel-padding-y)
+    var(--kestrel-impl-op-panel-padding-x);
+  border-bottom: var(--kestrel-impl-op-panel-border-width) solid
+    var(--kestrel-impl-op-panel-border-color);
+  background: var(--kestrel-impl-op-panel-background);
+  font: var(--kestrel-impl-op-panel-font);
 }
 
 #op-panel .k-op-title {
-  font-weight: bold;
-  margin: 0 0 4px 0;
+  font: var(--kestrel-impl-op-panel-title-font);
+  color: var(--kestrel-impl-op-panel-title-color);
+  margin: 0 0 var(--kestrel-impl-op-panel-target-gap) 0;
 }
 
 #op-panel .k-op-target {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 12px;
-  color: #0b5cc0;
-  margin: 0 0 4px 0;
+  font: var(--kestrel-impl-op-panel-target-font);
+  color: var(--kestrel-impl-op-panel-target-color);
+  margin: 0 0 var(--kestrel-impl-op-panel-target-gap) 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -155,47 +258,83 @@ body {
 
 #op-panel label {
   display: block;
-  margin: 4px 0;
+  margin: var(--kestrel-impl-op-panel-label-gap) 0;
 }
 
 #op-panel input[type="text"] {
-  font: inherit;
-  font-size: 13px;
+  font: var(--kestrel-input-font);
   width: 100%;
-  max-width: 560px;
+  max-width: var(--kestrel-impl-op-panel-input-max-width);
   box-sizing: border-box;
-  padding: 2px 6px;
-  margin-left: 4px;
+  padding: var(--kestrel-impl-op-panel-input-padding-y)
+    var(--kestrel-impl-op-panel-input-padding-x);
+  margin-left: var(--kestrel-impl-op-panel-btn-gap);
+  color: var(--kestrel-input-color);
+  background: var(--kestrel-input-background);
+  border: var(--kestrel-input-border-width) solid var(--kestrel-input-border);
+  border-radius: var(--kestrel-input-radius);
+}
+
+#op-panel input[type="text"]:focus {
+  border-color: var(--kestrel-input-border-focus);
+  outline: var(--kestrel-input-ring-width) solid var(--kestrel-input-ring-color);
+  outline-offset: var(--kestrel-input-ring-offset);
 }
 
 #op-panel .k-op-hint {
-  font-size: 12px;
-  color: #555;
-  margin: 4px 0;
+  font: var(--kestrel-impl-op-panel-hint-font);
+  color: var(--kestrel-impl-op-panel-hint-color);
+  margin: var(--kestrel-impl-op-panel-label-gap) 0;
 }
 
 #op-panel .k-op-warn {
-  font-size: 12px;
-  color: #b00020;
-  margin: 4px 0;
+  font: var(--kestrel-impl-op-panel-warn-font);
+  color: var(--kestrel-impl-op-panel-warn-color);
+  margin: var(--kestrel-impl-op-panel-label-gap) 0;
 }
 
 #op-panel button {
-  font: inherit;
-  font-size: 13px;
-  margin-right: 4px;
-  margin-top: 4px;
-  padding: 2px 10px;
+  font: var(--kestrel-input-font);
+  margin-right: var(--kestrel-impl-op-panel-btn-gap);
+  margin-top: var(--kestrel-impl-op-panel-btn-gap);
+  padding: var(--kestrel-impl-op-panel-btn-padding-y)
+    var(--kestrel-impl-op-panel-btn-padding-x);
   cursor: pointer;
+  color: var(--kestrel-dialog-btn-cancel-text);
+  background: var(--kestrel-dialog-btn-cancel-bg);
+  border: var(--kestrel-dialog-btn-cancel-border-width) solid
+    var(--kestrel-dialog-btn-cancel-border);
+  border-radius: var(--kestrel-dialog-btn-radius);
 }
 
-/* Phase 3a — job list. Separate DOM above the status bar; per-event updates
- * touch only these nodes, never the windower row pool. */
+#op-panel button:hover {
+  background: var(--kestrel-dialog-btn-cancel-bg-hover);
+}
+
+/* The destructive action is the filled one, and it is the one the dialog makes
+ * you read: a red row that fires on every right-click is noise. */
+#op-panel .k-op-warn ~ button,
+#op-panel button.k-op-danger {
+  color: var(--kestrel-dialog-btn-destructive-text);
+  background: var(--kestrel-dialog-btn-destructive-bg);
+  border-color: var(--kestrel-dialog-btn-destructive-bg);
+}
+
+#op-panel button.k-op-danger:hover {
+  background: var(--kestrel-dialog-btn-destructive-bg-hover);
+}
+
+/* ---------------------------------------------------------------------------
+ * Phase 3a — job list. Separate DOM above the status bar; per-event updates
+ * touch only these nodes, never the windower row pool.
+ * ------------------------------------------------------------------------ */
+
 #jobs {
-  border-top: 1px solid #ccc;
-  background: #fafafa;
-  font-size: 12px;
-  max-height: 132px;
+  border-top: var(--kestrel-impl-jobs-border-width) solid
+    var(--kestrel-impl-jobs-border-color);
+  background: var(--kestrel-impl-jobs-background);
+  font: var(--kestrel-impl-jobs-font);
+  max-height: var(--kestrel-impl-jobs-max-height);
   overflow-y: auto;
 }
 
@@ -205,8 +344,10 @@ body {
 
 .k-job {
   display: block;
-  padding: 4px 12px;
-  border-bottom: 1px solid #eee;
+  padding: var(--kestrel-impl-jobs-padding-y)
+    var(--kestrel-impl-jobs-padding-x);
+  border-bottom: var(--kestrel-impl-jobs-divider-width) solid
+    var(--kestrel-impl-jobs-divider-color);
 }
 
 .k-job .k-job-top {
@@ -217,65 +358,84 @@ body {
 }
 
 .k-job .k-job-label {
-  font-weight: bold;
+  font: var(--kestrel-impl-jobs-label-font);
 }
 
 .k-job .k-job-phase {
-  color: #555;
-  margin-left: 8px;
+  color: var(--kestrel-impl-jobs-meta-color);
+  margin-left: var(--kestrel-impl-jobs-meta-gap);
 }
 
 .k-job .k-job-bytes {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  color: #555;
-  margin-left: 8px;
+  font: var(--kestrel-impl-jobs-meta-font);
+  font-variant-numeric: var(--kestrel-text-role-numeric);
+  color: var(--kestrel-impl-jobs-meta-color);
+  margin-left: var(--kestrel-impl-jobs-meta-gap);
 }
 
 /* Native <progress>: the semantic, screen-reader-announced foundation
- * (modern-web-guidance spinner/progress-ring). Deliberately unstylized —
- * the guides' conic-gradient/@property/mask styling is not safari13-safe,
- * so the native control stands as-is. Width only, no custom paint. */
+ * (modern-web-guidance spinner/progress-ring). Deliberately unstylized — the
+ * guides' conic-gradient / @property / mask styling is not Safari-13-safe, so
+ * the native control stands as-is. Width only, no custom paint. */
 .k-job progress {
-  width: 220px;
-  max-width: 40%;
-  height: 14px;
-  margin-left: 8px;
+  width: var(--kestrel-impl-jobs-progress-width);
+  max-width: var(--kestrel-impl-jobs-progress-max-width);
+  height: var(--kestrel-impl-jobs-progress-height);
+  margin-left: var(--kestrel-impl-jobs-progress-gap);
   vertical-align: middle;
 }
 
 .k-job .k-job-note {
   display: block;
-  color: #555;
-  margin-top: 2px;
+  font: var(--kestrel-impl-jobs-note-font);
+  color: var(--kestrel-impl-jobs-note-color);
+  margin-top: var(--kestrel-impl-jobs-note-gap);
 }
 
 .k-job.is-failed .k-job-note {
-  color: #b00020;
+  color: var(--kestrel-impl-jobs-failed-color);
 }
 
 .k-job button {
-  font: inherit;
-  font-size: 12px;
-  margin-left: 8px;
-  padding: 1px 8px;
+  font: var(--kestrel-impl-jobs-font);
+  margin-left: var(--kestrel-impl-jobs-btn-gap);
+  padding: var(--kestrel-impl-jobs-btn-padding-y)
+    var(--kestrel-impl-jobs-btn-padding-x);
   cursor: pointer;
+  color: var(--kestrel-toolbar-btn-label);
+  background: var(--kestrel-toolbar-btn-bg);
+  border: none;
+  border-radius: var(--kestrel-toolbar-btn-radius);
 }
 
-/* Viewport: the scroll container. Fixed height via flex; rows windowed. */
+.k-job button:hover {
+  background: var(--kestrel-toolbar-btn-bg-hover);
+}
+
+/* ---------------------------------------------------------------------------
+ * Viewport: the scroll container. Fixed height via flex; rows windowed.
+ * ------------------------------------------------------------------------ */
+
 #viewport {
   position: relative;
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
   outline: none;
-  background: #fff;
+  background: var(--kestrel-viewport-background);
+  z-index: var(--kestrel-viewport-layer);
 }
 
 #viewport:focus {
-  outline: 2px solid #4a90d9;
-  outline-offset: -2px;
+  outline: var(--kestrel-viewport-focus-ring-width) solid
+    var(--kestrel-viewport-focus-ring-color);
+  outline-offset: var(--kestrel-viewport-focus-ring-offset);
 }
 
+/* The spacer's 1px width is what gives the scroll container something to scroll;
+ * its height is set from JS (`count * ROW_HEIGHT`). Intrinsic, not a design
+ * value — this is the one literal px in the file and it is not a token because
+ * it is not a design decision. */
 #spacer {
   position: relative;
   width: 1px;
@@ -288,62 +448,84 @@ body {
   right: 0;
 }
 
+/* Row height is `--kestrel-row-height`, which is bound to the JS `ROW_HEIGHT`
+ * constant in `lib/windower.ts` (32px). Changing one without the other
+ * desynchronises the window from the scroller. */
 .k-row {
   position: absolute;
   top: 0;
   left: 0;
   right: 0;
-  height: 32px;
+  height: var(--kestrel-row-height);
   display: flex;
   align-items: center;
-  padding: 0 12px;
+  padding: 0 var(--kestrel-row-padding-x);
   box-sizing: border-box;
-  border-bottom: 1px solid #eee;
-  background: #fff;
+  border-bottom: var(--kestrel-row-divider-width) solid
+    var(--kestrel-row-divider-color);
+  background: var(--kestrel-row-bg);
   cursor: default;
   user-select: none;
   -webkit-user-select: none;
 }
 
 .k-row.is-selected {
-  background: #d7e9fd;
+  background: var(--kestrel-row-bg-selected);
+}
+
+/* Selection is a flat tint plus a 2px left bar, never a rounded pill — a pill on
+ * a 26px row leaves 13px of dead vertical space and reads as a chip (§7.6). */
+.k-row.is-selected::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--kestrel-row-selected-bar-width);
+  background: var(--kestrel-row-selected-bar-color);
+  z-index: var(--kestrel-row-selected-bar-layer);
 }
 
 .k-glyph {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 12px;
-  width: 20px;
-  margin-right: 8px;
+  font: var(--kestrel-impl-jobs-meta-font);
+  width: var(--kestrel-impl-glyph-cell-width);
+  margin-right: var(--kestrel-row-icon-gap);
   text-align: center;
-  color: #666;
+  color: var(--kestrel-row-icon-color);
   flex: none;
 }
 
 .k-name {
   flex: 1;
+  font: var(--kestrel-row-font);
+  color: var(--kestrel-row-text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.k-row.is-selected .k-name {
+  font: var(--kestrel-row-font-selected);
+}
+
 .k-meta {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 12px;
-  color: #666;
-  margin-left: 12px;
+  font: var(--kestrel-text-role-meta-font);
+  font-variant-numeric: var(--kestrel-text-role-numeric);
+  color: var(--kestrel-text-tertiary);
+  margin-left: var(--kestrel-row-column-gap);
   white-space: nowrap;
   flex: none;
 }
 
 .k-row.is-error .k-glyph {
-  color: #fff;
-  background: #b00020;
-  border-radius: 50%;
-  font-weight: bold;
+  color: var(--kestrel-text-on-danger);
+  background: var(--kestrel-status-danger-solid);
+  border-radius: var(--kestrel-row-error-badge-radius);
+  font-weight: var(--kestrel-row-error-badge-weight);
 }
 
 .k-row.is-error .k-name {
-  color: #b00020;
+  color: var(--kestrel-status-danger-text);
 }
 
 /* Loading / empty overlay. Margins, not gap. */
@@ -356,20 +538,28 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #666;
-  background: rgba(255, 255, 255, 0.7);
+  color: var(--kestrel-impl-state-overlay-color);
+  background: var(--kestrel-impl-state-overlay-bg);
   pointer-events: none;
+  z-index: var(--kestrel-impl-state-overlay-layer);
 }
+
+/* ---------------------------------------------------------------------------
+ * Status bar. A layout sibling with a 1px border, so it can never obscure a
+ * focused row (§2.12, WCAG 2.2 "Focus Not Obscured").
+ * ------------------------------------------------------------------------ */
 
 #statusbar {
   display: flex;
   align-items: center;
-  padding: 4px 12px;
-  border-top: 1px solid #ccc;
-  background: #f4f4f4;
-  font-size: 12px;
-  color: #555;
-  min-height: 22px;
+  padding: var(--kestrel-statusbar-padding-y)
+    var(--kestrel-statusbar-padding-x);
+  border-top: var(--kestrel-statusbar-top-border-width) solid
+    var(--kestrel-statusbar-top-border);
+  background: var(--kestrel-statusbar-background);
+  font: var(--kestrel-statusbar-label-font);
+  color: var(--kestrel-statusbar-label-color);
+  min-height: var(--kestrel-statusbar-height);
 }
 
 #status {
@@ -380,17 +570,84 @@ body {
 }
 
 #backend-tag {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  margin-left: 8px;
-  color: #888;
+  font: var(--kestrel-text-role-meta-font);
+  margin-left: var(--kestrel-statusbar-section-gap);
+  color: var(--kestrel-text-disabled);
 }
 
+/* Perf HUD. Carries the warning status roles rather than three private ambers:
+ * it is the report a long operation makes, so it should be themed like one. */
 #perf {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 12px;
-  padding: 4px 12px;
-  border-top: 1px solid #e0c36a;
-  background: #fff8e1;
-  color: #5d4a00;
+  font: var(--kestrel-impl-perf-font);
+  font-variant-numeric: var(--kestrel-text-role-numeric);
+  padding: var(--kestrel-impl-perf-padding-y)
+    var(--kestrel-impl-perf-padding-x);
+  border-top: var(--kestrel-impl-perf-border-width) solid
+    var(--kestrel-impl-perf-border-color);
+  background: var(--kestrel-impl-perf-bg);
+  color: var(--kestrel-impl-perf-color);
   white-space: pre-wrap;
+}
+
+/* ---------------------------------------------------------------------------
+ * Scrollbars.
+ *
+ * Fades in on hover and out when idle: a permanent 12px gutter costs horizontal
+ * space in a name column that already competes with four others (§4.9). Painted
+ * with `::-webkit-scrollbar` because that is the only pseudo-element WebKitGTK
+ * honours, and written with explicit longhands so it degrades to a visible
+ * default scrollbar rather than an invisible one where it does not.
+ * -------------------------------------------------------------------------- */
+
+#viewport::-webkit-scrollbar {
+  width: var(--kestrel-scrollbar-width);
+  background: var(--kestrel-scrollbar-track-color);
+}
+
+#viewport::-webkit-scrollbar-thumb {
+  background: var(--kestrel-scrollbar-thumb-color);
+  border-radius: var(--kestrel-scrollbar-thumb-radius);
+  min-height: var(--kestrel-scrollbar-thumb-min-size);
+}
+
+#viewport::-webkit-scrollbar-thumb:hover {
+  background: var(--kestrel-scrollbar-thumb-hover-color);
+}
+
+#viewport::-webkit-scrollbar-thumb:active {
+  background: var(--kestrel-scrollbar-thumb-active-color);
+}
+
+#jobs::-webkit-scrollbar {
+  width: var(--kestrel-scrollbar-width);
+}
+
+#jobs::-webkit-scrollbar-thumb {
+  background: var(--kestrel-scrollbar-thumb-color);
+  border-radius: var(--kestrel-scrollbar-thumb-radius);
+}
+
+/* ---------------------------------------------------------------------------
+ * Reduced motion.
+ *
+ * §2.11 rule 5: every duration is zero except the spinner, and every animated
+ * property renders its final state immediately. The token values are already
+ * overridden in `tokens.css`; this block exists so that when transitions are
+ * wired up (a later phase) there is one place that says "colour only, never
+ * layout" rather than a transition per rule that could animate a box model
+ * property by accident (§2.11 rule 2, §7.13).
+ * ------------------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: var(--kestrel-motion-role-reduced) !important;
+    animation-duration: var(--kestrel-motion-role-reduced) !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* The spinner keeps its duration: it reports that work is ongoing, and a
+   * frozen ring reads as a stuck UI. */
+  .k-job progress {
+    animation-duration: var(--kestrel-motion-role-reduced-spinner) !important;
+  }
 }

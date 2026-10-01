@@ -1,0 +1,1600 @@
+/* ==========================================================================
+   Kestrel design tokens.
+
+   A transcription of `docs/design-tokens.md` — the locked spec. The egui app's
+   `kestrel/src/tokens.rs` is the reference implementation of the same spec and
+   was used to resolve every value the prose left ambiguous.
+
+   THE LAYER RULE (spec, hard). Three layers, and nothing may reach past its
+   neighbour:
+
+     §2 primitives   --kestrel-neutral-100        raw ramp value
+     §3 semantics    --kestrel-surface-base       what a surface should be
+     §4 components   --kestrel-button-bg-hover    what THIS button does on hover
+
+     §3 references §2. §4 references §3. A §4 token that names a hex is a
+     defect. So is a §3 token that names a hex instead of a §2 token: it
+     silently severs the palette from the ramps underneath it, and the whole
+     point of the three-layer design is that swapping a ramp re-themes the app.
+
+   `styles.css` is the only consumer, and it names §4 or §3 tokens only — never
+   a raw hex, never a §2 primitive.
+
+   RENDERER TARGET. WebKitGTK, Tauri's oldest backend, which tracks Safari 13.
+   Everything here is inside that floor:
+
+     * Custom properties — Safari 9.1. Fine.
+     * `@media (prefers-color-scheme: dark)` — Safari 12.1. Fine.
+     * `@media (prefers-reduced-motion: reduce)` — Safari 10.1. Fine.
+     * Overriding the *values* of custom properties from inside `@media` is
+       ordinary cascade work: media queries are matched against the document,
+       never against a computed `var()`, so there is no cycle to worry about.
+       (What does NOT work is `var()` inside a media query *condition* — e.g.
+       `@media (min-width: var(--x))`. Nothing here does that.)
+     * NOT used, all verified above Safari 13: `@property` (16.4), the `inset`
+       shorthand (14.1), flex `gap` (14.1), `conic-gradient`, `:has()`,
+       container queries, `content-visibility`, `:focus-visible` (15.4),
+       `font-size-adjust` (16.4).
+
+   FALLBACKS. None, deliberately. Every token is defined in this one file,
+   which `styles.css` imports unconditionally, so an unset token is a broken
+   build rather than a silently-degraded page — the same totality the Rust gets
+   from `Theme` being a struct of concrete fields rather than a map. Use
+   `var(--x, fallback)` at a *call site* in `styles.css` if a token ever
+   becomes genuinely optional.
+
+   THEMES. §3 defines every role in both light and dark. Light is the default
+   (`:root`), matching the web build as it stands today; dark is applied from
+   `prefers-color-scheme` and can be forced either way with `data-theme` on
+   `<html>`. No code sets `data-theme` yet — the hooks exist so a theme switch
+   is an attribute write and not a second copy of the palette.
+   ========================================================================== */
+
+/* ==========================================================================
+   LAYER 1 — PRIMITIVES (§2)
+
+   Raw values. No meaning attached. Hex, px, ms, unitless weights.
+   ========================================================================== */
+
+:root {
+  /* --------------------------------------------------------------------------
+     §2.1 Neutral ramp — "warm graphite".
+
+     Chroma rises toward the mid-tones and falls off at both ends, which is what
+     keeps a warm ramp from looking muddy. Every step carries ~3–5% warm chroma;
+     a pure-gray ramp is what makes an interface look like a screenshot of a
+     template (spec anti-goal 2).
+     -------------------------------------------------------------------------- */
+  --kestrel-neutral-25: #fcfbf9;    /* brightest light surface */
+  --kestrel-neutral-50: #f7f5f2;
+  --kestrel-neutral-100: #efece7;
+  --kestrel-neutral-150: #e7e3dc;
+  --kestrel-neutral-200: #ded9d1;
+  --kestrel-neutral-300: #cfc9c0;
+  --kestrel-neutral-400: #a79f94;
+  --kestrel-neutral-500: #7c746a;
+  --kestrel-neutral-600: #5e574f;
+  --kestrel-neutral-700: #443f39;
+  --kestrel-neutral-800: #2b2824;
+  --kestrel-neutral-850: #211f1c;
+  --kestrel-neutral-900: #181715;
+  --kestrel-neutral-950: #100f0e;
+  --kestrel-neutral-1000: #0a0a09;  /* near-black, dark theme canvas base */
+
+  /* --------------------------------------------------------------------------
+     §2.1 (continued) — graphite values §3 assigns to a role that §2.1's ramp
+     does not contain.
+
+     This is not padding. §2.1 has a gap: the dark half of §3 leans on a band
+     of warm neutrals between `neutral.800` and `neutral.1000` that the ramp
+     steps straight over. `#131211` (`surface.app` dark), `#1E1C1A`
+     (`surface.list` dark), `#4A453F` (`text.secondary` light) and 15 others are
+     all live, measured values with no rung to point at. The spec's own §8 D-4
+     notices one of them (`#24221F`) and deliberately declines to close the gap,
+     because inserting a rung renumbers the ramp and invalidates every contrast
+     row in §6 that names it.
+
+     Rather than let those values leak into §3 as raw hex — which is exactly
+     the failure the layer rule exists to prevent — they are given primitive
+     names here. They are raw values, as §2 requires; the names label the
+     value, not the job. Closing D-4 properly later is an edit to this block
+     and to nothing else.
+     -------------------------------------------------------------------------- */
+  --kestrel-graphite-ink: #1c1a17;     /* §3.2 text.primary (light); §2.10 shadow + scrim ink */
+  --kestrel-graphite-mid: #4a453f;     /* §3.2 text.secondary (light); §3.7 icon.chrome (light) */
+  --kestrel-graphite-muted: #8c857c;   /* §3.2 text.disabled (light) */
+  --kestrel-graphite-bright: #f0ede8;   /* §3.2 text.primary (dark); §3.4 state.hover (light) */
+  --kestrel-graphite-faint: #a6a099;   /* §3.2 text.tertiary (dark) */
+  --kestrel-graphite-ghost: #726d66;   /* §3.2 text.disabled (dark) */
+  --kestrel-graphite-edge: #6f6961;    /* §3.3 border.strong (dark) */
+  --kestrel-graphite-rule: #3d3a35;    /* §3.3 border.default (dark) */
+  --kestrel-graphite-hairline: #2c2a27; /* §3.3 border.subtle (dark); §3.4 state.hover-strong (dark) */
+  --kestrel-graphite-lift: #24221f;    /* §3.4 state.hover (dark) — §8 D-4's documented orphan */
+  --kestrel-graphite-canvas: #131211;  /* §3.1 surface.app / surface.chrome; §3.4 state.pressed (dark) */
+  --kestrel-graphite-panel: #191817;   /* §3.1 surface.panel / input-disabled (dark) */
+  --kestrel-graphite-sheet: #1e1c1a;   /* §3.1 surface.list / surface.input (dark) */
+  --kestrel-graphite-pale: #b8b2a9;    /* §3.8 scrollbar.thumb-active (dark) */
+  --kestrel-graphite-wash: #e1dcd3;    /* §3.4 state.pressed (light) */
+  --kestrel-graphite-thumb: #7a7268;      /* §3.8 scrollbar.thumb (light) */
+  --kestrel-graphite-thumb-deep: #68615a; /* §3.8 scrollbar.thumb-hover (light) */
+  --kestrel-graphite-thumb-mid: #78716a;  /* §3.8 scrollbar.thumb (dark) */
+  --kestrel-graphite-thumb-lift: #948d84; /* §3.8 scrollbar.thumb-hover (dark) */
+
+  /* Tinted values with no ramp either — the dark selection washes, the dark
+     status backgrounds and borders, and the two dark accent steps that §6.5
+     entries 9 and 14 landed on by measurement. */
+  --kestrel-tint-teal-ink: #08221d;    /* §3.2 text.on-accent (dark); §3.5 accent.on (dark) */
+  --kestrel-tint-teal-deep: #16332f;   /* §3.4 state.selected (dark); §3.5 accent.subtle-bg (dark); §3.6 status.info-bg (dark) */
+  --kestrel-tint-teal-lift: #1a3a34;   /* §3.4 selected-hover / focus-within / drop-target (dark) */
+  --kestrel-tint-teal-wash: #bcded5;   /* §3.4 state.selected-hover (light) */
+  --kestrel-tint-teal-mute: #3f8478;   /* §3.5 accent.border (dark) — §6.5 entry 14 */
+  --kestrel-tint-teal-bright: #8fe6d4; /* §3.5 accent.pressed (dark) */
+  --kestrel-tint-red-deep: #331614;    /* §3.6 status.danger-bg (dark) */
+  --kestrel-tint-green-deep: #182b19;  /* §3.6 status.success-bg (dark) */
+  --kestrel-tint-green-mute: #2b4a2d;  /* §3.6 status.success-border (dark) */
+  --kestrel-tint-amber-deep: #332811;  /* §3.6 status.warning-bg (dark) */
+  --kestrel-tint-amber-mute: #4a3a15;  /* §3.6 status.warning-border (dark) */
+
+  /* The two extremes of the sRGB range. §1.4 restricts pure white to overlays
+     and lifted surfaces, and §2.10 needs black for the dark shadow ink, so both
+     are system-wide raw values rather than one component's private constant. */
+  --kestrel-white: #ffffff;
+  --kestrel-black: #000000;
+
+  /* --------------------------------------------------------------------------
+     §2.2 Accent ramp — "pine teal". The only hue in the UI chrome.
+
+     Blue is refused by policy (anti-goal 1): the accent is `#0E6B5F` light,
+     `#4FC7B1` dark, and nothing else. Blue is the colour of every
+     AI-generated interface ever shipped.
+     -------------------------------------------------------------------------- */
+  --kestrel-accent-50: #e8f5f1;
+  --kestrel-accent-100: #dcf0ea;
+  --kestrel-accent-200: #c9e6df;
+  --kestrel-accent-300: #a6d6cb;
+  --kestrel-accent-400: #5fc0ac;
+  --kestrel-accent-500: #33a894;
+  --kestrel-accent-600: #0e6b5f;      /* base accent, light theme */
+  --kestrel-accent-700: #0a5449;
+  --kestrel-accent-800: #073b33;
+  --kestrel-accent-900: #052b25;
+  --kestrel-accent-400-dark: #4fc7b1; /* base accent, dark theme */
+  --kestrel-accent-300-dark: #6bd9c4;
+
+  /* --------------------------------------------------------------------------
+     §2.3 Status ramps.
+
+     Teal accent (hue ~172°), green success (~130°), amber warning (~42°), red
+     danger (~4°). The three status hues are ≥40° apart from each other and
+     from the accent, and every status is ALWAYS paired with a distinct glyph:
+     colour is never the sole channel.
+     -------------------------------------------------------------------------- */
+  --kestrel-danger-50: #fbe9e7;
+  --kestrel-danger-100: #f7d5d1;
+  --kestrel-danger-300: #d96a62;
+  --kestrel-danger-400: #e05a50;
+  --kestrel-danger-500: #b3261e;
+  --kestrel-danger-600: #8f1d17;
+  --kestrel-danger-700: #6e1610;
+  --kestrel-danger-400-dark: #f2837c;
+  --kestrel-danger-600-dark: #5a1512;
+
+  --kestrel-success-50: #e4f2e4;
+  --kestrel-success-100: #cfe7d0;
+  --kestrel-success-300: #8cbf8f;
+  --kestrel-success-400: #4e9a52;
+  --kestrel-success-500: #286a2a;
+  --kestrel-success-600: #1d4e1f;
+  --kestrel-success-400-dark: #7fce85;
+
+  --kestrel-warning-50: #fbf0d9;
+  --kestrel-warning-100: #f6e3b8;
+  --kestrel-warning-300: #e3c470;
+  --kestrel-warning-400: #c99a1e;
+  --kestrel-warning-500: #7a5100;
+  --kestrel-warning-600: #5e3f00;
+  --kestrel-warning-400-dark: #e0b461;
+
+  /* --------------------------------------------------------------------------
+     §2.4 File-type hue slots.
+
+     This is the entire colour budget of the app: every other surface is
+     neutral. Each slot is desaturated to sit on warm graphite without shouting
+     and clears 3:1 against every surface in both themes (§6.3). Used as an icon
+     fill, never as a background.
+
+     `text` and `binary` are intentionally identical — an unclassifiable binary
+     and a plain document are both "no hue", and inventing a colour for
+     "unknown" would make the colour column meaningless.
+     -------------------------------------------------------------------------- */
+  --kestrel-hue-folder-light: #9a6510;
+  --kestrel-hue-folder-dark: #d8a548;
+  --kestrel-hue-text-light: #5e574f;
+  --kestrel-hue-text-dark: #b8b2a9;
+  --kestrel-hue-code-light: #5b3ea8;
+  --kestrel-hue-code-dark: #a794f5;
+  --kestrel-hue-image-light: #a6326e;
+  --kestrel-hue-image-dark: #e88ab4;
+  --kestrel-hue-video-light: #7a3abf;
+  --kestrel-hue-video-dark: #c199f2;
+  --kestrel-hue-audio-light: #286a2a;
+  --kestrel-hue-audio-dark: #7fce85;
+  --kestrel-hue-archive-light: #9a4520;
+  --kestrel-hue-archive-dark: #e0a184;
+  --kestrel-hue-binary-light: #5e574f;
+  --kestrel-hue-binary-dark: #b8b2a9;
+  --kestrel-hue-executable-light: #1f5e8a;
+  --kestrel-hue-executable-dark: #6fb6e0;
+  --kestrel-hue-symlink-light: #0e6b5f;
+  --kestrel-hue-symlink-dark: #4fc7b1;
+  --kestrel-hue-hidden-light: #6a635a;
+  --kestrel-hue-hidden-dark: #948e85;
+  --kestrel-hue-error-light: #b3261e;
+  --kestrel-hue-error-dark: #f2837c;
+
+  /* --------------------------------------------------------------------------
+     §2.5 Spacing — 4px base with a 2px half-step.
+
+     The app runs three density bands (chrome 8/12/16, list 4/8/10, icon gutter
+     0/2/10) and every value is chosen by role, not by picking the next rung up
+     the ladder — one uniform spacing scale everywhere is the layout equivalent
+     of a default font (anti-goal 4). The 2px half-step exists because a 4px
+     rhythm is too coarse inside a 26px file row.
+     -------------------------------------------------------------------------- */
+  --kestrel-space-0: 0px;
+  --kestrel-space-half: 2px;
+  --kestrel-space-1: 4px;
+  --kestrel-space-1-5: 6px;
+  --kestrel-space-2: 8px;
+  --kestrel-space-2-5: 10px;
+  --kestrel-space-3: 12px;
+  --kestrel-space-4: 16px;
+  --kestrel-space-5: 20px;
+  --kestrel-space-6: 24px;
+  --kestrel-space-8: 32px;
+  --kestrel-space-10: 40px;
+  --kestrel-space-12: 48px;
+
+  /* --------------------------------------------------------------------------
+     §2.6 Radii. `radius.pill` is for chips and toggles; the file row is capped
+     at `radius.sm` by anti-goal 6, because a pill on a 26px row leaves 13px of
+     dead vertical space and reads as a chip rather than a row.
+     -------------------------------------------------------------------------- */
+  --kestrel-radius-none: 0px;
+  --kestrel-radius-xs: 2px;
+  --kestrel-radius-sm: 3px;
+  --kestrel-radius-md: 4px;
+  --kestrel-radius-lg: 6px;
+  --kestrel-radius-xl: 8px;
+  --kestrel-radius-2xl: 12px;
+  --kestrel-radius-pill: 999px;
+
+  /* --------------------------------------------------------------------------
+     §2.7 Border widths.
+     -------------------------------------------------------------------------- */
+  --kestrel-border-hairline: 1px;     /* all separators, input borders, menu outline */
+  --kestrel-border-thick: 2px;        /* focus ring, selection left bar */
+  --kestrel-border-marker: 3px;       /* active-pane indicator bar */
+  --kestrel-border-hidden-marker: 4px; /* diameter of the hidden-file dot */
+
+  /* --------------------------------------------------------------------------
+     §2.8 Typography.
+
+     IBM Plex Sans (400/500/600) for human names; IBM Plex Mono (400/500) for
+     machine values only — sizes, dates, counts, permissions, the status-bar
+     path. The mono/sans split is a hard rule, not a preference: monospace for
+     data because digits must line up and compare, proportional for names
+     because that is what makes a filename column scannable.
+
+     NOT `system-ui`, NOT Inter, NOT Roboto (anti-goal 3). `system-ui` is
+     refused specifically because it silently changes meaning on every platform
+     the app runs on, and Kestrel is developed by one person on more than one
+     machine.
+
+     The faces are not bundled into the web build yet — the fallback chain below
+     is what §2.8 specifies for that case, and it lands on DejaVu Sans /
+     DejaVu Sans Mono, which is the Linux box this is developed on.
+     -------------------------------------------------------------------------- */
+  --kestrel-font-sans: "IBM Plex Sans", "DejaVu Sans", sans-serif;
+  --kestrel-font-mono: "IBM Plex Mono", "DejaVu Sans Mono", monospace;
+
+  /* The type scale. Sizes are absolute px; the base body is 13px because that is
+     the largest size that still fits ~34 file rows in a 900px list. No token
+     goes above 22px, none below weight 400, none above 700. */
+  --kestrel-type-micro-size: 10px;
+  --kestrel-type-micro-line: 14px;
+  --kestrel-type-micro-weight: 500;
+  --kestrel-type-micro-tracking: 0.04em;
+
+  --kestrel-type-caption-size: 11px;
+  --kestrel-type-caption-line: 15px;
+  --kestrel-type-caption-weight: 400;
+
+  --kestrel-type-label-size: 11px;
+  --kestrel-type-label-line: 15px;
+  --kestrel-type-label-weight: 600;
+  --kestrel-type-label-tracking: 0.06em;
+  --kestrel-type-label-transform: uppercase;
+
+  --kestrel-type-meta-size: 12px;
+  --kestrel-type-meta-line: 16px;
+  --kestrel-type-meta-weight: 400;
+
+  --kestrel-type-meta-strong-size: 12px;
+  --kestrel-type-meta-strong-line: 16px;
+  --kestrel-type-meta-strong-weight: 500;
+
+  --kestrel-type-status-size: 12px;
+  --kestrel-type-status-line: 16px;
+  --kestrel-type-status-weight: 400;
+
+  --kestrel-type-ui-size: 13px;
+  --kestrel-type-ui-line: 18px;
+  --kestrel-type-ui-weight: 400;
+
+  --kestrel-type-ui-strong-size: 13px;
+  --kestrel-type-ui-strong-line: 18px;
+  --kestrel-type-ui-strong-weight: 500;
+
+  --kestrel-type-ui-heading-size: 13px;
+  --kestrel-type-ui-heading-line: 18px;
+  --kestrel-type-ui-heading-weight: 600;
+
+  --kestrel-type-name-size: 13px;
+  --kestrel-type-name-line: 18px;
+  --kestrel-type-name-weight: 400;
+
+  --kestrel-type-name-selected-size: 13px;
+  --kestrel-type-name-selected-line: 18px;
+  --kestrel-type-name-selected-weight: 500;
+
+  --kestrel-type-dialog-body-size: 13px;
+  --kestrel-type-dialog-body-line: 20px;
+  --kestrel-type-dialog-body-weight: 400;
+
+  --kestrel-type-dialog-title-size: 15px;
+  --kestrel-type-dialog-title-line: 21px;
+  --kestrel-type-dialog-title-weight: 600;
+
+  --kestrel-type-verb-size: 13px;
+  --kestrel-type-verb-line: 18px;
+  --kestrel-type-verb-weight: 700;
+  --kestrel-type-verb-tracking: 0.01em;
+
+  --kestrel-type-display-size: 22px;
+  --kestrel-type-display-line: 28px;
+  --kestrel-type-display-weight: 600;
+  --kestrel-type-display-tracking: -0.01em;
+
+  /* Monospace values get tabular figures so digits occupy the same cell and a
+     column of sizes can be compared by eye. Safari 9.1+, so it is safe here;
+     a face without tabular variants (DejaVu Sans Mono) simply ignores it. */
+  --kestrel-type-numeric: tabular-nums;
+
+  /* --------------------------------------------------------------------------
+     §2.9 Layout metrics.
+     -------------------------------------------------------------------------- */
+  --kestrel-metric-row: 26px;                /* default file list row height */
+  --kestrel-metric-row-compact: 22px;        /* density: compact */
+  --kestrel-metric-row-comfortable: 32px;    /* density: comfortable, icon 20px */
+  --kestrel-metric-column-header: 24px;
+  --kestrel-metric-toolbar: 34px;
+  --kestrel-metric-breadcrumb: 28px;
+  --kestrel-metric-status-bar: 24px;
+  --kestrel-metric-sidebar-item: 26px;       /* must equal metric.row */
+  --kestrel-metric-sidebar-width: 200px;
+  --kestrel-metric-sidebar-width-min: 160px;
+  --kestrel-metric-sidebar-width-max: 340px;
+  --kestrel-metric-icon: 16px;               /* list icons; never below 14 */
+  --kestrel-metric-icon-compact: 14px;       /* compact density, Regular weight only */
+  --kestrel-metric-icon-chrome: 18px;        /* toolbar / sidebar */
+  --kestrel-metric-icon-lg: 20px;            /* comfortable density */
+  --kestrel-metric-target-min: 24px;         /* WCAG 2.2 minimum hit target */
+  --kestrel-metric-scrollbar: 12px;          /* full hit area */
+  --kestrel-metric-scrollbar-thumb: 6px;     /* visible thumb */
+  --kestrel-metric-gutter: 10px;             /* leading gutter before the icon */
+  --kestrel-metric-gutter-marker: 3px;       /* gutter reserved for the hidden-file dot */
+  --kestrel-metric-column-name-min: 160px;   /* flexible column, min */
+  --kestrel-metric-column-size: 88px;        /* right-aligned */
+  --kestrel-metric-column-kind: 92px;
+  --kestrel-metric-column-modified: 140px;   /* right-aligned */
+  --kestrel-metric-column-permissions: 108px; /* mono, right-aligned */
+
+  /* --------------------------------------------------------------------------
+     §2.10 Elevation.
+
+     Shadows appear on OVERLAYS ONLY — menus, dialogs, tooltips, the drag ghost.
+     Chrome is flat and separated by hairlines. That is not restraint, it is
+     the point: shadow on every surface is the single strongest "generic
+     dashboard" tell there is (anti-goal 8).
+
+     Elevation degrades gracefully — if shadows are unavailable in the host,
+     menus and dialogs must still carry `border.strong` plus the light-mode
+     inner highlight, so the overlay boundary survives on its own.
+     -------------------------------------------------------------------------- */
+  --kestrel-shadow-ink-light: #1c1a17;
+  --kestrel-shadow-ink-dark: #000000;
+
+  --kestrel-elev-0: none;
+
+  /* The list's in-flight veil, raw. §3.1 gives it no role because the spec does
+   * not describe the loading state — §4.2's empty-state block covers the *empty
+   * directory*. So the composite is a primitive here and `surface.list-veil` in
+   * §3 is the role components consume.
+   *
+   * Deliberately not `surface.scrim`: that is a 38% black MODAL backdrop, and a
+   * modal backdrop over a loading list reads as "something is blocking you" when
+   * nothing is. This is a 70% wash of the list's own surface — it hides the
+   * half-painted rows without announcing a dialog. */
+  --kestrel-veil-light: rgba(255, 255, 255, 0.7);
+  --kestrel-veil-dark: rgba(19, 18, 17, 0.7);
+  /* `elev.1` — menus, tooltips. Offset 6, blur 18, spread −4 (contracted). */
+  --kestrel-elev-1-light: 0 6px 18px -4px rgba(28, 26, 23, 0.12);
+  --kestrel-elev-1-dark: 0 6px 18px -4px rgba(0, 0, 0, 0.55);
+  /* `elev.2` — dialogs. Offset 16, blur 40, spread −12. */
+  --kestrel-elev-2-light: 0 16px 40px -12px rgba(28, 26, 23, 0.22);
+  --kestrel-elev-2-dark: 0 16px 40px -12px rgba(0, 0, 0, 0.65);
+  /* `elev.3` — the drag ghost. Offset 2, blur 6, spread 0. */
+  --kestrel-elev-3-light: 0 2px 6px 0 rgba(28, 26, 23, 0.1);
+  --kestrel-elev-3-dark: 0 2px 6px 0 rgba(0, 0, 0, 0.45);
+  /* `elev.inner-highlight` — a 1px white inner top edge, light theme only. */
+  --kestrel-elev-inner-highlight: inset 0 1px 0 0 rgba(255, 255, 255, 0.6);
+
+  /* --------------------------------------------------------------------------
+     §2.11 Motion.
+
+     Rule 1 is the single most important motion decision in the app: SELECTION
+     IS INSTANT. A fading selection reads as lag in a file list, so it changes
+     in one frame and every other duration is a matter of taste by comparison.
+
+     Rules 2–4: nothing animates layout (no `width`, `height`, `margin`,
+     `top`/`left` — tweening row height while scrolling drops frames on a weak
+     machine, which is the whole lightweight constraint), `motion.base` is the
+     ceiling for anything the pointer touches, and there is no bounce, spring,
+     overshoot, stagger or skeleton shimmer — a local filesystem read is not a
+     network wait, and a shimmer implies a wait that does not exist.
+     -------------------------------------------------------------------------- */
+  --kestrel-motion-instant: 0ms;     /* selection state changes */
+  --kestrel-motion-fast: 90ms;       /* hover tint, focus ring, checkbox, toggle */
+  --kestrel-motion-base: 130ms;      /* button press, row hover, icon swap */
+  --kestrel-motion-moderate: 180ms;  /* menu open, dialog enter, resize settle */
+  --kestrel-motion-slow: 260ms;      /* scrim fade-in */
+  --kestrel-motion-deliberate: 380ms;/* directory content cross-fade on navigation */
+  --kestrel-motion-spinner: 900ms;   /* one rotation, linear, looping */
+
+  --kestrel-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --kestrel-ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --kestrel-ease-emphasis: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --kestrel-ease-linear: linear;     /* indeterminate progress only */
+
+  --kestrel-motion-hover: var(--kestrel-motion-fast) var(--kestrel-ease-standard);
+  --kestrel-motion-press: var(--kestrel-motion-base) var(--kestrel-ease-standard);
+  --kestrel-motion-overlay-in: var(--kestrel-motion-moderate) var(--kestrel-ease-emphasis);
+  --kestrel-motion-overlay-out: var(--kestrel-motion-fast) var(--kestrel-ease-exit);
+  --kestrel-motion-selection: var(--kestrel-motion-instant) var(--kestrel-ease-standard);
+
+  /* The two durations §2.11 rule 5 actually applies to rendered properties.
+   * §3 roles, so the reduced-motion block in `styles.css` reaches them through
+   * the semantic layer rather than naming §2 — and so the token file has one
+   * place to say what "instant" means instead of two. */
+  --kestrel-motion-role-reduced: var(--kestrel-motion-instant);
+  --kestrel-motion-role-reduced-spinner: var(--kestrel-motion-spinner);
+
+  /* --------------------------------------------------------------------------
+     §2.12 Layering order.
+
+     Sticky chrome is a LAYOUT SIBLING with a 1px border, never an overlay.
+     That is what satisfies WCAG 2.2 "Focus Not Obscured" structurally rather
+     than with scroll offsets: no sticky element ever covers a focused row.
+     -------------------------------------------------------------------------- */
+  --kestrel-layer-chrome: 0;      /* toolbar, breadcrumb, status bar, sidebar */
+  --kestrel-layer-list: 10;       /* file rows, in-pane overlays */
+  --kestrel-layer-ghost: 100;     /* drag ghost */
+  --kestrel-layer-menu: 200;      /* context menus, dropdowns */
+  --kestrel-layer-scrim: 300;     /* modal backdrop */
+  --kestrel-layer-dialog: 310;    /* confirmation dialogs */
+  --kestrel-layer-tooltip: 400;
+  --kestrel-layer-drag-cursor: 500;
+}
+
+/* ==========================================================================
+   LAYER 2 — SEMANTIC (§3)
+
+   Every role defined for light and dark. A role with no definition in a theme
+   is a bug, not a fallback to a primitive — which is why the dark column below
+   redefines every single role rather than inheriting and overriding.
+
+   These reference §2 primitives only. Not one raw hex below this line.
+   ========================================================================== */
+
+:root {
+  /* ---- §3.1 Surfaces ---------------------------------------------------- */
+
+  /* `surface.app` — window background, gutters, empty space. */
+  --kestrel-surface-app: var(--kestrel-neutral-50);
+  /* `surface.panel` — sidebar, breadcrumb bar, status bar. */
+  --kestrel-surface-panel: var(--kestrel-neutral-100);
+  /* `surface.chrome` — toolbar background. */
+  --kestrel-surface-chrome: var(--kestrel-neutral-50);
+  /* `surface.list` — file list rows, default. */
+  --kestrel-surface-list: var(--kestrel-neutral-25);
+  /* `surface.raised` — menus, dialogs, popovers, tooltips.
+     Pure white in light, and only here: that is what makes an overlay read as
+     *lifted off the page* without needing a heavy shadow to say so. */
+  --kestrel-surface-raised: var(--kestrel-white);
+  /* `surface.input` — search field, rename field. */
+  --kestrel-surface-input: var(--kestrel-neutral-25);
+  --kestrel-surface-input-disabled: var(--kestrel-neutral-100);
+  /* `surface.scrim` — the modal backdrop. */
+  --kestrel-surface-scrim: rgba(28, 26, 23, 0.38);
+
+  /* The list's in-flight veil. Deliberately NOT `surface.scrim`: that is a 38%
+   * black *modal* backdrop, and a modal backdrop over a loading list reads as
+   * "something is blocking you" when nothing is. This is a 70% wash of the list's
+   * own surface — it hides the half-painted rows without announcing a dialog.
+   *
+   * §3.1 gives this no role because the spec does not describe the state: §4.2's
+   * empty-state block covers the *empty directory*, not the in-flight one. So the
+   * raw composite is a §2 primitive and this is the §3 role wrapping it. Where
+   * the spec is silent, the honest response is to record the value rather than
+   * pretend the spec named it — §8 D-8's reasoning, applied to a token. */
+  --kestrel-surface-list-veil: var(--kestrel-veil-light);
+
+  /* ---- §3.2 Text -------------------------------------------------------- */
+
+  /* 4.5:1 minimum against every surface a role can land on, in both themes. */
+  --kestrel-text-primary: var(--kestrel-graphite-ink);
+  --kestrel-text-secondary: var(--kestrel-graphite-mid);
+  --kestrel-text-tertiary: var(--kestrel-neutral-600);
+  /* WCAG-exempt: 1.4.3 exempts inactive controls. Never rendered on a selected
+     row — a disabled item is not selectable. */
+  --kestrel-text-disabled: var(--kestrel-graphite-muted);
+  --kestrel-text-on-accent: var(--kestrel-white);
+  --kestrel-text-on-danger: var(--kestrel-white);
+  --kestrel-text-link: var(--kestrel-accent-700);
+  --kestrel-text-inverse: var(--kestrel-neutral-50);
+
+  /* ---- §3.3 Borders and focus ------------------------------------------ */
+
+  /* `subtle` and `default` sit below 3:1 on purpose: they are decorative
+     separators between regions that are already distinguishable, never the sole
+     means of identifying a control. Every control boundary clears 3:1 on its
+     own. See §6.4. */
+  --kestrel-border-subtle: var(--kestrel-neutral-200);
+  --kestrel-border-default: var(--kestrel-neutral-300);
+  --kestrel-border-strong: var(--kestrel-neutral-400);
+  --kestrel-border-accent: var(--kestrel-accent-600);
+  --kestrel-border-danger: var(--kestrel-danger-500);
+
+  /* The focus ring: always visible, always 2px, never the only cue for anything
+     except focus itself. */
+  --kestrel-focus-ring: var(--kestrel-accent-600);
+  /* 40% — dimmed ONLY while the window itself is unfocused, at which point WCAG
+     2.4.7 does not require a visible indicator. Restoring full opacity on
+     refocus is mandatory. */
+  --kestrel-focus-ring-inactive: rgba(14, 107, 95, 0.4);
+  --kestrel-focus-ring-width: var(--kestrel-border-thick);
+  --kestrel-focus-ring-offset: var(--kestrel-border-hairline);
+
+  /* ---- §3.4 Interactive state backgrounds ------------------------------ */
+
+  --kestrel-state-hover: var(--kestrel-graphite-bright);
+  --kestrel-state-hover-strong: var(--kestrel-neutral-150);
+  --kestrel-state-pressed: var(--kestrel-graphite-wash);
+  /* The flat selection tint. A wash, not a pill — anti-goal 6. */
+  --kestrel-state-selected: var(--kestrel-accent-200);
+  --kestrel-state-selected-hover: var(--kestrel-tint-teal-wash);
+  /* The 2px left bar: selection's second channel, so it is never colour alone. */
+  --kestrel-state-selected-bar: var(--kestrel-accent-600);
+  /* `selected` at 55% over `surface.list`. The spec writes this as a
+     composition, not a hex, so it is a translucent overlay and it composites
+     against whatever it is drawn on. */
+  --kestrel-state-cut: rgba(201, 230, 223, 0.55);
+  --kestrel-state-focus-within: var(--kestrel-accent-100);
+  --kestrel-state-drop-target: var(--kestrel-accent-100);
+
+  /* ---- §3.5 Accent ------------------------------------------------------ */
+
+  --kestrel-accent-base: var(--kestrel-accent-600);
+  --kestrel-accent-hover: var(--kestrel-accent-700);
+  --kestrel-accent-pressed: var(--kestrel-accent-800);
+  --kestrel-accent-subtle-bg: var(--kestrel-accent-100);
+  --kestrel-accent-border: var(--kestrel-accent-300);
+  --kestrel-accent-text: var(--kestrel-accent-700);
+  --kestrel-accent-on: var(--kestrel-white);
+
+  /* ---- §3.6 Status ------------------------------------------------------ */
+
+  /* A status colour never appears without `warning` / `check-circle` /
+     `x-circle` / `info` next to it. */
+  --kestrel-status-danger-text: var(--kestrel-danger-500);
+  --kestrel-status-danger-solid: var(--kestrel-danger-600);
+  /* §4.7's `dialog.btn-destructive-bg-hover`. §4.7 writes the value as a pair
+     of *primitives* (`danger.600` / `danger.500`), but a component may not name
+     a primitive, so the role lives here — which is exactly what the layer rule
+     prescribes when a component needs a value §3 has not given a name: "the
+     role is missing — add it to §3, don't reach past it." Resolved to the
+     lighter step, so the destructive button lifts toward the user instead of
+     receding further into the dark. */
+  /* APPLIED: the code's value. §4.7's cell writes the pair as "danger.600 /
+   * danger.500" — a literal primitive reference, which the layer rule forbids a
+   * §4 cell from making, so the role has to exist in §3 regardless. On *which*
+   * rung, the two are not equivalent:
+   *   spec-as-written: `danger.600` (#8F1D17), i.e. darker than the resting fill.
+   *   tokens.rs:       `danger.500` (#B3261E), i.e. LIGHTER, with the comment
+   *                    "so the button lifts toward the user rather than receding".
+   *
+   * Followed: the Rust. A destructive hover that darkens reads as the button
+   * sinking, and a hovered control that sinks is a control that feels broken.
+   * Recorded as a divergence in the report rather than guessed at. */
+  --kestrel-status-danger-hover: var(--kestrel-danger-500);
+  --kestrel-status-danger-bg: var(--kestrel-danger-50);
+  --kestrel-status-danger-border: var(--kestrel-danger-100);
+  --kestrel-status-success-text: var(--kestrel-success-500);
+  --kestrel-status-success-solid: var(--kestrel-success-500);
+  --kestrel-status-success-bg: var(--kestrel-success-50);
+  --kestrel-status-success-border: var(--kestrel-success-100);
+  --kestrel-status-warning-text: var(--kestrel-warning-500);
+  --kestrel-status-warning-solid: var(--kestrel-warning-500);
+  --kestrel-status-warning-bg: var(--kestrel-warning-50);
+  --kestrel-status-warning-border: var(--kestrel-warning-100);
+  --kestrel-status-info-text: var(--kestrel-accent-600);
+  --kestrel-status-info-bg: var(--kestrel-accent-100);
+
+  /* ---- §3.7 Icon roles -------------------------------------------------- */
+
+  /* Mirrors §2.4. Components reference these, never `hue.*` directly. */
+  --kestrel-icon-folder: var(--kestrel-hue-folder-light);
+  --kestrel-icon-text: var(--kestrel-hue-text-light);
+  --kestrel-icon-code: var(--kestrel-hue-code-light);
+  --kestrel-icon-image: var(--kestrel-hue-image-light);
+  --kestrel-icon-video: var(--kestrel-hue-video-light);
+  --kestrel-icon-audio: var(--kestrel-hue-audio-light);
+  --kestrel-icon-archive: var(--kestrel-hue-archive-light);
+  --kestrel-icon-binary: var(--kestrel-hue-binary-light);
+  --kestrel-icon-executable: var(--kestrel-hue-executable-light);
+  --kestrel-icon-symlink: var(--kestrel-hue-symlink-light);
+  --kestrel-icon-hidden: var(--kestrel-hue-hidden-light);
+  --kestrel-icon-error: var(--kestrel-hue-error-light);
+  /* Toolbar, breadcrumb and status-bar glyphs. `icon.chrome` is deliberately
+     allowed to reach a text role — a chrome glyph is chrome text. */
+  --kestrel-icon-chrome: var(--kestrel-text-secondary);
+  /* A toggled-on toolbar button — the only accent-coloured glyph in the chrome. */
+  --kestrel-icon-chrome-active: var(--kestrel-accent-base);
+
+  /* ---- §3.8 Scrollbar --------------------------------------------------- */
+
+  /* Track is the panel colour under the chrome, and transparent over the list —
+     so the thumb has to clear 3:1 against `surface.list` too, not just against
+     the track. §6.4 measures both. */
+  --kestrel-scrollbar-track: var(--kestrel-neutral-100);
+  --kestrel-scrollbar-thumb: var(--kestrel-graphite-thumb);
+  --kestrel-scrollbar-thumb-hover: var(--kestrel-graphite-thumb-deep);
+  --kestrel-scrollbar-thumb-active: var(--kestrel-neutral-700);
+
+  /* ---- §3.9 Type roles -------------------------------------------------- */
+
+  /* §3.9's table maps a text role to a §2.8 type token. A CSS custom property
+     holds one value, so each role is carried as a complete `font` shorthand
+     assembled from the §2.8 primitives — which keeps the role in the semantic
+     layer and the sizes, weights and line boxes in the primitive layer, where
+     they belong. Tracking is separate because the `font` shorthand does not
+     reset `letter-spacing`. */
+  --kestrel-text-role-name-font: var(--kestrel-type-name-weight) var(--kestrel-type-name-size) / var(--kestrel-type-name-line) var(--kestrel-font-sans);
+  --kestrel-text-role-name-selected-font: var(--kestrel-type-name-selected-weight) var(--kestrel-type-name-selected-size) / var(--kestrel-type-name-selected-line) var(--kestrel-font-sans);
+  --kestrel-text-role-meta-font: var(--kestrel-type-meta-weight) var(--kestrel-type-meta-size) / var(--kestrel-type-meta-line) var(--kestrel-font-mono);
+  --kestrel-text-role-meta-strong-font: var(--kestrel-type-meta-strong-weight) var(--kestrel-type-meta-strong-size) / var(--kestrel-type-meta-strong-line) var(--kestrel-font-mono);
+  --kestrel-text-role-column-header-font: var(--kestrel-type-label-weight) var(--kestrel-type-label-size) / var(--kestrel-type-label-line) var(--kestrel-font-sans);
+  --kestrel-text-role-column-header-tracking: var(--kestrel-type-label-tracking);
+  --kestrel-text-role-status-bar-font: var(--kestrel-type-status-weight) var(--kestrel-type-status-size) / var(--kestrel-type-status-line) var(--kestrel-font-sans);
+  --kestrel-text-role-dialog-title-font: var(--kestrel-type-dialog-title-weight) var(--kestrel-type-dialog-title-size) / var(--kestrel-type-dialog-title-line) var(--kestrel-font-sans);
+  --kestrel-text-role-dialog-body-font: var(--kestrel-type-dialog-body-weight) var(--kestrel-type-dialog-body-size) / var(--kestrel-type-dialog-body-line) var(--kestrel-font-sans);
+  --kestrel-text-role-ui-font: var(--kestrel-type-ui-weight) var(--kestrel-type-ui-size) / var(--kestrel-type-ui-line) var(--kestrel-font-sans);
+  --kestrel-text-role-ui-strong-font: var(--kestrel-type-ui-strong-weight) var(--kestrel-type-ui-strong-size) / var(--kestrel-type-ui-strong-line) var(--kestrel-font-sans);
+  --kestrel-text-role-verb-font: var(--kestrel-type-verb-weight) var(--kestrel-type-verb-size) / var(--kestrel-type-verb-line) var(--kestrel-font-sans);
+  --kestrel-text-role-verb-tracking: var(--kestrel-type-verb-tracking);
+  --kestrel-text-role-empty-state-font: var(--kestrel-type-display-weight) var(--kestrel-type-display-size) / var(--kestrel-type-display-line) var(--kestrel-font-sans);
+  --kestrel-text-role-empty-state-tracking: var(--kestrel-type-display-tracking);
+  --kestrel-text-role-caption-font: var(--kestrel-type-caption-weight) var(--kestrel-type-caption-size) / var(--kestrel-type-caption-line) var(--kestrel-font-sans);
+  --kestrel-text-role-micro-font: var(--kestrel-type-micro-weight) var(--kestrel-type-micro-size) / var(--kestrel-type-micro-line) var(--kestrel-font-sans);
+  --kestrel-text-role-micro-tracking: var(--kestrel-type-micro-tracking);
+  --kestrel-text-role-label-font: var(--kestrel-type-label-weight) var(--kestrel-type-label-size) / var(--kestrel-type-label-line) var(--kestrel-font-sans);
+  --kestrel-text-role-label-tracking: var(--kestrel-type-label-tracking);
+
+  /* §2.8's rule that monospace values carry tabular figures, exposed as a role
+   * so components reach it through §3 rather than naming the §2 primitive. It is
+   * a property rather than a colour because a custom property holds one value. */
+  --kestrel-text-role-numeric: var(--kestrel-type-numeric);
+}
+
+/* --------------------------------------------------------------------------
+   §3, dark column.
+
+   Written out in full. Not one role inherits from the light column — a role
+   that silently kept its light value would be exactly the "role with no
+   definition in a theme" bug the §3 preamble calls out.
+
+   Note the two corrections that live here rather than in §2:
+
+     * `surface.raised` is `neutral.800` `#2B2824`, not the `#24221F` an earlier
+       draft of §3.1 printed. `#24221F` is not a rung in §2.1's ramp, and a
+       dialog raised on a hover tint would sit *below* the rows it overlays
+       rather than above them. §8 D-1 records the correction and §6.2 was
+       recomputed against it. This is the one place the code was right and the
+       prose was behind.
+     * `accent.border` is `#3F8478`, not `#3A7A76`. The surface-raised move
+       made every dark ratio fall, and `#3A7A76` measured 2.93 against the new
+       `#2B2824` — under the 3:1 floor. §6.5 entry 14: 3.34, closed.
+
+   `state.hover` remains `#24221F`, still off-ramp. §8 D-4 records it as an
+   open item and deliberately declines to renumber the ramp for one value.
+   -------------------------------------------------------------------------- */
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --kestrel-surface-app: var(--kestrel-graphite-canvas);
+    --kestrel-surface-panel: var(--kestrel-graphite-panel);
+    --kestrel-surface-chrome: var(--kestrel-graphite-canvas);
+    --kestrel-surface-list: var(--kestrel-graphite-sheet);
+    --kestrel-surface-raised: var(--kestrel-neutral-800);
+    --kestrel-surface-input: var(--kestrel-graphite-sheet);
+    --kestrel-surface-input-disabled: var(--kestrel-graphite-panel);
+    --kestrel-surface-scrim: rgba(0, 0, 0, 0.58);
+    /* The veil is a 70% wash of the list's own dark surface, not a fixed colour:
+     * what "half the rows are still loading" looks like. */
+    --kestrel-surface-list-veil: var(--kestrel-veil-dark);
+
+    --kestrel-text-primary: var(--kestrel-graphite-bright);
+    --kestrel-text-secondary: var(--kestrel-graphite-pale);
+    --kestrel-text-tertiary: var(--kestrel-graphite-faint);
+    --kestrel-text-disabled: var(--kestrel-graphite-ghost);
+    --kestrel-text-on-accent: var(--kestrel-tint-teal-ink);
+    --kestrel-text-on-danger: var(--kestrel-graphite-bright);
+    --kestrel-text-link: var(--kestrel-accent-300-dark);
+    --kestrel-text-inverse: var(--kestrel-graphite-canvas);
+
+    --kestrel-border-subtle: var(--kestrel-graphite-hairline);
+    --kestrel-border-default: var(--kestrel-graphite-rule);
+    --kestrel-border-strong: var(--kestrel-graphite-edge);
+    --kestrel-border-accent: var(--kestrel-accent-400-dark);
+    --kestrel-border-danger: var(--kestrel-danger-400-dark);
+
+    --kestrel-focus-ring: var(--kestrel-accent-400-dark);
+    --kestrel-focus-ring-inactive: rgba(79, 199, 177, 0.4);
+    /* Theme-invariant, but §3.3 lists both in both columns and §3's preamble
+     * makes a missing definition a bug rather than an inheritance. Restated so
+     * the dark column is genuinely self-contained. */
+    --kestrel-focus-ring-width: var(--kestrel-border-thick);
+    --kestrel-focus-ring-offset: var(--kestrel-border-hairline);
+
+    --kestrel-state-hover: var(--kestrel-graphite-lift);
+    --kestrel-state-hover-strong: var(--kestrel-graphite-hairline);
+    --kestrel-state-pressed: var(--kestrel-graphite-canvas);
+    --kestrel-state-selected: var(--kestrel-tint-teal-deep);
+    --kestrel-state-selected-hover: var(--kestrel-tint-teal-lift);
+    --kestrel-state-selected-bar: var(--kestrel-accent-400-dark);
+    --kestrel-state-cut: rgba(22, 51, 47, 0.55);
+    --kestrel-state-focus-within: var(--kestrel-tint-teal-lift);
+    --kestrel-state-drop-target: var(--kestrel-tint-teal-lift);
+
+    --kestrel-accent-base: var(--kestrel-accent-400-dark);
+    --kestrel-accent-hover: var(--kestrel-accent-300-dark);
+    --kestrel-accent-pressed: var(--kestrel-tint-teal-bright);
+    --kestrel-accent-subtle-bg: var(--kestrel-tint-teal-deep);
+    --kestrel-accent-border: var(--kestrel-tint-teal-mute);
+    --kestrel-accent-text: var(--kestrel-accent-300-dark);
+    --kestrel-accent-on: var(--kestrel-tint-teal-ink);
+
+    --kestrel-status-danger-text: var(--kestrel-danger-400-dark);
+    --kestrel-status-danger-solid: var(--kestrel-danger-600-dark);
+    --kestrel-status-danger-hover: var(--kestrel-danger-400-dark);
+    --kestrel-status-danger-bg: var(--kestrel-tint-red-deep);
+    --kestrel-status-danger-border: var(--kestrel-danger-600-dark);
+    --kestrel-status-success-text: var(--kestrel-success-400-dark);
+    --kestrel-status-success-solid: var(--kestrel-success-600);
+    --kestrel-status-success-bg: var(--kestrel-tint-green-deep);
+    --kestrel-status-success-border: var(--kestrel-tint-green-mute);
+    --kestrel-status-warning-text: var(--kestrel-warning-400-dark);
+    --kestrel-status-warning-solid: var(--kestrel-warning-600);
+    --kestrel-status-warning-bg: var(--kestrel-tint-amber-deep);
+    --kestrel-status-warning-border: var(--kestrel-tint-amber-mute);
+    --kestrel-status-info-text: var(--kestrel-accent-400-dark);
+    --kestrel-status-info-bg: var(--kestrel-tint-teal-deep);
+
+    --kestrel-icon-folder: var(--kestrel-hue-folder-dark);
+    --kestrel-icon-text: var(--kestrel-hue-text-dark);
+    --kestrel-icon-code: var(--kestrel-hue-code-dark);
+    --kestrel-icon-image: var(--kestrel-hue-image-dark);
+    --kestrel-icon-video: var(--kestrel-hue-video-dark);
+    --kestrel-icon-audio: var(--kestrel-hue-audio-dark);
+    --kestrel-icon-archive: var(--kestrel-hue-archive-dark);
+    --kestrel-icon-binary: var(--kestrel-hue-binary-dark);
+    --kestrel-icon-executable: var(--kestrel-hue-executable-dark);
+    --kestrel-icon-symlink: var(--kestrel-hue-symlink-dark);
+    --kestrel-icon-hidden: var(--kestrel-hue-hidden-dark);
+    --kestrel-icon-error: var(--kestrel-hue-error-dark);
+    --kestrel-icon-chrome: var(--kestrel-text-secondary);
+    --kestrel-icon-chrome-active: var(--kestrel-accent-base);
+
+    --kestrel-scrollbar-track: var(--kestrel-graphite-panel);
+    --kestrel-scrollbar-thumb: var(--kestrel-graphite-thumb-mid);
+    --kestrel-scrollbar-thumb-hover: var(--kestrel-graphite-thumb-lift);
+    --kestrel-scrollbar-thumb-active: var(--kestrel-graphite-pale);
+
+    /* The dark overlay shadows are the light ones with black ink; the inner
+       highlight is light-theme only (§2.10), so it stays `none` here. */
+    --kestrel-elev-1: var(--kestrel-elev-1-dark);
+    --kestrel-elev-2: var(--kestrel-elev-2-dark);
+    --kestrel-elev-3: var(--kestrel-elev-3-dark);
+    --kestrel-elev-inner-highlight-active: none;
+  }
+}
+
+/* Explicit override. Nothing sets `data-theme` yet; these hooks exist so that
+   when something does, it is one attribute write and not a second copy of the
+   palette. The `:not()` in the media query above is what lets an explicit
+   `light` beat a system preference of `dark`. */
+:root {
+  --kestrel-elev-1: var(--kestrel-elev-1-light);
+  --kestrel-elev-2: var(--kestrel-elev-2-light);
+  --kestrel-elev-3: var(--kestrel-elev-3-light);
+  --kestrel-elev-inner-highlight-active: var(--kestrel-elev-inner-highlight);
+}
+
+:root[data-theme="dark"] {
+  --kestrel-surface-app: var(--kestrel-graphite-canvas);
+  --kestrel-surface-panel: var(--kestrel-graphite-panel);
+  --kestrel-surface-chrome: var(--kestrel-graphite-canvas);
+  --kestrel-surface-list: var(--kestrel-graphite-sheet);
+  --kestrel-surface-raised: var(--kestrel-neutral-800);
+  --kestrel-surface-input: var(--kestrel-graphite-sheet);
+  --kestrel-surface-input-disabled: var(--kestrel-graphite-panel);
+  --kestrel-surface-scrim: rgba(0, 0, 0, 0.58);
+  --kestrel-surface-list-veil: var(--kestrel-veil-dark);
+
+  --kestrel-text-primary: var(--kestrel-graphite-bright);
+  --kestrel-text-secondary: var(--kestrel-graphite-pale);
+  --kestrel-text-tertiary: var(--kestrel-graphite-faint);
+  --kestrel-text-disabled: var(--kestrel-graphite-ghost);
+  --kestrel-text-on-accent: var(--kestrel-tint-teal-ink);
+  --kestrel-text-on-danger: var(--kestrel-graphite-bright);
+  --kestrel-text-link: var(--kestrel-accent-300-dark);
+  --kestrel-text-inverse: var(--kestrel-graphite-canvas);
+
+  --kestrel-border-subtle: var(--kestrel-graphite-hairline);
+  --kestrel-border-default: var(--kestrel-graphite-rule);
+  --kestrel-border-strong: var(--kestrel-graphite-edge);
+  --kestrel-border-accent: var(--kestrel-accent-400-dark);
+  --kestrel-border-danger: var(--kestrel-danger-400-dark);
+
+  --kestrel-focus-ring: var(--kestrel-accent-400-dark);
+  --kestrel-focus-ring-inactive: rgba(79, 199, 177, 0.4);
+  /* Theme-invariant, but §3.3 lists both in both columns and §3's preamble makes
+   * a missing definition a bug rather than an inheritance. Restated here so the
+   * dark column is genuinely self-contained. */
+  --kestrel-focus-ring-width: var(--kestrel-border-thick);
+  --kestrel-focus-ring-offset: var(--kestrel-border-hairline);
+
+  --kestrel-state-hover: var(--kestrel-graphite-lift);
+  --kestrel-state-hover-strong: var(--kestrel-graphite-hairline);
+  --kestrel-state-pressed: var(--kestrel-graphite-canvas);
+  --kestrel-state-selected: var(--kestrel-tint-teal-deep);
+  --kestrel-state-selected-hover: var(--kestrel-tint-teal-lift);
+  --kestrel-state-selected-bar: var(--kestrel-accent-400-dark);
+  --kestrel-state-cut: rgba(22, 51, 47, 0.55);
+  --kestrel-state-focus-within: var(--kestrel-tint-teal-lift);
+  --kestrel-state-drop-target: var(--kestrel-tint-teal-lift);
+
+  --kestrel-accent-base: var(--kestrel-accent-400-dark);
+  --kestrel-accent-hover: var(--kestrel-accent-300-dark);
+  --kestrel-accent-pressed: var(--kestrel-tint-teal-bright);
+  --kestrel-accent-subtle-bg: var(--kestrel-tint-teal-deep);
+  --kestrel-accent-border: var(--kestrel-tint-teal-mute);
+  --kestrel-accent-text: var(--kestrel-accent-300-dark);
+  --kestrel-accent-on: var(--kestrel-tint-teal-ink);
+
+  --kestrel-status-danger-text: var(--kestrel-danger-400-dark);
+  --kestrel-status-danger-solid: var(--kestrel-danger-600-dark);
+  --kestrel-status-danger-hover: var(--kestrel-danger-400-dark);
+  --kestrel-status-danger-bg: var(--kestrel-tint-red-deep);
+  --kestrel-status-danger-border: var(--kestrel-danger-600-dark);
+  --kestrel-status-success-text: var(--kestrel-success-400-dark);
+  --kestrel-status-success-solid: var(--kestrel-success-600);
+  --kestrel-status-success-bg: var(--kestrel-tint-green-deep);
+  --kestrel-status-success-border: var(--kestrel-tint-green-mute);
+  --kestrel-status-warning-text: var(--kestrel-warning-400-dark);
+  --kestrel-status-warning-solid: var(--kestrel-warning-600);
+  --kestrel-status-warning-bg: var(--kestrel-tint-amber-deep);
+  --kestrel-status-warning-border: var(--kestrel-tint-amber-mute);
+  --kestrel-status-info-text: var(--kestrel-accent-400-dark);
+  --kestrel-status-info-bg: var(--kestrel-tint-teal-deep);
+
+  --kestrel-icon-folder: var(--kestrel-hue-folder-dark);
+  --kestrel-icon-text: var(--kestrel-hue-text-dark);
+  --kestrel-icon-code: var(--kestrel-hue-code-dark);
+  --kestrel-icon-image: var(--kestrel-hue-image-dark);
+  --kestrel-icon-video: var(--kestrel-hue-video-dark);
+  --kestrel-icon-audio: var(--kestrel-hue-audio-dark);
+  --kestrel-icon-archive: var(--kestrel-hue-archive-dark);
+  --kestrel-icon-binary: var(--kestrel-hue-binary-dark);
+  --kestrel-icon-executable: var(--kestrel-hue-executable-dark);
+  --kestrel-icon-symlink: var(--kestrel-hue-symlink-dark);
+  --kestrel-icon-hidden: var(--kestrel-hue-hidden-dark);
+  --kestrel-icon-error: var(--kestrel-hue-error-dark);
+  --kestrel-icon-chrome: var(--kestrel-text-secondary);
+  --kestrel-icon-chrome-active: var(--kestrel-accent-base);
+
+  --kestrel-scrollbar-track: var(--kestrel-graphite-panel);
+  --kestrel-scrollbar-thumb: var(--kestrel-graphite-thumb-mid);
+  --kestrel-scrollbar-thumb-hover: var(--kestrel-graphite-thumb-lift);
+  --kestrel-scrollbar-thumb-active: var(--kestrel-graphite-pale);
+
+  --kestrel-elev-1: var(--kestrel-elev-1-dark);
+  --kestrel-elev-2: var(--kestrel-elev-2-dark);
+  --kestrel-elev-3: var(--kestrel-elev-3-dark);
+  --kestrel-elev-inner-highlight-active: none;
+}
+
+/* ==========================================================================
+   LAYER 3 — COMPONENT (§4)
+
+   §4's cells are written as "<type token>, <semantic role>" — a component names
+   a §2.8 type token and a §3 colour role and nothing else. That is reproduced
+   here literally: every `-color` token below resolves to a §3 role, every
+   measurement resolves to a §2 metric or §2.5 spacing rung. No hex appears
+   below this line, and no §4 token names a §2 colour.
+
+   Some of these components (sidebar, menu, dialog, scrollbar) are not in the
+   DOM yet. They are transcribed anyway, because §8 D-8's own reasoning applies
+   to tokens as much as to panes: a token file that only holds what today's UI
+   happens to use stops being a spec and becomes a cache.
+   ========================================================================== */
+
+:root {
+  /* ---- §4.1 Sidebar item ------------------------------------------------ */
+
+  /* Covers places, bookmarks, volumes, recent. */
+  --kestrel-sidebar-item-height: var(--kestrel-metric-sidebar-item);
+  --kestrel-sidebar-item-padding-x: var(--kestrel-space-2);
+  --kestrel-sidebar-item-gap: var(--kestrel-space-2-5);
+  --kestrel-sidebar-item-radius: var(--kestrel-radius-md);
+  --kestrel-sidebar-item-bg: transparent;
+  --kestrel-sidebar-item-bg-hover: var(--kestrel-state-hover);
+  --kestrel-sidebar-item-bg-pressed: var(--kestrel-state-pressed);
+  --kestrel-sidebar-item-bg-active: var(--kestrel-accent-subtle-bg);
+  --kestrel-sidebar-item-bg-disabled: transparent;
+  --kestrel-sidebar-item-text: var(--kestrel-text-secondary);
+  --kestrel-sidebar-item-text-active: var(--kestrel-text-primary);
+  --kestrel-sidebar-item-text-disabled: var(--kestrel-text-disabled);
+  --kestrel-sidebar-item-icon: var(--kestrel-icon-chrome);
+  --kestrel-sidebar-item-icon-size: var(--kestrel-metric-icon-chrome);
+  --kestrel-sidebar-item-icon-active: var(--kestrel-accent-base);
+  /* The active place is the ONLY sidebar item that uses the accent. If more
+     than one is ever accented, the rule has broken. */
+  --kestrel-sidebar-item-active-bar-width: var(--kestrel-border-marker);
+  --kestrel-sidebar-item-active-bar-color: var(--kestrel-state-selected-bar);
+  --kestrel-sidebar-item-section-label-font: var(--kestrel-text-role-label-font);
+  --kestrel-sidebar-item-section-label-tracking: var(--kestrel-text-role-label-tracking);
+  --kestrel-sidebar-item-section-label-color: var(--kestrel-text-tertiary);
+  --kestrel-sidebar-item-section-label-padding-x: var(--kestrel-space-2);
+  --kestrel-sidebar-item-section-label-height: var(--kestrel-metric-row-compact);
+  --kestrel-sidebar-item-count-font: var(--kestrel-text-role-meta-font);
+  --kestrel-sidebar-item-count-color: var(--kestrel-text-tertiary);
+  --kestrel-sidebar-divider-color: var(--kestrel-border-subtle);
+  --kestrel-sidebar-divider-width: var(--kestrel-border-hairline);
+  --kestrel-sidebar-divider-margin-y: var(--kestrel-space-2);
+  --kestrel-sidebar-resize-handle: var(--kestrel-border-hidden-marker);
+  --kestrel-sidebar-resize-handle-hover: var(--kestrel-border-strong);
+  --kestrel-sidebar-item-transition: var(--kestrel-motion-hover); /* colour only */
+
+  /* ---- §4.2 File list row ----------------------------------------------- */
+
+  /* The densest and most important component. Single line, no wrapping.
+
+     `row.height` is the 32px *comfortable* variant, not the 26px default. That
+     is not a deviation to be tidied up: `lib/windower.ts` hard-codes
+     `ROW_HEIGHT = 32` and derives both the spacer height and every row's
+     `translateY` from it. Changing this token alone desynchronises the window
+     from the scroller. The two move together or not at all. */
+  --kestrel-row-height: var(--kestrel-metric-row-comfortable);
+  --kestrel-row-height-compact: var(--kestrel-metric-row-compact);
+  --kestrel-row-height-default: var(--kestrel-metric-row);
+  /* §4.2 says 8px. The web list runs 12px, and 12 is `space.3`, so it is kept
+     for now rather than silently re-laid-out; the spec value is transcribed
+     alongside it so reconciliation is a one-token edit. */
+  --kestrel-row-padding-x: var(--kestrel-space-3);
+  --kestrel-row-padding-x-spec: var(--kestrel-space-2);
+  --kestrel-row-gutter: var(--kestrel-metric-gutter);
+  --kestrel-row-icon-size: var(--kestrel-metric-icon);
+  /* §4.2 says 10px. 8px is what the web list's glyph column actually uses
+     (`space.2`); 10px is transcribed at `--kestrel-row-icon-gap-spec` so the
+     reconciliation is a one-token edit when the geometry lands. */
+  --kestrel-row-icon-gap: var(--kestrel-space-2);
+  --kestrel-row-icon-gap-spec: var(--kestrel-space-2-5);
+  --kestrel-row-column-gap: var(--kestrel-space-3);
+  --kestrel-row-radius: var(--kestrel-radius-sm);
+  --kestrel-row-indent-step: 14px;
+  --kestrel-row-bg: var(--kestrel-surface-list);
+  --kestrel-row-bg-hover: var(--kestrel-state-hover);
+  --kestrel-row-bg-selected: var(--kestrel-state-selected);
+  --kestrel-row-bg-selected-hover: var(--kestrel-state-selected-hover);
+  --kestrel-row-bg-cut: var(--kestrel-state-cut);
+  --kestrel-row-bg-drop-target: var(--kestrel-state-drop-target);
+  --kestrel-row-text: var(--kestrel-text-primary);
+  --kestrel-row-text-selected: var(--kestrel-text-primary);
+  --kestrel-row-text-hidden: var(--kestrel-text-tertiary);
+  --kestrel-row-text-disabled: var(--kestrel-text-disabled);
+  --kestrel-row-font: var(--kestrel-text-role-name-font);
+  --kestrel-row-font-selected: var(--kestrel-text-role-name-selected-font);
+  /* Selection's second channel. A row is never both selected and hovered with a
+     third, ambiguous background; the bar is what keeps selection readable when
+     the tint is subtle or the reader cannot resolve it. */
+  --kestrel-row-selected-bar-width: var(--kestrel-border-thick);
+  --kestrel-row-selected-bar-color: var(--kestrel-state-selected-bar);
+  --kestrel-row-selected-bar-layer: var(--kestrel-layer-list);
+  --kestrel-row-ring-width: var(--kestrel-focus-ring-width);
+  --kestrel-row-ring-color: var(--kestrel-focus-ring);
+  --kestrel-row-ring-inactive-color: var(--kestrel-focus-ring-inactive);
+  --kestrel-row-divider-width: var(--kestrel-border-hairline);
+  --kestrel-row-divider-color: var(--kestrel-border-subtle);
+  /* §4.2 insets the divider 8px from each edge; the web row's runs full width.
+     Recorded, not silently applied — see the report. */
+  --kestrel-row-divider-inset-x: var(--kestrel-space-2);
+  /* Row states. Hover and focus animate; selection is instant. */
+  --kestrel-row-icon: var(--kestrel-icon-chrome);
+  /* §2.4's deliberate "no hue" slot. The web list's glyph is a character, not a
+     Phosphor glyph, so it carries no file-type hue — and `icon.binary` is the
+     spec's name for exactly that: an unclassifiable item and a plain document
+     are both "no hue", and inventing a colour would make the colour column
+     meaningless. */
+  --kestrel-row-icon-unclassified: var(--kestrel-icon-binary);
+  --kestrel-row-icon-color: var(--kestrel-row-icon-unclassified);
+  --kestrel-row-icon-disabled-opacity: 0.5;
+  --kestrel-row-icon-cut-opacity: 0.7;
+  /* The unreadable-row badge: a filled dot on the glyph in `status.danger-solid`
+   * with `text.on-danger` inside it. `radius.pill` because a circle is the point
+   * — it reads as "this row failed" at the row's left edge, where the eye
+   * already is, and the name beside it is still `status.danger-text` so the two
+   * channels agree. */
+  --kestrel-row-error-badge-radius: var(--kestrel-radius-pill);
+  --kestrel-row-error-badge-weight: var(--kestrel-type-verb-weight);
+  --kestrel-row-hidden-dot: var(--kestrel-border-hidden-marker);
+  --kestrel-row-hidden-dot-color: var(--kestrel-icon-hidden);
+  --kestrel-row-gutter-marker: var(--kestrel-metric-gutter-marker);
+  --kestrel-row-transition: var(--kestrel-motion-hover); /* colour only */
+  --kestrel-row-selection-transition: var(--kestrel-motion-selection); /* 0ms */
+
+  /* Row columns. */
+  --kestrel-row-col-header-font: var(--kestrel-text-role-column-header-font);
+  --kestrel-row-col-header-tracking: var(--kestrel-text-role-column-header-tracking);
+  --kestrel-row-col-header-color: var(--kestrel-text-tertiary);
+  --kestrel-row-col-header-height: var(--kestrel-metric-column-header);
+  --kestrel-row-col-header-bg-hover: var(--kestrel-state-hover);
+  --kestrel-row-col-header-bg-pressed: var(--kestrel-state-pressed);
+  --kestrel-row-col-size-font: var(--kestrel-text-role-meta-font);
+  --kestrel-row-col-size-color: var(--kestrel-text-tertiary);
+  --kestrel-row-col-size-width: var(--kestrel-metric-column-size);
+  --kestrel-row-col-kind-font: var(--kestrel-text-role-caption-font);
+  --kestrel-row-col-kind-color: var(--kestrel-text-tertiary);
+  --kestrel-row-col-kind-width: var(--kestrel-metric-column-kind);
+  --kestrel-row-col-modified-font: var(--kestrel-text-role-meta-font);
+  --kestrel-row-col-modified-color: var(--kestrel-text-tertiary);
+  --kestrel-row-col-modified-width: var(--kestrel-metric-column-modified);
+  --kestrel-row-col-permissions-font: var(--kestrel-text-role-meta-font);
+  --kestrel-row-col-permissions-color: var(--kestrel-text-secondary);
+  --kestrel-row-col-permissions-width: var(--kestrel-metric-column-permissions);
+
+  /* Empty and loading states. A real design moment, not an afterthought: a 48px
+     folder-open at 40%, the folder name, one sentence. No illustration. */
+  --kestrel-row-empty-title-font: var(--kestrel-text-role-empty-state-font);
+  --kestrel-row-empty-title-tracking: var(--kestrel-text-role-empty-state-tracking);
+  --kestrel-row-empty-title-color: var(--kestrel-text-primary);
+  --kestrel-row-empty-body-font: var(--kestrel-text-role-dialog-body-font);
+  --kestrel-row-empty-body-color: var(--kestrel-text-secondary);
+  --kestrel-row-empty-body-max-width: 44ch;
+  --kestrel-row-empty-icon-size: 48px;
+  --kestrel-row-empty-icon-color: var(--kestrel-icon-chrome);
+  --kestrel-row-empty-icon-opacity: 0.4;
+  /* `row.skeleton` — a flat hover bar. No shimmer: a shimmer implies a network
+     wait, and this app reads a local filesystem (§2.11 rule 4). */
+  --kestrel-row-skeleton-bg: var(--kestrel-state-hover);
+  --kestrel-row-skeleton-height: 12px;
+  --kestrel-row-skeleton-radius: var(--kestrel-radius-xs);
+  --kestrel-row-reading-icon-size: var(--kestrel-metric-icon-chrome);
+  --kestrel-row-reading-icon-color: var(--kestrel-icon-chrome);
+
+  /* ---- §4.3 Breadcrumb segment ------------------------------------------ */
+
+  /* The final segment is the current directory, rendered at 500 weight, and is
+     NOT clickable — clicking it does nothing and it must not show a hover
+     state. Overflow collapses from the left and the last two segments always
+     stay visible, because the question is always "where am I" and "what's in
+     here". */
+  --kestrel-breadcrumb-height: var(--kestrel-metric-breadcrumb);
+  --kestrel-breadcrumb-padding-x: var(--kestrel-space-2);
+  --kestrel-breadcrumb-background: var(--kestrel-surface-panel);
+  --kestrel-breadcrumb-bottom-border: var(--kestrel-border-subtle);
+  --kestrel-breadcrumb-bottom-border-width: var(--kestrel-border-hairline);
+  --kestrel-breadcrumb-segment-gap: var(--kestrel-space-1-5);
+  --kestrel-breadcrumb-segment-gap-padding: var(--kestrel-space-half);
+  --kestrel-breadcrumb-segment-height: 20px;
+  --kestrel-breadcrumb-segment-radius: var(--kestrel-radius-sm);
+  --kestrel-breadcrumb-segment-font: var(--kestrel-text-role-ui-font);
+  --kestrel-breadcrumb-segment-font-current: var(--kestrel-text-role-ui-strong-font);
+  --kestrel-breadcrumb-segment-text: var(--kestrel-text-secondary);
+  --kestrel-breadcrumb-segment-text-current: var(--kestrel-text-primary);
+  --kestrel-breadcrumb-segment-text-ellipsis: var(--kestrel-text-tertiary);
+  --kestrel-breadcrumb-segment-bg-hover: var(--kestrel-state-hover);
+  --kestrel-breadcrumb-segment-bg-active: var(--kestrel-state-pressed);
+  --kestrel-breadcrumb-segment-ring-width: var(--kestrel-focus-ring-width);
+  --kestrel-breadcrumb-segment-ring-color: var(--kestrel-focus-ring);
+  --kestrel-breadcrumb-separator-size: 12px;
+  --kestrel-breadcrumb-separator-color: var(--kestrel-icon-chrome);
+  --kestrel-breadcrumb-separator-opacity: 0.55;
+  --kestrel-breadcrumb-separator-hit-width: 16px;
+  --kestrel-breadcrumb-separator-hit-height: 20px;
+  --kestrel-breadcrumb-overflow-size: var(--kestrel-metric-target-min);
+  --kestrel-breadcrumb-drop-indicator: var(--kestrel-border-accent);
+  --kestrel-breadcrumb-drop-indicator-width: var(--kestrel-border-thick);
+  --kestrel-breadcrumb-transition: var(--kestrel-motion-hover);
+
+  /* ---- §4.4 Toolbar button ---------------------------------------------- */
+
+  /* Two variants: icon button (default) and icon + label (view switcher, sort,
+     filter). 28px of button in a 34px toolbar leaves 3px above and below; the
+     visual gap between adjacent buttons is larger than the gap to the toolbar
+     edge, and proximity is what does the grouping. No separators needed except
+     between functional groups. */
+  --kestrel-toolbar-btn-height: var(--kestrel-metric-breadcrumb);
+  --kestrel-toolbar-btn-width: var(--kestrel-metric-breadcrumb);
+  --kestrel-toolbar-btn-radius: var(--kestrel-radius-md);
+  --kestrel-toolbar-btn-icon-size: var(--kestrel-metric-icon-chrome);
+  /* §4.4's cell: 6 px, `space.1.5`. APPLIED, per the doc's own precedence rule —
+   "where this document and the code disagree, this document is the intent and the
+   code is the defect", with `surface.raised` (D-1) the one recorded exception.
+   This is not that exception: `tokens.rs` takes 4 px (`space.1`) with a stated
+   window-threshold rationale, which is a divergence rather than a correction,
+   and the spec has never been re-opened for it.
+
+   The code value is transcribed alongside so the difference is one visible token
+   rather than a discrepancy between two files. If the code lane opens a ruling
+   making the divergence deliberate, swap which one `--kestrel-toolbar-btn-label-gap`
+   names. */
+  --kestrel-toolbar-btn-label-gap: var(--kestrel-space-1-5);
+  --kestrel-toolbar-btn-label-gap-code: var(--kestrel-space-1);
+  /* The icon + label variant's "auto, padding-x 8 px". */
+  --kestrel-toolbar-btn-padding-x: var(--kestrel-space-2);
+  /* §4.4 gives a height, not a padding; the vertical padding is what centres a
+     label inside that 28px box. */
+  --kestrel-toolbar-btn-padding-y: var(--kestrel-space-half);
+  --kestrel-toolbar-btn-bg: transparent;
+  --kestrel-toolbar-btn-bg-hover: var(--kestrel-state-hover);
+  --kestrel-toolbar-btn-bg-pressed: var(--kestrel-state-pressed);
+  --kestrel-toolbar-btn-bg-toggled-on: var(--kestrel-accent-subtle-bg);
+  --kestrel-toolbar-btn-font: var(--kestrel-text-role-ui-font);
+  --kestrel-toolbar-btn-font-active: var(--kestrel-text-role-ui-strong-font);
+  --kestrel-toolbar-btn-label: var(--kestrel-text-secondary);
+  --kestrel-toolbar-btn-label-active: var(--kestrel-text-primary);
+  --kestrel-toolbar-btn-icon: var(--kestrel-icon-chrome);
+  --kestrel-toolbar-btn-icon-active: var(--kestrel-accent-base);
+  --kestrel-toolbar-btn-disabled-opacity: 0.4;
+  --kestrel-toolbar-btn-ring-width: var(--kestrel-focus-ring-width);
+  --kestrel-toolbar-btn-ring-color: var(--kestrel-focus-ring);
+  --kestrel-toolbar-btn-separator-width: var(--kestrel-border-hairline);
+  --kestrel-toolbar-btn-separator-color: var(--kestrel-border-subtle);
+  --kestrel-toolbar-btn-separator-height: var(--kestrel-space-4);
+  --kestrel-toolbar-btn-separator-margin: var(--kestrel-space-2);
+  --kestrel-toolbar-btn-tooltip-delay: 500ms;
+  --kestrel-toolbar-btn-transition: var(--kestrel-motion-hover); /* colour only */
+  /* §4.4's one filled button: the primary action. */
+  --kestrel-toolbar-btn-primary-bg: var(--kestrel-accent-base);
+  --kestrel-toolbar-btn-primary-bg-hover: var(--kestrel-accent-hover);
+  --kestrel-toolbar-btn-primary-text: var(--kestrel-text-on-accent);
+  --kestrel-toolbar-btn-primary-font: var(--kestrel-text-role-ui-strong-font);
+
+  /* ---- §4.5 Status bar -------------------------------------------------- */
+
+  /* A layout sibling with a border, never an overlay, so it can never obscure a
+     focused row. */
+  --kestrel-statusbar-height: var(--kestrel-metric-status-bar);
+  --kestrel-statusbar-padding-y: var(--kestrel-space-1);
+  --kestrel-statusbar-background: var(--kestrel-surface-panel);
+  --kestrel-statusbar-top-border: var(--kestrel-border-subtle);
+  --kestrel-statusbar-top-border-width: var(--kestrel-border-hairline);
+  --kestrel-statusbar-padding-x: var(--kestrel-space-2-5);
+  --kestrel-statusbar-section-gap: 14px;
+  --kestrel-statusbar-section-divider-width: var(--kestrel-border-hairline);
+  --kestrel-statusbar-section-divider-color: var(--kestrel-border-subtle);
+  --kestrel-statusbar-section-divider-height: var(--kestrel-space-3);
+  --kestrel-statusbar-label-font: var(--kestrel-text-role-status-bar-font);
+  --kestrel-statusbar-label-color: var(--kestrel-text-tertiary);
+  --kestrel-statusbar-value-font: var(--kestrel-text-role-meta-font);
+  --kestrel-statusbar-value-color: var(--kestrel-text-secondary);
+  --kestrel-statusbar-value-strong-font: var(--kestrel-text-role-meta-strong-font);
+  --kestrel-statusbar-value-strong-color: var(--kestrel-text-primary);
+  --kestrel-statusbar-path-font: var(--kestrel-text-role-meta-font);
+  --kestrel-statusbar-path-color: var(--kestrel-text-secondary);
+  --kestrel-statusbar-path-focus-bg: var(--kestrel-surface-input);
+  --kestrel-statusbar-path-focus-ring-width: var(--kestrel-focus-ring-width);
+  --kestrel-statusbar-path-focus-ring-color: var(--kestrel-focus-ring);
+  --kestrel-statusbar-selection-count-font: var(--kestrel-text-role-meta-strong-font);
+  --kestrel-statusbar-selection-count-color: var(--kestrel-accent-text);
+  --kestrel-statusbar-selection-count-idle-color: var(--kestrel-text-tertiary);
+  /* A long operation always reports itself here, with a spinner AND words — a
+     spinner with no words is a spinner nobody can act on. */
+  --kestrel-statusbar-busy-icon-size: 12px;
+  --kestrel-statusbar-busy-icon-color: var(--kestrel-icon-chrome);
+  --kestrel-statusbar-busy-label-color: var(--kestrel-text-secondary);
+  --kestrel-statusbar-busy-duration: var(--kestrel-motion-spinner);
+  --kestrel-statusbar-error-icon-size: var(--kestrel-metric-icon-compact);
+  --kestrel-statusbar-error-icon-color: var(--kestrel-status-warning-text);
+  --kestrel-statusbar-error-color: var(--kestrel-status-danger-text);
+  --kestrel-statusbar-success-icon-size: var(--kestrel-metric-icon-compact);
+  --kestrel-statusbar-success-icon-color: var(--kestrel-status-success-text);
+  --kestrel-statusbar-success-color: var(--kestrel-status-success-text);
+  --kestrel-statusbar-success-hold: 2000ms;
+  --kestrel-statusbar-hidden-toggle-size: var(--kestrel-metric-icon-compact);
+  /* Free-space meter: a 60×4 strip, `state.hover` track and `accent.base` fill. */
+  --kestrel-statusbar-meter-width: 60px;
+  --kestrel-statusbar-meter-height: var(--kestrel-space-1);
+  --kestrel-statusbar-meter-track: var(--kestrel-state-hover);
+  --kestrel-statusbar-meter-fill: var(--kestrel-accent-base);
+  --kestrel-statusbar-meter-label-color: var(--kestrel-text-tertiary);
+
+  /* ---- §4.6 Context menu ------------------------------------------------ */
+
+  --kestrel-menu-min-width: 180px;
+  --kestrel-menu-max-width: 320px;
+  --kestrel-menu-padding: var(--kestrel-radius-xs);
+  --kestrel-menu-radius: var(--kestrel-radius-lg);
+  --kestrel-menu-background: var(--kestrel-surface-raised);
+  --kestrel-menu-border: var(--kestrel-border-strong);
+  --kestrel-menu-border-width: var(--kestrel-border-hairline);
+  --kestrel-menu-elevation: var(--kestrel-elev-1);
+  --kestrel-menu-layer: var(--kestrel-layer-menu);
+  --kestrel-menu-offset-from-cursor: var(--kestrel-space-half);
+  --kestrel-menu-item-height: var(--kestrel-metric-row);
+  --kestrel-menu-item-padding-x: var(--kestrel-space-2);
+  --kestrel-menu-item-radius: var(--kestrel-radius-md);
+  --kestrel-menu-item-gap: var(--kestrel-space-3);
+  --kestrel-menu-item-font: var(--kestrel-text-role-ui-font);
+  --kestrel-menu-item-color: var(--kestrel-text-primary);
+  --kestrel-menu-item-icon-size: var(--kestrel-metric-icon);
+  --kestrel-menu-item-icon-color: var(--kestrel-icon-chrome);
+  --kestrel-menu-item-shortcut-font: var(--kestrel-text-role-meta-font);
+  --kestrel-menu-item-shortcut-color: var(--kestrel-text-tertiary);
+  --kestrel-menu-item-bg-hover: var(--kestrel-state-hover);
+  --kestrel-menu-item-bg-focus: var(--kestrel-accent-subtle-bg);
+  --kestrel-menu-item-bg-disabled: transparent;
+  --kestrel-menu-item-text-disabled: var(--kestrel-text-disabled);
+  --kestrel-menu-item-disabled-opacity: 0.4;
+  /* Destructive items are red TEXT AND ICON only. A red-filled menu row is the
+     loudest possible signal and it fires on every right-click, not on the click
+     that matters. */
+  --kestrel-menu-item-destructive: var(--kestrel-status-danger-text);
+  --kestrel-menu-item-ring-width: var(--kestrel-focus-ring-width);
+  --kestrel-menu-item-ring-color: var(--kestrel-focus-ring);
+  --kestrel-menu-separator-width: var(--kestrel-border-hairline);
+  --kestrel-menu-separator-color: var(--kestrel-border-subtle);
+  --kestrel-menu-separator-margin-y: 5px;
+  --kestrel-menu-separator-inset-x: var(--kestrel-space-2);
+  --kestrel-menu-section-label-font: var(--kestrel-text-role-label-font);
+  --kestrel-menu-section-label-tracking: var(--kestrel-text-role-label-tracking);
+  --kestrel-menu-section-label-color: var(--kestrel-text-tertiary);
+  --kestrel-menu-section-label-height: var(--kestrel-metric-row-compact);
+  --kestrel-menu-checkmark-slot: var(--kestrel-metric-icon);
+  --kestrel-menu-enter-duration: var(--kestrel-motion-moderate);
+  --kestrel-menu-enter-ease: var(--kestrel-ease-emphasis);
+  --kestrel-menu-enter-offset: var(--kestrel-space-half);
+  --kestrel-menu-exit-duration: var(--kestrel-motion-fast);
+  --kestrel-menu-exit-ease: var(--kestrel-ease-exit);
+  --kestrel-menu-submenu-delay: 250ms;
+
+  /* ---- §4.7 Confirmation dialog ----------------------------------------- */
+
+  /* Used for irreversible actions ONLY — delete, overwrite, empty trash, quit
+     with unsaved work. Nothing else gets a dialog. */
+  --kestrel-dialog-width: 400px;
+  --kestrel-dialog-padding: var(--kestrel-space-5);
+  --kestrel-dialog-radius: var(--kestrel-radius-xl);
+  --kestrel-dialog-background: var(--kestrel-surface-raised);
+  --kestrel-dialog-border: var(--kestrel-border-strong);
+  --kestrel-dialog-border-width: var(--kestrel-border-hairline);
+  --kestrel-dialog-elevation: var(--kestrel-elev-2);
+  --kestrel-dialog-scrim: var(--kestrel-surface-scrim);
+  --kestrel-dialog-scrim-layer: var(--kestrel-layer-scrim);
+  --kestrel-dialog-layer: var(--kestrel-layer-dialog);
+  --kestrel-dialog-scrim-enter-duration: var(--kestrel-motion-slow);
+  --kestrel-dialog-scrim-enter-ease: var(--kestrel-ease-standard);
+  --kestrel-dialog-enter-duration: var(--kestrel-motion-moderate);
+  --kestrel-dialog-enter-ease: var(--kestrel-ease-emphasis);
+  --kestrel-dialog-enter-rise: var(--kestrel-space-1);
+  --kestrel-dialog-exit-duration: var(--kestrel-motion-fast);
+  --kestrel-dialog-exit-ease: var(--kestrel-ease-exit);
+  --kestrel-dialog-title-font: var(--kestrel-text-role-dialog-title-font);
+  --kestrel-dialog-title-color: var(--kestrel-text-primary);
+  --kestrel-dialog-body-font: var(--kestrel-text-role-dialog-body-font);
+  --kestrel-dialog-body-color: var(--kestrel-text-secondary);
+  --kestrel-dialog-body-strong-color: var(--kestrel-text-primary);
+  --kestrel-dialog-path-quote-font: var(--kestrel-text-role-meta-font);
+  --kestrel-dialog-path-quote-color: var(--kestrel-text-secondary);
+  --kestrel-dialog-path-quote-bg: var(--kestrel-state-hover);
+  --kestrel-dialog-path-quote-radius: var(--kestrel-radius-md);
+  --kestrel-dialog-path-quote-padding-y: var(--kestrel-space-1-5);
+  --kestrel-dialog-path-quote-padding-x: var(--kestrel-space-2);
+  --kestrel-dialog-icon-size: var(--kestrel-metric-icon-lg);
+  --kestrel-dialog-icon-color: var(--kestrel-icon-chrome);
+  --kestrel-dialog-icon-destructive: var(--kestrel-status-danger-text);
+  --kestrel-dialog-footer-gap: var(--kestrel-space-3);
+  --kestrel-dialog-footer-align: right;
+  --kestrel-dialog-btn-height: 30px;
+  --kestrel-dialog-btn-padding-x: 14px;
+  --kestrel-dialog-btn-radius: var(--kestrel-radius-md);
+  /* §4.7 says "`type.ui`, 500" — but §2.8 defines `type.ui` as 13px/**400**,
+   * so the cell names a size from one token and a weight from another and is
+   * satisfiable by neither token alone. `type.ui-strong` is 13px/500, which is
+   * what the cell means.
+   *
+   * APPLIED: the code. §8 D-6 reaches the same conclusion — "the code is right;
+   * §4.7's row should read `type.ui-strong`". A 13px label at 400 is a label at
+   * the wrong *weight*, and the fill and the text then disagree about which
+   * button is the one. */
+  --kestrel-dialog-btn-font: var(--kestrel-text-role-ui-strong-font);
+  --kestrel-dialog-btn-cancel-bg: var(--kestrel-surface-input);
+  --kestrel-dialog-btn-cancel-border: var(--kestrel-border-strong);
+  --kestrel-dialog-btn-cancel-border-width: var(--kestrel-border-hairline);
+  --kestrel-dialog-btn-cancel-text: var(--kestrel-text-primary);
+  --kestrel-dialog-btn-cancel-bg-hover: var(--kestrel-state-hover-strong);
+  --kestrel-dialog-btn-confirm-bg: var(--kestrel-accent-base);
+  --kestrel-dialog-btn-confirm-bg-hover: var(--kestrel-accent-hover);
+  --kestrel-dialog-btn-confirm-text: var(--kestrel-text-on-accent);
+  --kestrel-dialog-btn-destructive-bg: var(--kestrel-status-danger-solid);
+  --kestrel-dialog-btn-destructive-bg-hover: var(--kestrel-status-danger-hover);
+  --kestrel-dialog-btn-destructive-text: var(--kestrel-text-on-danger);
+  --kestrel-dialog-btn-focus-ring-width: var(--kestrel-focus-ring-width);
+  --kestrel-dialog-btn-focus-ring-color: var(--kestrel-focus-ring);
+  --kestrel-dialog-btn-focus-ring-offset: var(--kestrel-border-thick);
+  --kestrel-dialog-checkbox-size: var(--kestrel-metric-icon-compact);
+  --kestrel-dialog-checkbox-radius: var(--kestrel-radius-sm);
+  --kestrel-dialog-checkbox-border: var(--kestrel-border-strong);
+  --kestrel-dialog-checkbox-border-width: var(--kestrel-border-hairline);
+  --kestrel-dialog-checkbox-checked-bg: var(--kestrel-accent-base);
+  --kestrel-dialog-checkbox-checked-border: var(--kestrel-accent-base);
+  --kestrel-dialog-checkbox-glyph-size: 12px;
+  --kestrel-dialog-checkbox-glyph-color: var(--kestrel-text-on-accent);
+  --kestrel-dialog-checkbox-disabled-border: var(--kestrel-border-subtle);
+
+  /* ---- §4.8 Text input / search field ----------------------------------- */
+
+  /* The placeholder is "Filter…", not "Search" — the field filters a list, it
+     does not search the web. The live match count sits OUTSIDE the field, so
+     the text never reflows as you type. */
+  --kestrel-input-height: var(--kestrel-metric-breadcrumb);
+  --kestrel-input-radius: var(--kestrel-radius-md);
+  --kestrel-input-background: var(--kestrel-surface-input);
+  --kestrel-input-border: var(--kestrel-border-default);
+  --kestrel-input-border-width: var(--kestrel-border-hairline);
+  --kestrel-input-border-hover: var(--kestrel-border-strong);
+  --kestrel-input-border-focus: var(--kestrel-border-accent);
+  --kestrel-input-ring-width: var(--kestrel-focus-ring-width);
+  --kestrel-input-ring-color: var(--kestrel-focus-ring);
+  --kestrel-input-ring-danger: var(--kestrel-border-danger);
+  --kestrel-input-ring-offset: var(--kestrel-focus-ring-offset);
+  --kestrel-input-font: var(--kestrel-text-role-ui-font);
+  --kestrel-input-color: var(--kestrel-text-primary);
+  --kestrel-input-placeholder-color: var(--kestrel-text-tertiary);
+  --kestrel-input-caret-width: var(--kestrel-border-hairline);
+  --kestrel-input-caret-color: var(--kestrel-text-primary);
+  --kestrel-input-caret-blink: 530ms;
+  --kestrel-input-selection-bg: var(--kestrel-accent-subtle-bg);
+  --kestrel-input-selection-color: var(--kestrel-text-primary);
+  --kestrel-input-padding-x: var(--kestrel-space-2);
+  --kestrel-input-icon-size: var(--kestrel-metric-icon);
+  --kestrel-input-icon-color: var(--kestrel-icon-chrome);
+  --kestrel-input-icon-gap: var(--kestrel-space-1-5);
+  --kestrel-input-clear-btn: var(--kestrel-space-5);
+  --kestrel-input-clear-btn-icon-size: 12px;
+  --kestrel-input-clear-btn-bg-hover: var(--kestrel-state-hover);
+  --kestrel-input-disabled-bg: var(--kestrel-surface-input-disabled);
+  --kestrel-input-disabled-color: var(--kestrel-text-disabled);
+  --kestrel-input-invalid-border: var(--kestrel-border-danger);
+  --kestrel-input-helper-font: var(--kestrel-text-role-caption-font);
+  --kestrel-input-helper-color: var(--kestrel-text-tertiary);
+  --kestrel-input-helper-danger-color: var(--kestrel-status-danger-text);
+  --kestrel-input-helper-gap: var(--kestrel-space-1);
+  --kestrel-input-transition: var(--kestrel-motion-hover); /* border + ring only */
+
+  /* ---- §4.9 Scrollbar --------------------------------------------------- */
+
+  /* Fades in on hover and out when idle, because a permanent 12px gutter costs
+     horizontal space in a name column that already competes with four others.
+     Minimum thumb 24px so it can always be grabbed — a thumb that shrinks to
+     6px in a 4,000-row directory is a pointer-target failure regardless of its
+     contrast. The list is never inset to make room; the thumb floats over it. */
+  --kestrel-scrollbar-width: var(--kestrel-metric-scrollbar);
+  --kestrel-scrollbar-thumb-size: var(--kestrel-metric-scrollbar-thumb);
+  --kestrel-scrollbar-thumb-radius: var(--kestrel-radius-sm);
+  --kestrel-scrollbar-track-color: var(--kestrel-scrollbar-track);
+  --kestrel-scrollbar-thumb-color: var(--kestrel-scrollbar-thumb);
+  --kestrel-scrollbar-thumb-hover-color: var(--kestrel-scrollbar-thumb-hover);
+  --kestrel-scrollbar-thumb-active-color: var(--kestrel-scrollbar-thumb-active);
+  --kestrel-scrollbar-inset: var(--kestrel-radius-sm);
+  --kestrel-scrollbar-thumb-min-size: var(--kestrel-metric-target-min);
+  --kestrel-scrollbar-track-fade-in: var(--kestrel-motion-fast);
+  --kestrel-scrollbar-track-fade-out: var(--kestrel-motion-moderate);
+  --kestrel-scrollbar-track-fade-out-delay: 400ms;
+  /* 3 lines per arrow press, 1 page per PageUp/PageDown, and NO smooth scroll
+     animation — `motion.instant`, because an animated jump in a file list hides
+     the very thing you navigated to. */
+  --kestrel-scrollbar-keyboard-lines: 3;
+  --kestrel-scrollbar-keyboard-transition: var(--kestrel-motion-instant);
+
+  /* ---- Components with no §4 section ------------------------------------ */
+
+  /* The viewport is the scroll container and the list's own surface. It is a
+     layout region, not an overlay: nothing floats over it, so a focused row can
+     never be obscured (§2.12, WCAG 2.2 "Focus Not Obscured"). */
+  --kestrel-viewport-background: var(--kestrel-surface-list);
+  --kestrel-viewport-focus-ring-width: var(--kestrel-focus-ring-width);
+  --kestrel-viewport-focus-ring-color: var(--kestrel-focus-ring);
+  --kestrel-viewport-focus-ring-offset: calc(0px - var(--kestrel-focus-ring-width));
+  --kestrel-viewport-layer: var(--kestrel-layer-list);
+
+  /* The toolbar is a layout sibling with a 1px border, never an overlay. */
+  --kestrel-toolbar-background: var(--kestrel-surface-chrome);
+  --kestrel-toolbar-border-bottom-color: var(--kestrel-border-default);
+  --kestrel-toolbar-border-bottom-width: var(--kestrel-border-hairline);
+  --kestrel-toolbar-padding-y: var(--kestrel-space-2);
+  --kestrel-toolbar-padding-x: var(--kestrel-space-3);
+  --kestrel-toolbar-layer: var(--kestrel-layer-chrome);
+
+  /* ---- Phase 1 / 3a implementation constants ----------------------------- */
+
+  /* Values the web build had hard-coded before this file existed and that §4 has
+     no token for. They are collected here rather than left inline so that the
+     file has no unreferenced magic numbers left in it — and so that each one is
+     visible as a decision to be made rather than as a number nobody owns.
+
+     Each is annotated with what it is and why it exists. None of them is a
+     design value; they are layout rectangles for two panels the spec does not
+     describe (§8 D-8 records the job panel, the op panel and the perf HUD as
+     unspecified) plus a handful of the Phase-1 list measurements that predate
+     this transcription. */
+  --kestrel-impl-op-panel-background: var(--kestrel-surface-panel);
+  --kestrel-impl-op-panel-padding-y: var(--kestrel-space-1-5);
+  --kestrel-impl-op-panel-padding-x: var(--kestrel-space-3);
+  --kestrel-impl-op-panel-border-color: var(--kestrel-border-default);
+  --kestrel-impl-op-panel-border-width: var(--kestrel-border-hairline);
+  --kestrel-impl-op-panel-font: var(--kestrel-text-role-ui-font);
+  --kestrel-impl-op-panel-label-gap: var(--kestrel-space-1);
+  --kestrel-impl-op-panel-title-font: var(--kestrel-text-role-ui-strong-font);
+  --kestrel-impl-op-panel-title-color: var(--kestrel-text-primary);
+  --kestrel-impl-op-panel-target-font: var(--kestrel-text-role-meta-font);
+  --kestrel-impl-op-panel-target-color: var(--kestrel-text-link);
+  --kestrel-impl-op-panel-target-gap: var(--kestrel-space-1);
+  --kestrel-impl-op-panel-hint-font: var(--kestrel-text-role-caption-font);
+  --kestrel-impl-op-panel-hint-color: var(--kestrel-text-tertiary);
+  --kestrel-impl-op-panel-warn-font: var(--kestrel-text-role-caption-font);
+  --kestrel-impl-op-panel-warn-color: var(--kestrel-status-danger-text);
+  --kestrel-impl-op-panel-input-max-width: 560px;
+  --kestrel-impl-op-panel-input-padding-y: var(--kestrel-space-half);
+  --kestrel-impl-op-panel-input-padding-x: var(--kestrel-space-1-5);
+  --kestrel-impl-op-panel-btn-gap: var(--kestrel-space-1);
+  --kestrel-impl-op-panel-btn-padding-y: var(--kestrel-space-half);
+  --kestrel-impl-op-panel-btn-padding-x: var(--kestrel-space-2-5);
+
+  /* Shared chrome-control metrics. The filter field, sort key and sort
+     direction are the same 13px control at three widths, so they share padding
+     rather than each carrying its own. */
+  --kestrel-impl-toolbar-control-font: var(--kestrel-text-role-ui-font);
+  --kestrel-impl-toolbar-control-padding-y: var(--kestrel-space-half);
+  --kestrel-impl-toolbar-control-padding-x: var(--kestrel-space-1-5);
+
+  --kestrel-impl-jobs-background: var(--kestrel-surface-panel);
+  --kestrel-impl-jobs-border-color: var(--kestrel-border-default);
+  --kestrel-impl-jobs-border-width: var(--kestrel-border-hairline);
+  --kestrel-impl-jobs-font: var(--kestrel-text-role-status-bar-font);
+  --kestrel-impl-jobs-padding-y: var(--kestrel-space-1);
+  --kestrel-impl-jobs-padding-x: var(--kestrel-space-3);
+  --kestrel-impl-jobs-divider-color: var(--kestrel-border-subtle);
+  --kestrel-impl-jobs-divider-width: var(--kestrel-border-hairline);
+  /* ~4 job rows before the panel scrolls. The Phase-1 value, kept: it is a
+     layout rectangle for a panel §8 D-8 records as unspecified, so there is no
+     spec number to move it to. */
+  --kestrel-impl-jobs-max-height: 132px;
+  --kestrel-impl-jobs-meta-color: var(--kestrel-text-tertiary);
+  --kestrel-impl-jobs-meta-font: var(--kestrel-text-role-meta-font);
+  --kestrel-impl-jobs-meta-gap: var(--kestrel-space-2);
+  --kestrel-impl-jobs-label-font: var(--kestrel-text-role-ui-strong-font);
+  --kestrel-impl-jobs-note-font: var(--kestrel-text-role-caption-font);
+  --kestrel-impl-jobs-note-color: var(--kestrel-text-tertiary);
+  --kestrel-impl-jobs-note-gap: var(--kestrel-space-half);
+  --kestrel-impl-jobs-failed-color: var(--kestrel-status-danger-text);
+  --kestrel-impl-jobs-progress-width: 220px;
+  --kestrel-impl-jobs-progress-max-width: 40%;
+  --kestrel-impl-jobs-progress-gap: var(--kestrel-space-2);
+  /* 14px is the native <progress> control's own height. It is numerically equal
+     to `metric.icon-compact`, but that names a glyph size and borrowing it here
+     would be a false claim about what the number is. */
+  --kestrel-impl-jobs-progress-height: 14px;
+  --kestrel-impl-jobs-btn-gap: var(--kestrel-space-2);
+  /* 1px, not 2px: the cancel/dismiss buttons sit inside a 12px row, and 2px of
+     vertical padding made the row change height when a button appeared. */
+  --kestrel-impl-jobs-btn-padding-y: 1px;
+  --kestrel-impl-jobs-btn-padding-x: var(--kestrel-space-2);
+
+  /* The loading/empty veil over the list. Deliberately a light scrim of the
+     list's own surface, NOT `surface.scrim` — that is a 38%-black *modal*
+     backdrop and a modal backdrop over a loading list would read as "something
+     is blocking you". */
+  --kestrel-impl-state-overlay-color: var(--kestrel-text-tertiary);
+  --kestrel-impl-state-overlay-bg: var(--kestrel-surface-list-veil);
+  --kestrel-impl-state-overlay-layer: var(--kestrel-layer-list);
+
+  /* The perf HUD. §7.16 requires a long operation to report itself with words,
+     not a bare spinner — this is that report, so it carries the warning status
+     roles rather than three private ambers. */
+  --kestrel-impl-perf-bg: var(--kestrel-status-warning-bg);
+  --kestrel-impl-perf-border-color: var(--kestrel-status-warning-border);
+  --kestrel-impl-perf-border-width: var(--kestrel-border-hairline);
+  --kestrel-impl-perf-color: var(--kestrel-status-warning-text);
+  --kestrel-impl-perf-font: var(--kestrel-text-role-meta-font);
+  --kestrel-impl-perf-padding-y: var(--kestrel-space-1);
+  --kestrel-impl-perf-padding-x: var(--kestrel-space-3);
+
+  /* Glyph column width. §4.2's comfortable density pairs `metric.icon-lg` (20px)
+     with a 10px icon gap; the web glyph is a single character in a fixed cell,
+     so the cell — not the glyph — is what needs the width. */
+  --kestrel-impl-glyph-cell-width: var(--kestrel-metric-icon-lg);
+
+  /* The filter field. §4.8 fixes the search field's height, radius, border and
+     padding but says nothing about its width; 160px is the Phase-1 value and
+     matches `metric.column-name-min`, the narrowest a name column is allowed to
+     get. */
+  --kestrel-impl-filter-width: var(--kestrel-metric-column-name-min);
+
+  /* Toolbar spacing between the loose groups (up-button, crumbs, filter, sort,
+     hidden toggle, op buttons). §4.4 puts a 6px gap inside a labelled button;
+     this is the gap between groups, which the spec leaves to proximity. */
+  --kestrel-impl-toolbar-group-gap: var(--kestrel-space-2);
+  --kestrel-impl-toolbar-tight-gap: var(--kestrel-space-1);
+  --kestrel-impl-toolbar-btn-padding-y: var(--kestrel-space-half);
+  --kestrel-impl-toolbar-btn-padding-x: var(--kestrel-space-2-5);
+
+  /* The up button and the toolbar path readout. */
+  --kestrel-impl-toolbar-path-font: var(--kestrel-text-role-meta-font);
+
+  /* Breadcrumb segment padding. §4.3 gives `breadcrumb.segment-gap` as "2px
+     (padding), 6px (visual)"; the padding side is 2px and the visual gap is
+     what the separator's margins produce. */
+  --kestrel-impl-breadcrumb-segment-padding-y: var(--kestrel-space-half);
+  --kestrel-impl-breadcrumb-segment-padding-x: var(--kestrel-space-1);
+  --kestrel-impl-breadcrumb-separator-margin-x: var(--kestrel-space-half);
+}
+
+/* ==========================================================================
+   Reduced motion.
+
+   §2.11 rule 5, and the one part of the motion layer that is not merely
+   declared: every duration becomes 0 except the spinner, and every animated
+   property renders its final state immediately. No intermediate keyframes are
+   skipped-then-settled, because a state the user never sees is not a state.
+
+   This overrides the TOKEN VALUES, not any animation — nothing in the web build
+   animates yet, and wiring that up is a later phase. Putting the override here
+   means no call site can get it wrong.
+
+   `prefers-reduced-motion` is Safari 10.1, so it is inside the WebKitGTK floor.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --kestrel-motion-fast: 0ms;
+    --kestrel-motion-base: 0ms;
+    --kestrel-motion-moderate: 0ms;
+    --kestrel-motion-slow: 0ms;
+    --kestrel-motion-deliberate: 0ms;
+    /* The spinner keeps its duration: it reports that work is ongoing, and
+       freezing it would leave a static ring that looks like a stuck UI. */
+  }
+}
