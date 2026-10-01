@@ -1,0 +1,38 @@
+[
+  {
+    "name": "progress_copying_with_known_totals",
+    "json": "{\"type\":\"progress\",\"id\":7,\"phase\":\"copying\",\"doneBytes\":123,\"totalBytes\":456,\"doneItems\":1,\"totalItems\":9}"
+  },
+  {
+    "name": "progress_measuring_with_unknown_totals",
+    "json": "{\"type\":\"progress\",\"id\":7,\"phase\":\"measuring\",\"doneBytes\":0,\"totalBytes\":0,\"doneItems\":3,\"totalItems\":0}"
+  },
+  {
+    "name": "progress_deleting_has_no_byte_total",
+    "json": "{\"type\":\"progress\",\"id\":7,\"phase\":\"deleting\",\"doneBytes\":0,\"totalBytes\":0,\"doneItems\":42,\"totalItems\":42}"
+  },
+  {
+    "name": "progress_beyond_u32_byte_counts",
+    "json": "{\"type\":\"progress\",\"id\":4294967296,\"phase\":\"copying\",\"doneBytes\":5368709120,\"totalBytes\":8589934592,\"doneItems\":4294967296,\"totalItems\":4294967296}"
+  },
+  {
+    "name": "done_names_the_file",
+    "json": "{\"type\":\"done\",\"id\":7,\"summary\":\"copied report.pdf\"}"
+  },
+  {
+    "name": "error_cancelled_for_a_user_cancel",
+    "json": "{\"type\":\"error\",\"id\":7,\"error\":{\"kind\":\"cancelled\",\"path\":null,\"message\":\"operation cancelled\"}}"
+  },
+  {
+    "name": "error_already_exists_for_a_collision",
+    "json": "{\"type\":\"error\",\"id\":9,\"error\":{\"kind\":\"already_exists\",\"path\":\"/tmp/dst.txt\",\"message\":\"already exists: /tmp/dst.txt\"}}"
+  },
+  {
+    "name": "error_not_found_with_a_path",
+    "json": "{\"type\":\"error\",\"id\":11,\"error\":{\"kind\":\"not_found\",\"path\":\"/nope\",\"message\":\"no such file or directory: /nope\"}}"
+  },
+  {
+    "name": "error_unknown_from_the_non_exhaustive_fallback",
+    "json": "{\"type\":\"error\",\"id\":13,\"error\":{\"kind\":\"unknown\",\"path\":null,\"message\":\"a future engine error\"}}"
+  }
+]

@@ -6,12 +6,15 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "esbuild test/op-seam.test.ts --bundle --platform=node --format=esm --external:@tauri-apps/api/core --outfile=/tmp/opencode/kestrel-op-seam.test.mjs --log-level=warning && node --test /tmp/opencode/kestrel-op-seam.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "=2.11.1"
   },
   "devDependencies": {
+    "@types/node": "^22.20.4",
+    "esbuild": "^0.25.12",
     "typescript": "~5.9",
     "vite": "^6.3"
   }
