@@ -18,8 +18,10 @@ import {
   parseFixtureParam,
   perfHudWanted,
 } from "./lib/fixture";
-import { createIpc } from "./lib/ipc";
-import type { SortKeyDto } from "./lib/types";
+import { createIpc, type KestrelIpc } from "./lib/ipc";
+import type { FileEntryDto, OpRequestDto, SortKeyDto } from "./lib/types";
+import { OpManager, isAlreadyExistsKind, type OpJob } from "./lib/ops";
+import { formatSize } from "./lib/format";
 import { OVERSCAN, ROW_HEIGHT, Windower } from "./lib/windower";
 
 function el<T extends HTMLElement>(id: string): T {
@@ -44,6 +46,102 @@ function autoOpenName(): string | null {
     return new URLSearchParams(window.location.search).get("open");
   } catch {
     return null;
+  }
+}
+
+/**
+ * Dev-only `?ipc=mock`: force the mock seam inside the real binary, so the
+ * Phase 3a op progress stream is exercisable on WebKitGTK before the backend
+ * lane lands `op_start`. Same category as `rows`/`perf`: never the default,
+ * always explicit, and the status backend tag keeps reading honestly.
+ */
+function ipcForceParam(): "mock" | null {
+  try {
+    return new URLSearchParams(window.location.search).get("ipc") === "mock"
+      ? "mock"
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Dev-only `?opdemo=copy|move|trash|delete|copy-collide`: auto-start one op
+ * on the selected (or first) entry after the listing completes, so progress
+ * + keystroke-to-paint-with-an-op-running are screenshot-measurable without
+ * synthetic input. Copy/move target `<src>-opdemo` in the same directory
+ * unless `?opdst=` overrides it. `copy-collide` targets an existing
+ * `README.md` to demo the `already_exists` error path.
+ */
+function opDemoParam(): string | null {
+  try {
+    const v = new URLSearchParams(window.location.search).get("opdemo");
+    return v === "copy" ||
+      v === "move" ||
+      v === "trash" ||
+      v === "delete" ||
+      v === "copy-collide"
+      ? v
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Dev-only `?opprompt=copy|move|delete`: open the destination prompt (or
+ * delete confirm) for the selected/first entry without starting an op —
+ * the prompt UI is screenshot-measurable without synthetic input.
+ */
+function opPromptParam(): string | null {
+  try {
+    const v = new URLSearchParams(window.location.search).get("opprompt");
+    return v === "copy" || v === "move" || v === "delete" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Dev-only `?opcancelms=N`: cancel the `?opdemo=` op N ms after it starts,
+ * so the cancelling/cancelled rows (and the partial-destination note) are
+ * screenshot-measurable without synthetic input.
+ */
+function opCancelMsParam(): number | null {
+  try {
+    const raw = new URLSearchParams(window.location.search).get("opcancelms");
+    if (!raw) return null;
+    const n = parseInt(raw, 10);
+    return isNaN(n) || n < 0 ? null : Math.min(n, 10000);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Dev-only `?opdst=<path>`: override the `<src>-opdemo` destination of a
+ * `?opdemo=copy|move` run. Needed for cross-filesystem moves (the only slow
+ * ones — same-dir moves are atomic renames and finish instantly).
+ */
+function opDstParam(): string | null {
+  try {
+    const v = new URLSearchParams(window.location.search).get("opdst");
+    return v !== null && v !== "" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Dev-only `?opstats=1`: append live per-job progress counters (events seen,
+ * backwards jumps) to the job notes — the monotonic-progress evidence for
+ * the exit gate, screenshot-readable.
+ */
+function opStatsParam(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get("opstats") === "1";
+  } catch {
+    return false;
   }
 }
 
@@ -136,7 +234,7 @@ async function main(): Promise<void> {
   const sortDirEl = el<HTMLButtonElement>("sort-dir");
   const hiddenEl = el<HTMLInputElement>("hidden-toggle");
 
-  const ipc = createIpc();
+  const ipc = createIpc(ipcForceParam() === "mock" ? "mock" : undefined);
   backendTag.textContent = ipc.backend === "tauri" ? "tauri" : "mock";
 
   const windower = new Windower(viewport, spacer, rowsEl, ROW_HEIGHT, OVERSCAN);
@@ -184,6 +282,22 @@ async function main(): Promise<void> {
     void browser.setShowHidden(hiddenEl.checked).then(refreshPerfLine);
   });
 
+  // --- Phase 3a ops wiring (selection lives in Browser; jobs live here) ---
+  const opsUi = setupOps({
+    browser,
+    ipc,
+    statusEl,
+    viewport,
+    panelEl: el<HTMLElement>("op-panel"),
+    jobsEl: el<HTMLElement>("jobs"),
+    copyBtn: el<HTMLButtonElement>("op-copy"),
+    moveBtn: el<HTMLButtonElement>("op-move"),
+    trashBtn: el<HTMLButtonElement>("op-trash"),
+    deleteBtn: el<HTMLButtonElement>("op-delete"),
+    onHud: refreshPerfLine,
+    showOpStats: opStatsParam(),
+  });
+
   const autoOpen = autoOpenName();
 
   if (fixtureN !== null) {
@@ -209,15 +323,32 @@ async function main(): Promise<void> {
           windower,
           browser
         );
+        // Dev-only auto probe: keystroke-to-paint with no synthetic input,
+        // so `--rows 10000 --perf` in the real binary still yields a genuine
+        // filter number. Probe a wide query, record, then clear. (Clear
+        // first: a `&filter=` dev param may already equal the probe query,
+        // and setFilter early-returns 0 on no-change — that 0 is not a
+        // measurement.)
+        const pq = "file-000";
+        browser.setFilter("");
+        const probeMs = browser.setFilter(pq);
+        browser.setFilter("");
+        setExtraHudLine(
+          'filter-probe "' + pq + '": ' + probeMs.toFixed(1) + " ms"
+        );
+        (window as unknown as Record<string, unknown>)[
+          "__kestrelFilterProbeMs"
+        ] = probeMs;
+        appendPhase2Line(perfEl, windower, browser, opsUi.ops.activeCount());
       });
     });
-    if (wantPerf) startPerfSampler(perfEl, windower, browser);
+    if (wantPerf) startPerfSampler(perfEl, windower, browser, () => opsUi.ops.activeCount());
     // Dev-only: exercise the real scroll path (passive listener → rAF →
     // windower.update) on a loop so the HUD's frame costs are genuine
     // WebKitGTK measurements, not idle zeros.
     if (autoScrollWanted()) startAutoScroll(viewport);
   } else {
-    if (wantPerf) startPerfSampler(perfEl, windower, browser);
+    if (wantPerf) startPerfSampler(perfEl, windower, browser, () => opsUi.ops.activeCount());
     await browser.navigate(startPath());
     if (autoOpen !== null) {
       // The scan streams in after scan_start resolves; wait for completion
@@ -255,11 +386,16 @@ async function main(): Promise<void> {
     await applyDevParams(browser, { filterEl, sortKeyEl, sortDirEl, hiddenEl });
   }
 
+  // Dev-only op demo (no-op unless `?opdemo=` is present in the query).
+  await maybeStartOpDemo(browser, opsUi);
+  // Dev-only prompt demo (no-op unless `?opprompt=` is present).
+  maybeOpenOpPrompt(browser, opsUi);
+
   viewport.focus();
 
   function refreshPerfLine(): void {
     if (!wantPerf && fixtureN === null) return;
-    appendPhase2Line(perfEl, windower, browser);
+    appendPhase2Line(perfEl, windower, browser, opsUi.ops.activeCount());
   }
 
   // Exposed for automation / manual probing in devtools.
@@ -292,6 +428,14 @@ async function main(): Promise<void> {
       }
       return false;
     },
+    /** Phase 3a: start an op on the selected entry (automation/devtools). */
+    startOp: (kind: string): Promise<number | null> => opsUi.startForTest(kind),
+    /** Phase 3a: cancel every in-flight op. */
+    cancelAllOps: (): void => opsUi.cancelAll(),
+    /** Phase 3a: in-flight op count (HUD + measurement). */
+    opsActive: (): number => opsUi.ops.activeCount(),
+    /** Phase 3a: DOM pool size after the job list was added (must stay flat). */
+    domPoolSize: (): number => windowerPoolSize(windower),
   };
   (window as unknown as Record<string, unknown>)["__kestrel"] = kestrel;
 }
@@ -318,7 +462,8 @@ function reportPerf(
     totalMs.toFixed(1) +
     " ms · DOM nodes in pool: " +
     windowerPoolSize(windower) +
-    phase2Line(browser);
+    phase2Line(browser) +
+    (extraHudLine !== "" ? "\n" + extraHudLine : "");
   (window as unknown as Record<string, unknown>)["__kestrelPerf"] = {
     rows: n,
     buildMs,
@@ -331,16 +476,30 @@ function windowerPoolSize(w: Windower): number {
   return (w as unknown as { pool: unknown[] }).pool.length;
 }
 
-function phase2Line(browser: Browser): string {
+/**
+ * Phase 3a HUD extension: one sticky extra line (filter probe, with-op
+ * filter timing) that survives the 500 ms sampler rewrites. Without this,
+ * anything appended to the HUD is wiped on the next tick and unmeasurable
+ * in screenshots.
+ */
+let extraHudLine = "";
+
+function setExtraHudLine(s: string): void {
+  extraHudLine = extraHudLine === "" ? s : extraHudLine + "\n" + s;
+}
+
+function phase2Line(browser: Browser, opsActive?: number): string {
   const f = browser.lastFilterMs >= 0 ? browser.lastFilterMs.toFixed(1) + " ms" : "—";
   const s = browser.lastSortMs >= 0 ? browser.lastSortMs.toFixed(1) + " ms" : "—";
-  return "\nfilter-to-paint " + f + " · sort-to-paint " + s + " · " + browser.watchStatus();
+  const ops = opsActive !== undefined ? " · ops active " + opsActive : "";
+  return "\nfilter-to-paint " + f + " · sort-to-paint " + s + " · " + browser.watchStatus() + ops;
 }
 
 function appendPhase2Line(
   perfEl: HTMLElement,
   windower: Windower,
-  browser: Browser
+  browser: Browser,
+  opsActive?: number
 ): void {
   perfEl.style.display = "";
   const costs = windower.frameCosts.slice().sort((a, b) => a - b);
@@ -358,18 +517,27 @@ function appendPhase2Line(
     p95.toFixed(2) +
     " ms";
   perfEl.textContent =
-    (base ? base + "\n" : "") + scroll + phase2Line(browser);
+    (base ? base + "\n" : "") +
+    scroll +
+    phase2Line(browser, opsActive) +
+    (extraHudLine !== "" ? "\n" + extraHudLine : "");
 }
 
 /** While ?perf=1, refresh scroll frame stats twice a second. */
 function startPerfSampler(
   perfEl: HTMLElement,
   windower: Windower,
-  browser: Browser
+  browser: Browser,
+  opsCount?: () => number
 ): void {
   perfEl.style.display = "";
   setInterval(() => {
-    appendPhase2Line(perfEl, windower, browser);
+    appendPhase2Line(
+      perfEl,
+      windower,
+      browser,
+      opsCount ? opsCount() : undefined
+    );
   }, 500);
 }
 
@@ -390,6 +558,635 @@ function startAutoScroll(viewport: HTMLElement): void {
   };
   // Start after first paint settles so scroll costs don't include setup.
   setTimeout(step, 1500);
+}
+
+/**
+ * Dev-only `?opdemo=`: auto-start one op after the listing completes.
+ * Copy/move target `<src>-opdemo` in the same directory. When `&filter=`
+ * is also present, the filter is re-applied mid-stream (measuring window)
+ * so the HUD's filter-to-paint number is genuinely "with an op running".
+ */
+async function maybeStartOpDemo(
+  browser: Browser,
+  opsUi: OpsHandle
+): Promise<void> {
+  const kind = opDemoParam();
+  if (!kind) return;
+  const t0 = Date.now();
+  while (!browser.doneScanning && Date.now() - t0 < 15000) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  // One frame past listing paint: the job row must exist as early as
+  // possible so headless captures (which fire ~130 ms after load) still
+  // land inside the measuring window.
+  await new Promise((r) => requestAnimationFrame(() => r(null)));
+  const id = await opsUi.startForTest(kind);
+  if (id === null) return;
+  const cancelMs = opCancelMsParam();
+  if (cancelMs !== null) {
+    await new Promise((r) => setTimeout(r, cancelMs));
+    opsUi.ops.cancel(id);
+    // Let the cancelling→cancelled flip land before a screenshot.
+    await new Promise((r) => setTimeout(r, 600));
+    return;
+  }
+  let filterQ: string | null = null;
+  try {
+    filterQ = new URLSearchParams(window.location.search).get("filter");
+  } catch {
+    filterQ = null;
+  }
+  if (filterQ !== null) {
+    // Mid-measuring window: progress events are streaming, total unknown.
+    // With `?opslow=1` the window is wide, so measure early enough for a
+    // headless capture to see the sticky HUD line.
+    let slow = false;
+    try {
+      slow = new URLSearchParams(window.location.search).get("opslow") === "1";
+    } catch {
+      slow = false;
+    }
+    await new Promise((r) => setTimeout(r, slow ? 100 : 700));
+    browser.setFilter("");
+    const ms = browser.setFilter(filterQ);
+    (window as unknown as Record<string, unknown>)[
+      "__kestrelFilterWithOpMs"
+    ] = ms;
+    setExtraHudLine(
+      'filter-with-op "' + filterQ + '": ' + ms.toFixed(1) + " ms"
+    );
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 3a — ops UI: buttons + shortcuts, destination prompt, jobs     */
+/* ------------------------------------------------------------------ */
+
+/** Dev-only `?opprompt=`: open the prompt/confirm with no synthetic input. */
+function maybeOpenOpPrompt(browser: Browser, opsUi: OpsHandle): void {
+  const kind = opPromptParam();
+  if (!kind) return;
+  // The demo runner is skipped when a prompt is requested, so poll for the
+  // listing here instead of reusing its wait.
+  const t0 = Date.now();
+  const poll = (): void => {
+    if (!browser.doneScanning && Date.now() - t0 < 15000) {
+      setTimeout(poll, 25);
+      return;
+    }
+    opsUi.openPrompt(kind);
+  };
+  poll();
+}
+
+interface OpsContext {
+  browser: Browser;
+  ipc: KestrelIpc;
+  statusEl: HTMLElement;
+  viewport: HTMLElement;
+  panelEl: HTMLElement;
+  jobsEl: HTMLElement;
+  copyBtn: HTMLButtonElement;
+  moveBtn: HTMLButtonElement;
+  trashBtn: HTMLButtonElement;
+  deleteBtn: HTMLButtonElement;
+  onHud: () => void;
+  /** Dev-only `?opstats=1`: show live per-job progress counters in notes. */
+  showOpStats: boolean;
+}
+
+interface OpsHandle {
+  ops: OpManager;
+  startForTest(kind: string): Promise<number | null>;
+  cancelAll(): void;
+  openPrompt(kind: string): void;
+}
+
+interface JobNodes {
+  root: HTMLDivElement;
+  label: HTMLSpanElement;
+  phase: HTMLSpanElement;
+  bytes: HTMLSpanElement;
+  bar: HTMLProgressElement;
+  note: HTMLSpanElement;
+  cancelBtn: HTMLButtonElement;
+  dismissBtn: HTMLButtonElement;
+}
+
+/**
+ * Wire the four operations. Every op is reachable by a visible button AND
+ * a keyboard shortcut (a hidden keyboard-only feature is not shipped):
+ * Ctrl+C copy, Ctrl+M move, Delete trash, Shift+Delete permanent delete.
+ * Shortcuts fire only when the list itself has focus — never while typing
+ * in the filter, the sort box, or the destination prompt.
+ */
+function setupOps(ctx: OpsContext): OpsHandle {
+  const ops = new OpManager(
+    ctx.ipc,
+    {
+      onJobsChanged: (jobs) => renderJobs(ctx, ops, jobs),
+      onOpError: (error) => ctx.browser.showOpError(error),
+      onSettled: () => {
+        ctx.browser.rescan();
+        ctx.onHud();
+      },
+    }
+  );
+
+  const selectedOrHint = (): FileEntryDto | null => {
+    const e = ctx.browser.selectedEntry();
+    if (!e)
+      ctx.statusEl.textContent =
+        "Select a file or folder first (click a row or use arrow keys).";
+    return e;
+  };
+
+  ctx.copyBtn.addEventListener("click", () => {
+    const e = selectedOrHint();
+    if (e) openCopyMove(ctx, ops, "copy", e);
+  });
+  ctx.moveBtn.addEventListener("click", () => {
+    const e = selectedOrHint();
+    if (e) openCopyMove(ctx, ops, "move", e);
+  });
+  ctx.trashBtn.addEventListener("click", () => {
+    const e = selectedOrHint();
+    if (e) void startOp(ctx, ops, { op: "trash", src: e.path });
+  });
+  ctx.deleteBtn.addEventListener("click", () => {
+    const e = selectedOrHint();
+    if (e) openDeleteConfirm(ctx, ops, e);
+  });
+
+  ctx.browser.opKeyHandler = (e) => {
+    if (isTypingTarget(ctx)) return false;
+    const mod = e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey;
+    if (mod && (e.key === "c" || e.key === "C")) {
+      const s = selectedOrHint();
+      if (s) openCopyMove(ctx, ops, "copy", s);
+      e.preventDefault();
+      return true;
+    }
+    if (mod && (e.key === "m" || e.key === "M")) {
+      const s = selectedOrHint();
+      if (s) openCopyMove(ctx, ops, "move", s);
+      e.preventDefault();
+      return true;
+    }
+    if (!e.ctrlKey && !e.altKey && !e.metaKey && e.key === "Delete") {
+      const s = selectedOrHint();
+      if (s) {
+        if (e.shiftKey) openDeleteConfirm(ctx, ops, s);
+        else void startOp(ctx, ops, { op: "trash", src: s.path });
+      }
+      e.preventDefault();
+      return true;
+    }
+    return false;
+  };
+
+  const handle: OpsHandle = {
+    ops,
+    cancelAll: () => {
+      const jobs = ops.liveJobs();
+      for (let i = 0; i < jobs.length; i++) ops.cancel(jobs[i].id);
+    },
+    openPrompt: (kind: string): void => {
+      const e = firstEntry(ctx);
+      if (!e) return;
+      if (kind === "copy" || kind === "move") openCopyMove(ctx, ops, kind, e);
+      else if (kind === "delete") openDeleteConfirm(ctx, ops, e);
+    },
+    startForTest: (kind: string): Promise<number | null> => {
+      const e = firstEntry(ctx);
+      if (!e) return Promise.resolve(null);
+      if (kind === "copy" || kind === "move") {
+        const dst = opDstParam();
+        return startOp(ctx, ops, {
+          op: kind,
+          src: e.path,
+          dst: dst !== null ? dst : e.path + "-opdemo",
+        });
+      }
+      if (kind === "copy-collide")
+        // Targets an existing README.md in the viewed directory: exercises
+        // the already_exists error path end to end (op fails, destination
+        // untouched, no dialog).
+        return startOp(ctx, ops, {
+          op: "copy",
+          src: e.path,
+          dst: dirName(e.path) + "/README.md",
+        });
+      if (kind === "trash") return startOp(ctx, ops, { op: "trash", src: e.path });
+      if (kind === "delete")
+        return startOp(ctx, ops, {
+          op: "delete",
+          src: e.path,
+          recursive: e.descendable,
+        });
+      return Promise.resolve(null);
+    },
+  };
+  return handle;
+}
+
+/** Selected entry, else the first entry row (dev/automation entry point). */
+function firstEntry(ctx: OpsContext): FileEntryDto | null {
+  const sel = ctx.browser.selectedEntry();
+  if (sel) return sel;
+  const rows = ctx.browser.rows;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (r.kind === "entry") return r.entry;
+  }
+  return null;
+}
+
+function dirName(p: string): string {
+  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  if (i <= 0) return "/";
+  return p.slice(0, i);
+}
+
+/** True while the user is typing somewhere ops shortcuts must not fire. */
+function isTypingTarget(ctx: OpsContext): boolean {
+  const a = document.activeElement;
+  if (!a || a === ctx.viewport) return false;
+  const tag = (a.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return true;
+  try {
+    if (ctx.panelEl.contains(a)) return true;
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
+function startOp(
+  ctx: OpsContext,
+  ops: OpManager,
+  req: OpRequestDto
+): Promise<number | null> {
+  return ops
+    .start(req)
+    .then((id) => {
+      ctx.viewport.focus();
+      return id as number;
+    })
+    .catch((err) => {
+      // The backend lane may not have landed op_start yet: say so honestly
+      // on the status line instead of failing silently.
+      ctx.statusEl.textContent =
+        "Operation failed to start: " + messageOf(err);
+      return null;
+    });
+}
+
+function clearEl(node: HTMLElement): void {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+function closePanel(ctx: OpsContext): void {
+  clearEl(ctx.panelEl);
+  ctx.panelEl.style.display = "none";
+}
+
+/**
+ * Destination prompt for copy/move. There is no meaningful default target,
+ * so the user names one: the directory to copy INTO (default: the viewed
+ * directory, always shown verbatim) plus the new name (default: the source
+ * name). A live preview shows the full destination path. Inline form, not
+ * a modal dialog — 3a ships no dialogs.
+ */
+function openCopyMove(
+  ctx: OpsContext,
+  ops: OpManager,
+  kind: "copy" | "move",
+  src: FileEntryDto
+): void {
+  const verb = kind === "copy" ? "Copy" : "Move";
+  clearEl(ctx.panelEl);
+  ctx.panelEl.style.display = "";
+
+  const title = document.createElement("p");
+  title.className = "k-op-title";
+  title.textContent = verb + " “" + src.name + "”";
+  ctx.panelEl.appendChild(title);
+
+  const dirLabel = document.createElement("label");
+  dirLabel.textContent = "Into directory:";
+  const dirInput = document.createElement("input");
+  dirInput.type = "text";
+  dirInput.value = ctx.browser.currentPath || "/";
+  dirInput.setAttribute("aria-label", "Destination directory");
+  dirLabel.appendChild(dirInput);
+  ctx.panelEl.appendChild(dirLabel);
+
+  const nameLabel = document.createElement("label");
+  nameLabel.textContent = "New name:";
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.value = src.name;
+  nameInput.setAttribute("aria-label", "Destination file name");
+  nameLabel.appendChild(nameInput);
+  ctx.panelEl.appendChild(nameLabel);
+
+  const preview = document.createElement("p");
+  preview.className = "k-op-target";
+  ctx.panelEl.appendChild(preview);
+  const repaint = (): void => {
+    preview.textContent = "Destination: " + joinDst(dirInput.value, nameInput.value);
+  };
+  dirInput.addEventListener("input", repaint);
+  nameInput.addEventListener("input", repaint);
+  repaint();
+
+  const hint = document.createElement("p");
+  hint.className = "k-op-hint";
+  hint.textContent =
+    "If that destination already exists the op fails and leaves it " +
+    "untouched — nothing is overwritten, and there is no collision " +
+    "dialog in Phase 3a (a later phase adds it).";
+  ctx.panelEl.appendChild(hint);
+
+  const go = document.createElement("button");
+  go.type = "button";
+  go.textContent = kind === "copy" ? "Copy here" : "Move here";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  ctx.panelEl.appendChild(go);
+  ctx.panelEl.appendChild(cancel);
+
+  const confirm = (): void => {
+    const dst = joinDst(dirInput.value, nameInput.value);
+    if (!nameInput.value) {
+      preview.textContent = "Destination: give the copy a name.";
+      nameInput.focus();
+      return;
+    }
+    closePanel(ctx);
+    const req: OpRequestDto =
+      kind === "copy"
+        ? { op: "copy", src: src.path, dst }
+        : { op: "move", src: src.path, dst };
+    void startOp(ctx, ops, req);
+  };
+  go.addEventListener("click", confirm);
+  cancel.addEventListener("click", () => {
+    closePanel(ctx);
+    ctx.viewport.focus();
+  });
+  nameInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") confirm();
+    else if (e.key === "Escape") {
+      closePanel(ctx);
+      ctx.viewport.focus();
+    }
+  });
+  dirInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      closePanel(ctx);
+      ctx.viewport.focus();
+    }
+  });
+  nameInput.focus();
+  try {
+    nameInput.select();
+  } catch {
+    /* older webviews may lack select */
+  }
+}
+
+/** Permanent delete always confirms inline: it cannot be undone. */
+function openDeleteConfirm(
+  ctx: OpsContext,
+  ops: OpManager,
+  src: FileEntryDto
+): void {
+  clearEl(ctx.panelEl);
+  ctx.panelEl.style.display = "";
+
+  const title = document.createElement("p");
+  title.className = "k-op-title";
+  title.textContent = "Delete “" + src.name + "” permanently?";
+  ctx.panelEl.appendChild(title);
+
+  const warn = document.createElement("p");
+  warn.className = "k-op-warn";
+  warn.textContent =
+    "This cannot be undone (unlike Trash)." +
+    (src.descendable ? " It is a directory: its contents are deleted too." : "");
+  ctx.panelEl.appendChild(warn);
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.textContent = "Delete forever";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  ctx.panelEl.appendChild(del);
+  ctx.panelEl.appendChild(cancel);
+
+  del.addEventListener("click", () => {
+    closePanel(ctx);
+    void startOp(ctx, ops, {
+      op: "delete",
+      src: src.path,
+      recursive: src.descendable,
+    });
+  });
+  cancel.addEventListener("click", () => {
+    closePanel(ctx);
+    ctx.viewport.focus();
+  });
+  del.focus();
+}
+
+/* ---------------- job list (never the windower) ---------------- */
+
+const jobNodes = new Map<number, JobNodes>();
+
+/**
+ * Keyed, in-place job rows: one DOM row per JobId, created once and updated
+ * per event (textContent + <progress> value only). Progress traffic never
+ * allocates list rows and never invalidates the windower pool.
+ */
+function renderJobs(ctx: OpsContext, ops: OpManager, jobs: OpJob[]): void {
+  const seen = new Map<number, boolean>();
+  for (let i = 0; i < jobs.length; i++) seen.set(jobs[i].id, true);
+  const dead: number[] = [];
+  jobNodes.forEach((_v, id) => {
+    if (!seen.has(id)) dead.push(id);
+  });
+  for (let i = 0; i < dead.length; i++) {
+    const n = jobNodes.get(dead[i]);
+    if (n && n.root.parentNode === ctx.jobsEl) ctx.jobsEl.removeChild(n.root);
+    jobNodes.delete(dead[i]);
+  }
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i];
+    let n = jobNodes.get(job.id);
+    if (!n) {
+      n = makeJobRow(ctx, ops, job.id);
+      ctx.jobsEl.appendChild(n.root);
+      jobNodes.set(job.id, n);
+    }
+    paintJobRow(n, job, ctx.showOpStats);
+  }
+}
+
+function makeJobRow(ctx: OpsContext, ops: OpManager, id: number): JobNodes {
+  const root = document.createElement("div");
+  root.className = "k-job";
+  const top = document.createElement("span");
+  top.className = "k-job-top";
+  const label = document.createElement("span");
+  label.className = "k-job-label";
+  const phase = document.createElement("span");
+  phase.className = "k-job-phase";
+  const bytes = document.createElement("span");
+  bytes.className = "k-job-bytes";
+  const bar = document.createElement("progress");
+  bar.setAttribute("aria-label", "Operation progress");
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", () => ops.cancel(id));
+  const dismissBtn = document.createElement("button");
+  dismissBtn.type = "button";
+  dismissBtn.textContent = "Dismiss";
+  dismissBtn.addEventListener("click", () => {
+    ops.dismiss(id);
+    ctx.viewport.focus();
+  });
+  top.appendChild(label);
+  top.appendChild(phase);
+  top.appendChild(bytes);
+  top.appendChild(bar);
+  top.appendChild(cancelBtn);
+  top.appendChild(dismissBtn);
+  const note = document.createElement("span");
+  note.className = "k-job-note";
+  root.appendChild(top);
+  root.appendChild(note);
+  return { root, label, phase, bytes, bar, note, cancelBtn, dismissBtn };
+}
+
+function paintJobRow(n: JobNodes, job: OpJob, showStats: boolean): void {
+  n.label.textContent = job.label;
+  n.phase.textContent = jobPhaseText(job);
+  n.root.className = "k-job" + (job.status === "failed" ? " is-failed" : "");
+  if (job.unknownTotal && job.status === "running") {
+    // Honest indeterminate: measuring has no total yet. The <progress>
+    // element with NO value attribute is the semantic indeterminate state
+    // (modern-web-guidance spinner); a guessed percentage would be a bug.
+    n.bar.removeAttribute("value");
+    n.bar.removeAttribute("max");
+    n.bytes.textContent = job.doneItems > 0 ? job.doneItems + " items seen" : "";
+  } else if (!job.unknownTotal && job.totalBytes > 0) {
+    n.bar.setAttribute("max", String(job.totalBytes));
+    n.bar.setAttribute("value", String(job.doneBytes));
+    let t =
+      formatSize(job.doneBytes) + " / " + formatSize(job.totalBytes);
+    if (job.totalItems > 0)
+      t += " · " + job.doneItems + "/" + job.totalItems + " items";
+    n.bytes.textContent = t;
+  } else {
+    n.bar.removeAttribute("value");
+    n.bar.removeAttribute("max");
+    n.bytes.textContent = "";
+  }
+  n.note.textContent = jobNoteText(job, showStats);
+  const running = job.status === "running";
+  const terminal =
+    job.status === "done" ||
+    job.status === "failed" ||
+    job.status === "cancelled";
+  n.cancelBtn.style.display = running || job.status === "cancelling" ? "" : "none";
+  n.cancelBtn.textContent = job.status === "cancelling" ? "Cancelling…" : "Cancel";
+  n.cancelBtn.disabled = job.status !== "running";
+  n.dismissBtn.style.display = terminal ? "" : "none";
+}
+
+function jobPhaseText(job: OpJob): string {
+  if (job.status === "done") return "done";
+  if (job.status === "failed") return "failed";
+  if (job.status === "cancelled") return "cancelled";
+  if (job.status === "cancelling") return "cancelling";
+  return job.phase;
+}
+
+/**
+ * The cancel contract, stated in the UI: the engine leaves a partial
+ * destination behind on cancel by design, so the user is told to check it
+ * rather than discovering a half-copied file. The note also says WHO
+ * settled the job — a backend confirmation with its measured latency, or
+ * the local 400 ms fallback — so the settle source is never asserted, only
+ * reported (Task 3).
+ */
+function jobNoteText(job: OpJob, showStats: boolean): string {
+  const stats =
+    showStats && (job.status === "running" || job.status === "done")
+      ? " [events " +
+        job.progressEvents +
+        ", backwards " +
+        job.backwardsJumps +
+        "]"
+      : "";
+  if (job.status === "cancelling") return "Cancelling…";
+  if (job.status === "cancelled") return cancelNote(job);
+  if (job.status === "done") return job.summary + stats;
+  if (job.status === "failed" && job.error) {
+    let t = job.error.kind + ": " + job.error.message;
+    if (isAlreadyExistsKind(job.error.kind))
+      t += " The destination was left untouched — the collision dialog arrives in a later phase.";
+    return t;
+  }
+  if (job.status === "running" && job.unknownTotal)
+    return "Measuring size — no total yet, so no percentage is shown." + stats;
+  if (job.status === "running") return stats !== "" ? stats.slice(1) : "";
+  return "";
+}
+
+function cancelNote(job: OpJob): string {
+  const during =
+    job.phaseAtCancel !== "" ? " (during " + job.phaseAtCancel + ")" : "";
+  if (
+    job.settleSource === "backend" &&
+    job.terminalEventAt > job.cancelRequestedAt
+  ) {
+    const ms = Math.round(job.terminalEventAt - job.cancelRequestedAt);
+    return (
+      job.summary +
+      during +
+      " Backend confirmed cancel " +
+      ms +
+      " ms after the request."
+    );
+  }
+  return (
+    job.summary +
+    during +
+    " No backend confirmation arrived within 400 ms; settled locally."
+  );
+}
+
+function joinDst(dir: string, name: string): string {
+  let d = dir;
+  while (d.length > 1 && d.charAt(d.length - 1) === "/") d = d.slice(0, -1);
+  if (d === "") d = "/";
+  const sep = d.charAt(d.length - 1) === "/" ? "" : "/";
+  return d + sep + name;
+}
+
+function messageOf(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }
 
 void main();

@@ -158,6 +158,25 @@ impl Backend {
         }
     }
 
+    /// Removes an op job and cancels its worker, if it is still present.
+    /// Unknown ids are a no-op so a racing frontend cannot error — the same
+    /// posture as [`cancel_scan`](Self::cancel_scan) and
+    /// [`cancel_watch`](Self::cancel_watch).
+    ///
+    /// Never blocks: cancelling is an atomic store on the token, and no thread
+    /// is joined here. The pump task exits on its own once it observes the
+    /// token (or finishes the op and removes the entry itself).
+    pub fn cancel_op(&self, id: JobId) {
+        if let Some(job) = lock(&self.ops).remove(&id) {
+            job.cancel.cancel();
+        }
+    }
+
+    /// Registers a freshly started op job under `id`.
+    pub fn register_op(&self, id: JobId, job: Arc<OpJob>) {
+        lock(&self.ops).insert(id, job);
+    }
+
     /// Subscribes `dir` on the ONE shared watcher and returns the receiving
     /// end for a [`WatchRelay`].
     ///

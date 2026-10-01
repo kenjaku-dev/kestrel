@@ -41,6 +41,8 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::error::{KestrelError, Result, classify_io};
 use crate::model::CancellationToken;
@@ -48,6 +50,14 @@ use crate::model::CancellationToken;
 /// Buffer size for file copies. 64 KiB is a good balance between syscall
 /// overhead and cache pressure.
 const COPY_BUFFER: usize = 64 * 1024;
+
+/// How often a [`ProgressSink`] is invoked during a copy or delete.
+///
+/// Elapsed-time throttling, mirroring
+/// [`crate::size::SizeOptions::progress_interval`]: a sink called per 64 KiB
+/// chunk would be a slowdown, not a feature. One emit per completed file still
+/// goes through regardless, which is what makes small copies report at all.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What to do when the destination already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,8 +74,43 @@ pub enum Collision {
     Skip,
 }
 
+/// One progress report from a running copy or delete.
+///
+/// `bytes_copied` is cumulative across every file copied so far and never
+/// decreases within one call. Deletes count entries, not bytes, so it is
+/// always 0 there and `files_done` (removed entries so far) is the honest
+/// counter — an indeterminate bar, never a guessed number.
+#[derive(Debug, Clone)]
+pub struct ProgressEvent {
+    /// The file currently being copied, or the entry being deleted.
+    pub current_src: PathBuf,
+    /// Where it is going. For deletes, the entry being removed.
+    pub current_dst: PathBuf,
+    /// Bytes written so far, cumulative. Always 0 for deletes.
+    pub bytes_copied: u64,
+    /// Files fully copied, or entries removed, so far.
+    pub files_done: usize,
+}
+
+/// A progress receiver for [`copy`], [`move_`] and
+/// [`delete_recursive_with_progress`].
+///
+/// `Arc` (not `Box`) so [`CopyOptions`] keeps its `Clone` and `Default`: an
+/// `Option<Arc<..>>` is both, while a `Box<dyn FnMut>` field would break all
+/// three of `Debug`, `Clone` and `Default` and cascade into every caller. The
+/// sink itself is therefore `Fn`, not `FnMut` — interior mutability (a `Mutex`,
+/// atomics) is the caller's tool when the sink needs state.
+///
+/// The sink runs on the worker thread, inline with the copy:
+///
+/// * Keep it fast and non-blocking — a slow sink slows the copy.
+/// * A panicking sink is isolated with `catch_unwind` and the op continues,
+///   because a progress display failing must never abort a user's file
+///   operation.
+pub type ProgressSink = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+
 /// Options for [`copy`] and [`move_`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CopyOptions {
     /// Collision behaviour at the destination.
     pub collision: Collision,
@@ -81,6 +126,24 @@ pub struct CopyOptions {
     /// Stop as soon as this token is cancelled, leaving a partial destination
     /// behind (which the caller is expected to clean up or report).
     pub cancel: Option<CancellationToken>,
+    /// Progress receiver, throttled to [`PROGRESS_INTERVAL`] with one emit per
+    /// completed file. `None` (the default) is today's behaviour: no reporting.
+    pub progress: Option<ProgressSink>,
+}
+
+// Manual `Debug`: the sink is a closure and cannot be printed. Everything else
+// is shown; the sink is shown as present/absent, which is the only thing a log
+// line could honestly say about it anyway.
+impl std::fmt::Debug for CopyOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopyOptions")
+            .field("collision", &self.collision)
+            .field("answered", &self.answered)
+            .field("preserve_permissions", &self.preserve_permissions)
+            .field("cancel", &self.cancel)
+            .field("progress", &self.progress.is_some())
+            .finish()
+    }
 }
 
 /// Collisions the caller has already answered, keyed by destination path.
@@ -136,6 +199,79 @@ fn collision_for(options: &CopyOptions, dst: &Path) -> Collision {
     options.answered.get(dst).unwrap_or(options.collision)
 }
 
+/// Throttled emit state threaded through the copy/delete recursion.
+///
+/// One value per top-level call; the recursion only holds `&mut` to it, so no
+/// channel, no thread and no allocation sits on the copy path when no sink is
+/// set (every method is a cheap no-op then).
+struct ProgressState<'a> {
+    sink: Option<&'a ProgressSink>,
+    last_emit: Instant,
+    bytes_copied: u64,
+    files_done: usize,
+}
+
+impl<'a> ProgressState<'a> {
+    fn new(sink: Option<&'a ProgressSink>) -> Self {
+        Self {
+            sink,
+            last_emit: Instant::now(),
+            bytes_copied: 0,
+            files_done: 0,
+        }
+    }
+
+    /// Records `n` more bytes and emits if the throttle interval has passed.
+    /// This is the per-chunk call: cheap (one timestamp read) when quiet.
+    fn add_bytes(&mut self, src: &Path, dst: &Path, n: u64) {
+        self.bytes_copied = self.bytes_copied.saturating_add(n);
+        self.maybe_emit(src, dst);
+    }
+
+    /// Records one finished file and always emits. Per-file granularity is
+    /// what makes small copies report at all, and one call per file is cheap.
+    fn file_done(&mut self, src: &Path, dst: &Path) {
+        self.files_done += 1;
+        self.emit(src, dst);
+    }
+
+    /// Records one removed entry (the delete path) and emits if throttled.
+    fn entry_removed(&mut self, path: &Path) {
+        self.files_done += 1;
+        self.maybe_emit(path, path);
+    }
+
+    /// A throttled heartbeat with no counter change (directory boundaries).
+    fn tick(&mut self, src: &Path, dst: &Path) {
+        self.maybe_emit(src, dst);
+    }
+
+    /// The trailing emit, so a fast operation still reports its final totals.
+    fn finish(&mut self, src: &Path, dst: &Path) {
+        self.emit(src, dst);
+    }
+
+    fn maybe_emit(&mut self, src: &Path, dst: &Path) {
+        if self.last_emit.elapsed() >= PROGRESS_INTERVAL {
+            self.emit(src, dst);
+        }
+    }
+
+    /// Invokes the sink, isolating panics: a failing progress display must
+    /// never abort the op. A no-op without a sink.
+    fn emit(&mut self, src: &Path, dst: &Path) {
+        let Some(sink) = self.sink else { return };
+        self.last_emit = Instant::now();
+        let event = ProgressEvent {
+            current_src: src.to_path_buf(),
+            current_dst: dst.to_path_buf(),
+            bytes_copied: self.bytes_copied,
+            files_done: self.files_done,
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(event)));
+    }
+}
+
 /// How [`move_`] should attempt the move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MoveStrategy {
@@ -172,7 +308,17 @@ pub fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>, options: CopyOptions) 
     check_collision(dst, collision_for(&options, dst))?;
 
     let mut counter = CopyCounter { cancelled: false };
-    copy_recursive(src, dst, &metadata, &options, &cancel, 0, &mut counter)?;
+    let mut progress = ProgressState::new(options.progress.as_ref());
+    copy_recursive(
+        src,
+        dst,
+        &metadata,
+        &options,
+        &cancel,
+        0,
+        &mut counter,
+        &mut progress,
+    )?;
     if counter.cancelled {
         return Err(KestrelError::Cancelled);
     }
@@ -311,10 +457,45 @@ pub fn delete(path: impl AsRef<Path>) -> Result<()> {
 /// Any classified error from the recursive walk; a partial deletion may remain
 /// and is reported per path through the same error type.
 pub fn delete_recursive(path: impl AsRef<Path>, cancel: Option<&CancellationToken>) -> Result<()> {
+    delete_recursive_with_progress(path, cancel, None)
+}
+
+/// Permanently removes a file, or a directory and everything under it,
+/// reporting removed entries through `progress`.
+///
+/// The sink sees [`ProgressEvent`]s with `files_done` counting removed entries
+/// and `bytes_copied` always 0: a delete counts entries, it has no byte total
+/// to measure, and the event is honest about that rather than inventing one.
+/// Throttled to the same interval as copy progress, with a trailing emit so a
+/// fast delete still reports its final count.
+///
+/// # Errors
+///
+/// Same as [`delete_recursive`].
+pub fn delete_recursive_with_progress(
+    path: impl AsRef<Path>,
+    cancel: Option<&CancellationToken>,
+    progress: Option<&ProgressSink>,
+) -> Result<()> {
     let path = path.as_ref();
+    let mut state = ProgressState::new(progress);
+    let result = delete_inner(path, cancel, &mut state);
+    if result.is_ok() {
+        state.finish(path, path);
+    }
+    result
+}
+
+fn delete_inner(
+    path: &Path,
+    cancel: Option<&CancellationToken>,
+    progress: &mut ProgressState<'_>,
+) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path).map_err(|e| classify_io(path, e))?;
     if !metadata.is_dir() {
-        return delete(path);
+        delete(path)?;
+        progress.entry_removed(path);
+        return Ok(());
     }
 
     // Collect first: mutating a directory while iterating its `read_dir` handle
@@ -330,9 +511,11 @@ pub fn delete_recursive(path: impl AsRef<Path>, cancel: Option<&CancellationToke
         {
             return Err(KestrelError::Cancelled);
         }
-        delete_recursive(&child, cancel)?;
+        delete_inner(&child, cancel, progress)?;
     }
-    std::fs::remove_dir(path).map_err(|e| classify_io(path, e))
+    std::fs::remove_dir(path).map_err(|e| classify_io(path, e))?;
+    progress.entry_removed(path);
+    Ok(())
 }
 
 /// `true` when the error is the "these are on different filesystems" case.
@@ -450,6 +633,11 @@ fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
 }
 
 /// Recursive copy worker. `metadata` describes `src` (from `lstat`).
+///
+/// Eight arguments, over clippy's default seven — but the eight are the honest
+/// minimum (paths, metadata, options, cancel, depth, two accumulators) and
+/// bundling them into a context struct would just move the list elsewhere.
+#[allow(clippy::too_many_arguments)]
 fn copy_recursive(
     src: &Path,
     dst: &Path,
@@ -458,6 +646,7 @@ fn copy_recursive(
     cancel: &CancellationToken,
     depth: usize,
     counter: &mut CopyCounter,
+    progress: &mut ProgressState<'_>,
 ) -> Result<()> {
     if cancel.is_cancelled() {
         counter.cancelled = true;
@@ -476,7 +665,9 @@ fn copy_recursive(
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
-        return copy_symlink(src, dst, collision_for(options, dst));
+        copy_symlink(src, dst, collision_for(options, dst))?;
+        progress.file_done(src, dst);
+        return Ok(());
     }
 
     let collision = collision_for(options, dst);
@@ -517,8 +708,10 @@ fn copy_recursive(
                 cancel,
                 depth + 1,
                 counter,
+                progress,
             )?;
         }
+        progress.tick(src, dst);
         return Ok(());
     }
 
@@ -539,10 +732,11 @@ fn copy_recursive(
         }
     }
 
-    copy_file_contents(src, dst, cancel)?;
+    copy_file_contents(src, dst, cancel, progress)?;
     if options.preserve_permissions {
         let _ = std::fs::set_permissions(dst, metadata.permissions());
     }
+    progress.file_done(src, dst);
     Ok(())
 }
 
@@ -553,7 +747,12 @@ fn copy_recursive(
 /// files, and cancelling a 4 GB copy does nothing for the length of that file.
 /// The destination is left partial, per [`CopyOptions::cancel`]'s contract —
 /// cleanup is the caller's job, not this function's.
-fn copy_file_contents(src: &Path, dst: &Path, cancel: &CancellationToken) -> Result<()> {
+fn copy_file_contents(
+    src: &Path,
+    dst: &Path,
+    cancel: &CancellationToken,
+    progress: &mut ProgressState<'_>,
+) -> Result<()> {
     let mut reader = std::fs::File::open(src).map_err(|e| classify_io(src, e))?;
     let mut writer = std::fs::File::create(dst).map_err(|e| classify_io(dst, e))?;
     let mut buffer = vec![0u8; COPY_BUFFER];
@@ -570,6 +769,9 @@ fn copy_file_contents(src: &Path, dst: &Path, cancel: &CancellationToken) -> Res
         if let Err(e) = writer.write_all(&buffer[..read]) {
             return Err(classify_io(dst, e));
         }
+        // The per-chunk call the throttle exists for: one timestamp read when
+        // quiet, one sink call per `PROGRESS_INTERVAL` when loud.
+        progress.add_bytes(src, dst, read as u64);
     }
     // A crash between `write_all` and here leaves a truncated destination.
     if let Err(e) = writer.sync_data() {
@@ -650,7 +852,9 @@ fn copy_symlink(src: &Path, dst: &Path, collision: Collision) -> Result<()> {
         collision,
         preserve_permissions: false,
         cancel: None,
+        ..CopyOptions::default()
     };
+    let mut progress = ProgressState::new(None);
     copy_recursive(
         src,
         dst,
@@ -659,6 +863,7 @@ fn copy_symlink(src: &Path, dst: &Path, collision: Collision) -> Result<()> {
         &CancellationToken::new(),
         0,
         counter,
+        &mut progress,
     )
 }
 
@@ -1380,5 +1585,223 @@ mod tests {
             leftovers.is_empty(),
             "the create-then-rename step left litter behind: {leftovers:?}"
         );
+    }
+
+    // -- Phase 3a progress hook -------------------------------------------
+
+    /// The hook fires, reports non-decreasing `bytes_copied`, and is throttled:
+    /// 8 MiB is 128 chunks of 64 KiB, so an unthrottled sink would be called
+    /// ~128 times; the throttled one must be called far fewer times.
+    #[test]
+    fn progress_hook_fires_monotonic_and_throttled() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("big.bin");
+        let dst = tmp.path().join("big.bin.copy");
+        let chunk = vec![0xABu8; 1024 * 1024];
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&src).expect("create");
+            for _ in 0..8 {
+                f.write_all(&chunk).expect("write");
+            }
+        }
+        let src_len = fs::metadata(&src).expect("stat").len();
+
+        let seen: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_sink = Arc::clone(&seen);
+        let sink: ProgressSink = Arc::new(move |ev: ProgressEvent| {
+            seen_sink.lock().expect("lock").push(ev);
+        });
+
+        copy(
+            &src,
+            &dst,
+            CopyOptions {
+                progress: Some(sink),
+                ..CopyOptions::default()
+            },
+        )
+        .expect("copy with progress");
+
+        let seen = seen.lock().expect("lock");
+        assert!(!seen.is_empty(), "the sink must have been called");
+        let mut prev = 0u64;
+        for ev in seen.iter() {
+            assert!(
+                ev.bytes_copied >= prev,
+                "bytes_copied must never go backwards: {prev} then {}",
+                ev.bytes_copied
+            );
+            assert!(
+                ev.bytes_copied <= src_len,
+                "bytes_copied must never exceed the source length"
+            );
+            prev = ev.bytes_copied;
+        }
+        assert!(
+            seen.len() < 64,
+            "the sink must be throttled, got {} calls for 128 chunks",
+            seen.len()
+        );
+        assert_eq!(fs::read(&dst).expect("read").len() as u64, src_len);
+    }
+
+    /// A failing progress display must never abort the user's file operation.
+    #[test]
+    fn a_panicking_sink_does_not_abort_the_copy() {
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("a.bin");
+        let dst = tmp.path().join("b.bin");
+        fs::write(&src, vec![7u8; 256 * 1024]).expect("write");
+        let sink: ProgressSink = Arc::new(|_| panic!("progress display exploded"));
+        copy(
+            &src,
+            &dst,
+            CopyOptions {
+                progress: Some(sink),
+                ..CopyOptions::default()
+            },
+        )
+        .expect("the copy must survive a panicking sink");
+        assert_eq!(fs::read(&dst).expect("read").len(), 256 * 1024);
+    }
+
+    /// EXIT-GATE CLAUSE: cancelling a move mid-copy must leave the source
+    /// fully intact and the destination partial. Driven through
+    /// `CopyThenDelete` so the slow path is exercised deterministically (a
+    /// same-filesystem `rename` would be instant and uninterruptible).
+    #[test]
+    fn cancelled_move_keeps_the_source_and_leaves_a_partial_destination() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc::channel};
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("big.bin");
+        let dst = tmp.path().join("big.bin.moved");
+        let chunk = vec![0xABu8; 1024 * 1024];
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&src).expect("create");
+            for _ in 0..64 {
+                f.write_all(&chunk).expect("write");
+            }
+        }
+        let src_len = fs::metadata(&src).expect("stat").len();
+
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&started);
+        let dst_probe = dst.clone();
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                if fs::metadata(&dst_probe).is_ok_and(|m| m.len() > 0) {
+                    flag.store(true, Ordering::Relaxed);
+                    worker_token.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let (tx, rx) = channel();
+        let src_clone = src.clone();
+        let dst_clone = dst.clone();
+        let mover = std::thread::spawn(move || {
+            let result = move_(
+                &src_clone,
+                &dst_clone,
+                CopyOptions {
+                    cancel: Some(token),
+                    ..CopyOptions::default()
+                },
+                MoveStrategy::CopyThenDelete,
+            );
+            let _ = tx.send(result);
+        });
+
+        let mut outcome = None;
+        for _ in 0..10_000 {
+            if let Ok(result) = rx.try_recv() {
+                outcome = Some(result);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = canceller.join();
+        let _ = mover.join();
+        let result = outcome.expect("the move must notice the cancel promptly");
+        let err = result.expect_err("a mid-copy cancel is an error");
+        assert!(
+            matches!(err, KestrelError::Cancelled),
+            "cancelling mid-move must report Cancelled, got {err}"
+        );
+        assert!(
+            started.load(Ordering::Relaxed),
+            "the cancel landed mid-copy, not before the move began"
+        );
+        // The source must be whole: a cancelled move never deletes the source.
+        assert!(
+            src.exists(),
+            "a cancelled move must never delete the source"
+        );
+        assert_eq!(
+            fs::metadata(&src).expect("source stat").len(),
+            src_len,
+            "the source must be byte-for-byte intact"
+        );
+        assert_eq!(
+            fs::read(&src).expect("read")[..8],
+            [0xABu8; 8],
+            "the source content must be untouched"
+        );
+        // ... and the destination is the documented partial.
+        let partial = fs::metadata(&dst)
+            .expect("partial destination must exist")
+            .len();
+        assert!(
+            partial > 0 && partial < src_len,
+            "expected a partial destination, got {partial} of {src_len} bytes"
+        );
+    }
+
+    /// `delete_recursive` progress counts entries with zero bytes: there is no
+    /// byte total to measure, and inventing one would be worse than reporting
+    /// indeterminate.
+    #[test]
+    fn delete_progress_counts_entries_with_zero_bytes() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("gone");
+        fs::create_dir_all(dir.join("sub")).expect("mkdir");
+        fs::write(dir.join("a.txt"), b"a").expect("write");
+        fs::write(dir.join("sub/b.txt"), b"b").expect("write");
+
+        let seen: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_sink = Arc::clone(&seen);
+        let sink: ProgressSink = Arc::new(move |ev: ProgressEvent| {
+            seen_sink.lock().expect("lock").push(ev);
+        });
+
+        delete_recursive_with_progress(&dir, None, Some(&sink)).expect("delete");
+        assert!(!dir.exists(), "the tree must be gone");
+
+        let seen = seen.lock().expect("lock");
+        assert!(!seen.is_empty(), "the sink must have been called");
+        for ev in seen.iter() {
+            assert_eq!(
+                ev.bytes_copied, 0,
+                "delete progress has no byte total to report"
+            );
+        }
+        let last = seen.last().expect("at least one event");
+        // a.txt, sub/b.txt, sub, gone: every removed entry is counted.
+        assert_eq!(last.files_done, 4, "all four entries must be counted");
     }
 }

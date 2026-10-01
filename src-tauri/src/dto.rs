@@ -437,6 +437,172 @@ impl Serialize for WatchEventDto {
 }
 
 // ---------------------------------------------------------------------------
+// op request / events (backend → frontend)
+//
+// Frozen Phase 3a contract, internally tagged exactly like [`ScanEventDto`]
+// and [`WatchEventDto`]:
+//
+// ```json
+// { "op": "copy", "src": "/a", "dst": "/b" }
+// { "op": "move", "src": "/a", "dst": "/b" }
+// { "op": "trash", "src": "/a" }
+// { "op": "delete", "src": "/a", "recursive": true }
+// ```
+//
+// ```json
+// { "type": "progress", "id": 7, "phase": "copying",
+//   "doneBytes": 1, "totalBytes": 9, "doneItems": 1, "totalItems": 9 }
+// { "type": "done", "id": 7, "summary": "copied report.pdf" }
+// { "type": "error", "id": 7, "error": CmdError }
+// ```
+//
+// Phase 3b will ADD a `collision` variant (and an `op_collision_answer`
+// command) for the human-in-the-loop round-trip. This enum is where it goes;
+// nothing here needs to change shape to accept it. For 3a a collision is an
+// `error` event with kind `"already_exists"` and the op fails.
+// ---------------------------------------------------------------------------
+
+/// One mutating operation the frontend asks for. Internally tagged with
+/// `"op"`; every variant carries exactly the paths the frozen contract shows
+/// and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+pub enum OpRequestDto {
+    /// Copy `src` to `dst`, refusing to overwrite.
+    Copy {
+        /// Source path.
+        src: String,
+        /// Destination path.
+        dst: String,
+    },
+    /// Move `src` to `dst`, refusing to overwrite.
+    Move {
+        /// Source path.
+        src: String,
+        /// Destination path.
+        dst: String,
+    },
+    /// Send `src` to the platform recycle bin.
+    Trash {
+        /// Path to trash.
+        src: String,
+    },
+    /// Permanently remove `src`. Recursive only when asked: a non-recursive
+    /// delete of a populated directory fails rather than losing a tree.
+    Delete {
+        /// Path to delete.
+        src: String,
+        /// Delete a directory and everything under it. Default `false`.
+        #[serde(default)]
+        recursive: bool,
+    },
+}
+
+/// Which stage an [`OpEventDto::Progress`] event reports on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpPhase {
+    /// Measuring the source tree before copying. Totals are still unknown, so
+    /// `totalBytes`/`totalItems` are 0 (indeterminate, never guessed).
+    Measuring,
+    /// Copying (or moving) bytes.
+    Copying,
+    /// Deleting entries. `totalBytes` is always 0: a delete counts entries,
+    /// it has no byte total to measure.
+    Deleting,
+}
+
+impl OpPhase {
+    /// The frozen wire string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Measuring => "measuring",
+            Self::Copying => "copying",
+            Self::Deleting => "deleting",
+        }
+    }
+}
+
+/// One message sent over an `op_start` [`Channel`](tauri::ipc::Channel).
+///
+/// Deliberately extensible: Phase 3b adds a `Collision` variant here without
+/// touching any existing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpEventDto {
+    /// Running totals for `id`. `totalBytes`/`totalItems` are 0 while unknown
+    /// (measuring, deletes) — the frontend shows indeterminate then.
+    Progress {
+        /// The backend-minted job id from `op_start`.
+        id: u64,
+        /// Which stage this reports on.
+        phase: OpPhase,
+        /// Bytes written so far (0 for deletes).
+        done_bytes: u64,
+        /// Bytes in total, or 0 when unknown.
+        total_bytes: u64,
+        /// Files copied, or entries removed, so far.
+        done_items: usize,
+        /// Files/entries in total, or 0 when unknown.
+        total_items: usize,
+    },
+    /// The op finished. Always exactly one terminal event (`Done` or
+    /// `Error`) per started op.
+    Done {
+        /// The backend-minted job id from `op_start`.
+        id: u64,
+        /// Human sentence, e.g. `"copied report.pdf"`.
+        summary: String,
+    },
+    /// The op failed or was cancelled. Nested under `"error"` per the frozen
+    /// `WatchEventDto` shape — do not flatten it.
+    Error {
+        /// The backend-minted job id from `op_start`.
+        id: u64,
+        /// The failure, as the standard error shape.
+        error: CmdError,
+    },
+}
+
+impl Serialize for OpEventDto {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Progress {
+                id,
+                phase,
+                done_bytes,
+                total_bytes,
+                done_items,
+                total_items,
+            } => {
+                let mut out = s.serialize_struct("OpEventDto", 7)?;
+                out.serialize_field("type", "progress")?;
+                out.serialize_field("id", id)?;
+                out.serialize_field("phase", phase.as_str())?;
+                out.serialize_field("doneBytes", done_bytes)?;
+                out.serialize_field("totalBytes", total_bytes)?;
+                out.serialize_field("doneItems", done_items)?;
+                out.serialize_field("totalItems", total_items)?;
+                out.end()
+            }
+            Self::Done { id, summary } => {
+                let mut out = s.serialize_struct("OpEventDto", 3)?;
+                out.serialize_field("type", "done")?;
+                out.serialize_field("id", id)?;
+                out.serialize_field("summary", summary)?;
+                out.end()
+            }
+            Self::Error { id, error } => {
+                let mut out = s.serialize_struct("OpEventDto", 3)?;
+                out.serialize_field("type", "error")?;
+                out.serialize_field("id", id)?;
+                out.serialize_field("error", error)?;
+                out.end()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // open_path result
 // ---------------------------------------------------------------------------
 
@@ -806,5 +972,298 @@ mod tests {
         assert_eq!(v["kind"], serde_json::json!("permission_denied"));
         let v = serde_json::to_value(ScanEventDto::Entries(vec![])).expect("serialize");
         assert_eq!(v["type"], serde_json::json!("entries"));
+    }
+
+    #[test]
+    fn op_request_dto_deserializes_all_four_shapes() {
+        let req: OpRequestDto = serde_json::from_value(serde_json::json!({
+            "op": "copy", "src": "/a", "dst": "/b",
+        }))
+        .expect("copy");
+        assert_eq!(
+            req,
+            OpRequestDto::Copy {
+                src: "/a".into(),
+                dst: "/b".into()
+            }
+        );
+        let req: OpRequestDto = serde_json::from_value(serde_json::json!({
+            "op": "move", "src": "/a", "dst": "/b",
+        }))
+        .expect("move");
+        assert_eq!(
+            req,
+            OpRequestDto::Move {
+                src: "/a".into(),
+                dst: "/b".into()
+            }
+        );
+        let req: OpRequestDto = serde_json::from_value(serde_json::json!({
+            "op": "trash", "src": "/a",
+        }))
+        .expect("trash");
+        assert_eq!(req, OpRequestDto::Trash { src: "/a".into() });
+        let req: OpRequestDto = serde_json::from_value(serde_json::json!({
+            "op": "delete", "src": "/a", "recursive": true,
+        }))
+        .expect("delete");
+        assert_eq!(
+            req,
+            OpRequestDto::Delete {
+                src: "/a".into(),
+                recursive: true
+            }
+        );
+        // `recursive` defaults to false: a bare delete never takes a tree.
+        let req: OpRequestDto = serde_json::from_value(serde_json::json!({
+            "op": "delete", "src": "/a",
+        }))
+        .expect("delete default");
+        assert_eq!(
+            req,
+            OpRequestDto::Delete {
+                src: "/a".into(),
+                recursive: false
+            }
+        );
+    }
+
+    #[test]
+    fn op_event_dto_wire_tags() {
+        let v = serde_json::to_value(OpEventDto::Progress {
+            id: 7,
+            phase: OpPhase::Copying,
+            done_bytes: 123,
+            total_bytes: 456,
+            done_items: 1,
+            total_items: 9,
+        })
+        .expect("serialize");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "progress", "id": 7, "phase": "copying",
+                "doneBytes": 123, "totalBytes": 456,
+                "doneItems": 1, "totalItems": 9,
+            })
+        );
+        let v = serde_json::to_value(OpEventDto::Progress {
+            id: 7,
+            phase: OpPhase::Measuring,
+            done_bytes: 0,
+            total_bytes: 0,
+            done_items: 0,
+            total_items: 0,
+        })
+        .expect("serialize");
+        assert_eq!(v["phase"], serde_json::json!("measuring"));
+        let v = serde_json::to_value(OpEventDto::Done {
+            id: 7,
+            summary: "copied report.pdf".to_string(),
+        })
+        .expect("serialize");
+        assert_eq!(
+            v,
+            serde_json::json!({"type": "done", "id": 7, "summary": "copied report.pdf"})
+        );
+        // The error shape is nested per the frozen WatchEventDto contract.
+        let err = CmdError::custom("watch", Some(Path::new("/tmp/x")), "gone".to_string());
+        let v = serde_json::to_value(OpEventDto::Error { id: 7, error: err }).expect("serialize");
+        assert_eq!(v["type"], serde_json::json!("error"));
+        assert_eq!(v["id"], serde_json::json!(7));
+        assert_eq!(v["error"]["kind"], serde_json::json!("watch"));
+    }
+
+    // ------------------------------------------------------------------
+    // the golden fixture (the Rust half of the wire-seam test)
+    //
+    // The defining near-miss in this codebase was a UI that ran entirely on
+    // `MockIpc` and looked correct on screen while the real seam was never
+    // exercised. `tsc` cannot catch a wire mismatch — TypeScript types are
+    // erased at runtime, so a `doneBytes` → `done_bytes` rename in the
+    // serializer compiles cleanly and then silently zeroes every progress bar.
+    //
+    // So the exact bytes `Serialize` produces are committed to
+    // `ui/test/fixtures/op-events.json` and asserted here. The frontend half
+    // (`ui/test/op-seam.test.ts`) reads the same file and pushes those bytes
+    // through the real `normalizeOpEvent` / `OpManager`. Rename a field, flip
+    // a tag's casing, or flatten the nested `error`, and *both* halves fail.
+    //
+    // Regenerate deliberately — never to make a failing test pass:
+    //
+    // ```sh
+    // KESTREL_UPDATE_GOLDEN=1 cargo test -p kestrel-tauri --lib op_event_bytes_match_the_golden_fixture
+    // ```
+    // ------------------------------------------------------------------
+
+    /// Path to the committed golden, shared with the frontend test.
+    fn golden_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/test/fixtures/op-events.json")
+    }
+
+    /// One committed case: a stable name plus the **exact** bytes the
+    /// serializer emits. The bytes are the point — comparing parsed
+    /// `serde_json::Value`s would tolerate key reordering that the frontend
+    /// never sees and could hide a rename behind a cosmetic diff.
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    struct GoldenCase {
+        /// Why the case exists; shows up in the failure message.
+        name: String,
+        /// The literal JSON the webview would receive and `JSON.parse`.
+        json: String,
+    }
+
+    /// Every `OpEventDto` variant and every error shape the op layer can
+    /// produce, as the real `Serialize` output.
+    fn golden_cases() -> Vec<GoldenCase> {
+        let mut cases: Vec<GoldenCase> = Vec::new();
+        let mut push = |name: &str, dto: &OpEventDto| {
+            cases.push(GoldenCase {
+                name: name.to_string(),
+                json: serde_json::to_string(dto).expect("OpEventDto must serialize"),
+            });
+        };
+
+        push(
+            "progress_copying_with_known_totals",
+            &OpEventDto::Progress {
+                id: 7,
+                phase: OpPhase::Copying,
+                done_bytes: 123,
+                total_bytes: 456,
+                done_items: 1,
+                total_items: 9,
+            },
+        );
+        push(
+            // The measuring phase has no total yet. A guessed percentage here
+            // would be a lie, so the frontend must render indeterminate.
+            "progress_measuring_with_unknown_totals",
+            &OpEventDto::Progress {
+                id: 7,
+                phase: OpPhase::Measuring,
+                done_bytes: 0,
+                total_bytes: 0,
+                done_items: 3,
+                total_items: 0,
+            },
+        );
+        push(
+            // A delete counts entries; inventing a byte total is forbidden.
+            "progress_deleting_has_no_byte_total",
+            &OpEventDto::Progress {
+                id: 7,
+                phase: OpPhase::Deleting,
+                done_bytes: 0,
+                total_bytes: 0,
+                done_items: 42,
+                total_items: 42,
+            },
+        );
+        push(
+            // > 2^32 bytes: the JS side must not lose precision on a 4 GB+ file.
+            "progress_beyond_u32_byte_counts",
+            &OpEventDto::Progress {
+                id: u64::from(u32::MAX) + 1,
+                phase: OpPhase::Copying,
+                done_bytes: 5_368_709_120,
+                total_bytes: 8_589_934_592,
+                done_items: 4_294_967_296,
+                total_items: 4_294_967_296,
+            },
+        );
+        push(
+            "done_names_the_file",
+            &OpEventDto::Done {
+                id: 7,
+                summary: "copied report.pdf".to_string(),
+            },
+        );
+        push(
+            // A user cancel arrives as a terminal `error` with kind
+            // `cancelled`, nested exactly like `WatchEventDto::Error`. The
+            // frontend routes this to `cancelled`, not to `failed`.
+            "error_cancelled_for_a_user_cancel",
+            &OpEventDto::Error {
+                id: 7,
+                error: CmdError::from_kestrel(&KestrelError::Cancelled),
+            },
+        );
+        push(
+            // Phase 3a has no collision dialog: a collision is an error and the
+            // destination is left untouched.
+            "error_already_exists_for_a_collision",
+            &OpEventDto::Error {
+                id: 9,
+                error: CmdError::from_kestrel(&KestrelError::AlreadyExists {
+                    path: "/tmp/dst.txt".into(),
+                }),
+            },
+        );
+        push(
+            // `path: null` must stay null, not become the string "null".
+            "error_not_found_with_a_path",
+            &OpEventDto::Error {
+                id: 11,
+                error: CmdError::from_kestrel(&KestrelError::not_found("/nope")),
+            },
+        );
+        push(
+            // The `#[non_exhaustive]` fallback. It must still parse as an op
+            // error rather than dropping the event on the floor.
+            "error_unknown_from_the_non_exhaustive_fallback",
+            &OpEventDto::Error {
+                id: 13,
+                error: CmdError::custom("unknown", None, "a future engine error".to_string()),
+            },
+        );
+        cases
+    }
+
+    /// THE Rust half of the wire-seam test: these exact bytes are what the
+    /// frontend will be handed, so they are committed and asserted.
+    #[test]
+    fn op_event_bytes_match_the_golden_fixture() {
+        let path = golden_path();
+        let cases = golden_cases();
+        if std::env::var_os("KESTREL_UPDATE_GOLDEN").is_some() {
+            let json = serde_json::to_string_pretty(&cases).expect("golden serializes");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("fixture dir");
+            }
+            std::fs::write(&path, json + "\n").expect("write golden fixture");
+            eprintln!("wrote {} cases to {}", cases.len(), path.display());
+            return;
+        }
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "missing golden fixture {}: {e}\n\
+                 regenerate with KESTREL_UPDATE_GOLDEN=1 cargo test -p kestrel-tauri \
+                 --lib op_event_bytes_match_the_golden_fixture",
+                path.display()
+            )
+        });
+        let committed: Vec<GoldenCase> =
+            serde_json::from_str(&raw).expect("golden fixture must be valid JSON");
+        assert_eq!(
+            committed.len(),
+            cases.len(),
+            "the golden fixture covers {} cases but the serializer produces {} — \
+             add the new shape to golden_cases() and regenerate",
+            committed.len(),
+            cases.len()
+        );
+        for (want, got) in cases.iter().zip(committed.iter()) {
+            assert_eq!(want.name, got.name, "golden case names drifted");
+            assert_eq!(
+                want.json, got.json,
+                "the wire bytes for `{}` changed. The frontend normaliser \
+                 (ui/src/lib/ipc.ts) reads this exact text, so a mismatch here \
+                 is a production break, not a cosmetic diff. If the change is \
+                 intended, update MIGRATION.md §3 and regenerate with \
+                 KESTREL_UPDATE_GOLDEN=1.",
+                want.name
+            );
+        }
     }
 }

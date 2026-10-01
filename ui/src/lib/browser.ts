@@ -564,6 +564,15 @@ export class Browser {
   }
 
   private onKey(e: KeyboardEvent): void {
+    // Phase 3a hook: op shortcuts (copy/move/trash/delete) live in main.ts.
+    // Returning true consumes the key before list navigation sees it.
+    if (this.opKeyHandler) {
+      try {
+        if (this.opKeyHandler(e)) return;
+      } catch {
+        /* a broken hook must never break arrow/enter navigation */
+      }
+    }
     const n = this.rows.length;
     if (e.key === "ArrowDown") {
       e.preventDefault();
@@ -592,6 +601,45 @@ export class Browser {
     this.windower.setSelected(i);
     if (scroll) this.windower.scrollToIndex(i);
     this.paintRowSelection();
+  }
+
+  /* ---------------- Phase 3a: ops surface ---------------- */
+
+  /** Op shortcut hook (wired in main.ts). Return true to consume the key. */
+  opKeyHandler: ((e: KeyboardEvent) => boolean) | null = null;
+
+  /** The selected entry, or null when nothing (or an error row) is selected.
+   * Single-item exit gate: there is no selection set this phase. */
+  selectedEntry(): FileEntryDto | null {
+    const row = this.rows[this.selected];
+    if (!row || row.kind !== "entry") return null;
+    return row.entry;
+  }
+
+  selectedIndex(): number {
+    return this.selected;
+  }
+
+  /** Re-run the listing on the current path (op settled → contents changed).
+   * Keeps the watch subscription — same path as watch-triggered rescans. */
+  rescan(): void {
+    if (this.fixtureMode) return;
+    void this.startScan();
+  }
+
+  /**
+   * Op failure sink. Reuses the scan error path exactly: the error becomes
+   * a visible error row (never dropped silently) plus a status line — no
+   * second error channel. `AlreadyExists` collisions land here as errors.
+   */
+  showOpError(error: CmdError): void {
+    const row: Row = { kind: "error", error };
+    this.all.push(row);
+    this.keys.push("");
+    this.rows.push(row); // error rows always pass the filter
+    this.errorCount++;
+    this.setStatus("Operation failed: " + error.message);
+    this.queueRender();
   }
 
   /* ---------------- painting ---------------- */

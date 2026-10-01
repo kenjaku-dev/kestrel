@@ -41,16 +41,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use kestrel_fs::KestrelError;
 use kestrel_fs::error::classify_io;
 use kestrel_fs::model::{CancellationToken, FileEntry};
+use kestrel_fs::ops::{self, Collision, CopyOptions, MoveStrategy, ProgressEvent, ProgressSink};
 use kestrel_fs::scan::{self, ScanEvent, ScanHandle};
+use kestrel_fs::size::{self, SizeEvent, SizeOptions};
 use kestrel_fs::watcher::{ChangeSet, WatchEvent};
 use tauri::{AppHandle, Manager, Runtime, async_runtime, ipc::Channel};
 
 use crate::dto::{
-    CmdError, FileEntryDto, OpenResultDto, ScanEventDto, ScanOptionsDto, WatchEventDto,
+    CmdError, FileEntryDto, OpEventDto, OpPhase, OpRequestDto, OpenResultDto, ScanEventDto,
+    ScanOptionsDto, WatchEventDto,
 };
-use crate::state::{Backend, JobId, WatchRelay};
+use crate::state::{Backend, JobId, OpJob, WatchRelay};
 
 /// How long one pump iteration waits for the next engine event. Short enough
 /// that `scan_cancel` (which needs the same per-job lock) never waits long,
@@ -340,6 +344,314 @@ fn watch_touches(changes: &ChangeSet, dir: &Path) -> bool {
     }
     changes.paths.iter().any(|p| p.starts_with(dir))
         || changes.dirs.iter().any(|d| d.starts_with(dir))
+}
+
+// ---------------------------------------------------------------------------
+// op_start / op_cancel (Phase 3a)
+//
+// ```ts
+// op_start(req: OpRequestDto, progress: Channel<OpEventDto>): Promise<number>
+// op_cancel(id: number): Promise<void>
+// ```
+//
+// Delivery posture is the scan/watch pumps': the worker drains the engine and
+// forwards to the `Channel` **without ever blocking on the frontend**, and
+// every `Channel::send` result is discarded with a comment saying why. A busy
+// or gone frontend must not cancel a file operation midway — a dropped send
+// during a half-finished copy is exactly the case where the op keeps going.
+// ---------------------------------------------------------------------------
+
+/// How often the op worker forwards engine progress to the frontend. The
+/// engine already throttles its own sink; this second throttle bounds IPC when
+/// an op touches thousands of files (one engine emit per file) — without it a
+/// big tree would cost one `webview.eval` per file.
+const OP_FORWARD_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Starts a mutating operation (copy / move / trash / delete). Returns the
+/// backend-minted [`JobId`]; progress and exactly one terminal event (`done`
+/// or `error`) arrive on `progress` as [`OpEventDto`]. The caller must invoke
+/// `op_cancel` once it no longer cares — cancelling stops the worker at the
+/// next chunk boundary, leaving a partial destination and reporting
+/// `Cancelled` (a cancelled move never deletes the source).
+///
+/// There is no fail-fast validation: every outcome, including a missing source
+/// or a collision, arrives as an event, so the frontend has exactly one error
+/// path to handle. A collision under the Phase 3a policy
+/// ([`Collision::Fail`]) is an `error` event with kind `"already_exists"`.
+#[tauri::command]
+pub fn op_start<R: Runtime>(
+    app: AppHandle<R>,
+    req: OpRequestDto,
+    progress: Channel<OpEventDto>,
+) -> Result<JobId, CmdError> {
+    let backend = app.state::<Backend>();
+    let id = backend.mint();
+    let cancel = CancellationToken::new();
+    backend.register_op(
+        id,
+        Arc::new(OpJob {
+            cancel: cancel.clone(),
+            description: describe_op(&req),
+        }),
+    );
+
+    // `spawn_blocking`, not `spawn`: the worker is synchronous blocking code
+    // and must not stall the async executor. `AppHandle` is `'static`, so
+    // state re-resolves inside for the completion cleanup — a no-op when
+    // `op_cancel` already ran.
+    async_runtime::spawn_blocking(move || {
+        run_op_blocking(id, &req, &cancel, &progress);
+        app.state::<Backend>().cancel_op(id);
+    });
+    Ok(id)
+}
+
+/// Cancels an op. Unknown ids are a silent no-op (the op already finished and
+/// cleaned itself up, or the id never existed) — the same posture as
+/// `scan_cancel` and `watch_unsubscribe`. Never blocks: see
+/// [`Backend::cancel_op`].
+#[tauri::command]
+pub fn op_cancel<R: Runtime>(app: AppHandle<R>, id: JobId) {
+    app.state::<Backend>().cancel_op(id);
+}
+
+/// Runs one op to exactly one terminal event (`done` or `error`) on `events`.
+///
+/// This is the whole body of [`op_start`]'s worker, factored out so tests can
+/// drive it with a [`Channel`] recorder and no Tauri runtime — exactly like
+/// `pump_scan_loop`. Public so out-of-tree probes can exercise the same path
+/// the command spawns.
+pub fn run_op_blocking(
+    id: JobId,
+    req: &OpRequestDto,
+    cancel: &CancellationToken,
+    events: &Channel<OpEventDto>,
+) {
+    match req {
+        OpRequestDto::Copy { src, dst } => run_copylike(id, src, dst, cancel, events, false),
+        OpRequestDto::Move { src, dst } => run_copylike(id, src, dst, cancel, events, true),
+        OpRequestDto::Trash { src } => match ops::trash(src) {
+            Ok(()) => send_done(id, events, format!("trashed {}", short_name(src))),
+            Err(e) => send_error(id, events, &e),
+        },
+        OpRequestDto::Delete { src, recursive } => {
+            if *recursive {
+                let path = PathBuf::from(src);
+                let forward = Forwarder::new(events.clone(), id, OpPhase::Deleting, 0, 0);
+                let sink: ProgressSink = Arc::new(move |ev| forward.push(&ev));
+                match ops::delete_recursive_with_progress(&path, Some(cancel), Some(&sink)) {
+                    Ok(()) => send_done(id, events, format!("deleted {}", short_name(src))),
+                    Err(e) => send_error(id, events, &e),
+                }
+            } else {
+                match ops::delete(src) {
+                    Ok(()) => send_done(id, events, format!("deleted {}", short_name(src))),
+                    Err(e) => send_error(id, events, &e),
+                }
+            }
+        }
+    }
+}
+
+/// Shared body for copy and move: measure, then run, then one terminal event.
+fn run_copylike(
+    id: JobId,
+    src: &str,
+    dst: &str,
+    cancel: &CancellationToken,
+    events: &Channel<OpEventDto>,
+    is_move: bool,
+) {
+    let src_path = PathBuf::from(src);
+    let dst_path = PathBuf::from(dst);
+    let Some((total_bytes, total_items)) = measure_source(&src_path, id, cancel, events) else {
+        send_error(id, events, &KestrelError::Cancelled);
+        return;
+    };
+    let forward = Forwarder::new(
+        events.clone(),
+        id,
+        OpPhase::Copying,
+        total_bytes,
+        total_items,
+    );
+    let sink: ProgressSink = Arc::new(move |ev| forward.push(&ev));
+    // Phase 3a has no collision dialog yet, so the policy is `Fail`: a
+    // collision surfaces as `AlreadyExists` and the op fails without writing.
+    // Phase 3b adds the question round-trip; nothing here changes shape for it.
+    let options = CopyOptions {
+        collision: Collision::Fail,
+        answered: ops::AnsweredCollisions::new(),
+        preserve_permissions: false,
+        cancel: Some(cancel.clone()),
+        progress: Some(sink),
+    };
+    let verb = if is_move { "moved" } else { "copied" };
+    let result = if is_move {
+        ops::move_(&src_path, &dst_path, options, MoveStrategy::Auto)
+    } else {
+        ops::copy(&src_path, &dst_path, options)
+    };
+    match result {
+        Ok(()) => send_done(id, events, format!("{verb} {}", short_name(src))),
+        Err(e) => send_error(id, events, &e),
+    }
+}
+
+/// Best-effort pre-measurement of `src` for the `totalBytes`/`totalItems` of
+/// copy/move progress, mirroring the egui `job.rs` approach: measure with
+/// [`size::compute_blocking`](size::compute_blocking), then copy.
+///
+/// Returns `None` when cancelled (the caller reports `Cancelled`). Any other
+/// failure returns `(0, 0)` and lets the op itself surface the real error —
+/// the measure must never fail an op the copy would have explained better.
+/// Unknown shapes (symlinks, special files) are `(0, 0)`: indeterminate, and
+/// the frontend shows them as such rather than as a guessed 90%.
+fn measure_source(
+    src: &Path,
+    id: JobId,
+    cancel: &CancellationToken,
+    events: &Channel<OpEventDto>,
+) -> Option<(u64, usize)> {
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let send = |done_bytes: u64, total_bytes: u64, done_items: usize, total_items: usize| {
+        // Discarded on purpose, like every other pump: a failed send means the
+        // webview is gone or busy, never a reason to stop measuring.
+        let _ = events.send(OpEventDto::Progress {
+            id,
+            phase: OpPhase::Measuring,
+            done_bytes,
+            total_bytes,
+            done_items,
+            total_items,
+        });
+    };
+    let metadata = match std::fs::symlink_metadata(src) {
+        Ok(md) => md,
+        Err(_) => return Some((0, 0)),
+    };
+    if metadata.is_file() {
+        let total = metadata.len();
+        send(total, total, 1, 1);
+        return Some((total, 1));
+    }
+    if !metadata.is_dir() {
+        return Some((0, 0));
+    }
+    // A directory: walk it with the engine's own measurer, forwarding its
+    // (already throttled) progress as measuring-phase events.
+    let mut sink = |event: SizeEvent| -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        if let SizeEvent::Progress { bytes, files, .. } = event {
+            send(bytes, 0, files, 0);
+        }
+        // `true` unconditionally: a busy frontend must not stop the walk (the
+        // `send` above already discarded its result for exactly this reason).
+        true
+    };
+    match size::compute_blocking(src, SizeOptions::default(), cancel, &mut sink) {
+        Ok(Some(size)) => {
+            send(size.logical, size.logical, size.files, size.files);
+            Some((size.logical, size.files))
+        }
+        Ok(None) => None,
+        Err(_) => Some((0, 0)),
+    }
+}
+
+/// Forwards engine [`ProgressEvent`]s to the frontend channel.
+///
+/// Throttled to [`OP_FORWARD_INTERVAL`], except the first event for the phase,
+/// which always goes through: a phase transition (`measuring` → `copying`) is
+/// itself information, and without the exception a fast op's only `copying`
+/// event could be swallowed by the throttle. `Clone` so the engine sink can
+/// own one. (No `Debug`: `Channel` has none, and there is nothing to log
+/// about a forwarder anyway.)
+#[derive(Clone)]
+struct Forwarder {
+    events: Channel<OpEventDto>,
+    id: JobId,
+    phase: OpPhase,
+    total_bytes: u64,
+    total_items: usize,
+    last: Arc<Mutex<(Instant, Option<OpPhase>)>>,
+}
+
+impl Forwarder {
+    fn new(
+        events: Channel<OpEventDto>,
+        id: JobId,
+        phase: OpPhase,
+        total_bytes: u64,
+        total_items: usize,
+    ) -> Self {
+        Self {
+            events,
+            id,
+            phase,
+            total_bytes,
+            total_items,
+            last: Arc::new(Mutex::new((Instant::now(), None))),
+        }
+    }
+
+    fn push(&self, ev: &ProgressEvent) {
+        let mut guard = lock(&self.last);
+        if guard.1 != Some(self.phase) || guard.0.elapsed() >= OP_FORWARD_INTERVAL {
+            *guard = (Instant::now(), Some(self.phase));
+            // Discarded on purpose: a failed send means the webview is gone or
+            // busy, never a reason to stop the op — the engine keeps producing
+            // into our sink regardless.
+            let _ = self.events.send(OpEventDto::Progress {
+                id: self.id,
+                phase: self.phase,
+                done_bytes: ev.bytes_copied,
+                total_bytes: self.total_bytes,
+                done_items: ev.files_done,
+                total_items: self.total_items,
+            });
+        }
+    }
+}
+
+/// Sends the success terminal. The result is discarded: see [`pump_scan_loop`].
+fn send_done(id: JobId, events: &Channel<OpEventDto>, summary: String) {
+    let _ = events.send(OpEventDto::Done { id, summary });
+}
+
+/// Sends the failure/cancel terminal. The result is discarded: see
+/// [`pump_scan_loop`].
+fn send_error(id: JobId, events: &Channel<OpEventDto>, err: &KestrelError) {
+    let _ = events.send(OpEventDto::Error {
+        id,
+        error: CmdError::from_kestrel(err),
+    });
+}
+
+/// A human sentence for the op registry ("Copy a → b").
+fn describe_op(req: &OpRequestDto) -> String {
+    match req {
+        OpRequestDto::Copy { src, dst } => {
+            format!("Copy {} → {}", short_name(src), short_name(dst))
+        }
+        OpRequestDto::Move { src, dst } => {
+            format!("Move {} → {}", short_name(src), short_name(dst))
+        }
+        OpRequestDto::Trash { src } => format!("Trash {}", short_name(src)),
+        OpRequestDto::Delete { src, .. } => format!("Delete {}", short_name(src)),
+    }
+}
+
+/// The file name, or the full path when there is none.
+fn short_name(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -855,5 +1167,828 @@ mod tests {
             "unsubscribe must not block the caller"
         );
         assert!(!lock(&backend.watches).contains_key(&id));
+    }
+
+    // ------------------------------------------------------------------
+    // op tests (Phase 3a)
+    // ------------------------------------------------------------------
+
+    use crate::dto::{OpEventDto, OpRequestDto};
+    use crate::state::OpJob;
+
+    /// Scratch root for the tests that need gigabytes.
+    ///
+    /// `/tmp` is a 4 GB tmpfs on this host, so a 1 GB source *plus* its 1 GB
+    /// destination would live in RAM and evict the page cache out from under
+    /// every other test running in parallel. Prefer a real-disk root; let CI
+    /// override with `KESTREL_TEST_TMPDIR`.
+    ///
+    /// Every path built from this is still a [`tempfile::TempDir`]: nothing
+    /// outside one is ever written, and each test cleans up after itself.
+    fn big_test_root() -> PathBuf {
+        if let Some(dir) = std::env::var_os("KESTREL_TEST_TMPDIR") {
+            return PathBuf::from(dir);
+        }
+        ["/var/tmp", "/home"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    /// A gigabyte-scale tempdir on real disk (see [`big_test_root`]).
+    fn big_tempdir() -> tempfile::TempDir {
+        let root = big_test_root();
+        std::fs::create_dir_all(&root).expect("scratch root must be creatable");
+        tempfile::Builder::new()
+            .prefix("kestrel-op-")
+            .tempdir_in(&root)
+            .unwrap_or_else(|e| panic!("cannot make a tempdir under {}: {e}", root.display()))
+    }
+
+    /// Writes `len` bytes to `path` in 1 MiB chunks (a single `vec!` of a
+    /// gigabyte would spike RSS by a gigabyte for no reason).
+    fn write_mb_file(path: &Path, megabytes: usize) -> u64 {
+        use std::io::Write;
+        let chunk = vec![0x5Au8; 1024 * 1024];
+        let mut f = fs::File::create(path).expect("create");
+        for _ in 0..megabytes {
+            f.write_all(&chunk).expect("write");
+        }
+        drop(f);
+        megabytes as u64 * 1024 * 1024
+    }
+
+    /// Runs `run_op_blocking` on a worker thread with a cancel token the test
+    /// holds, so the cancel can be delivered *mid-flight* rather than before
+    /// the op starts. `on_first_destination_byte` runs on the main thread and
+    /// is expected to cancel as soon as `probe` shows the destination
+    /// starting to land — that is what makes the partial real.
+    fn run_op_cancel_midflight(
+        req: OpRequestDto,
+        probe: PathBuf,
+        min_bytes: u64,
+    ) -> Vec<serde_json::Value> {
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = op_recording_channel(&seen, || Ok(()));
+        let worker = std::thread::spawn(move || {
+            run_op_blocking(7, &req, &worker_cancel, &events);
+            // `events` drops here, releasing the recorder's `seen` clone.
+        });
+        let started = Instant::now();
+        loop {
+            if fs::metadata(&probe).is_ok_and(|m| m.len() >= min_bytes) {
+                cancel.cancel();
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the destination never reached {min_bytes} bytes: a test that cannot \
+                 land a cancel mid-flight is not testing what it claims"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.join().expect("op worker joins");
+        Arc::try_unwrap(seen)
+            .expect("seen")
+            .into_inner()
+            .expect("lock")
+    }
+
+    /// The one terminal event of a stream, with its kind.
+    fn terminal(seen: &[serde_json::Value]) -> (&str, serde_json::Value) {
+        let terminals: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| {
+                v["type"] == serde_json::json!("done") || v["type"] == serde_json::json!("error")
+            })
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "exactly one terminal event per op (MIGRATION.md §3): {seen:?}"
+        );
+        let last = seen.last().expect("a non-empty stream");
+        assert_eq!(
+            last, terminals[0],
+            "the terminal event must be last: a progress event after it means the \
+             relay emitted past the end of the op"
+        );
+        (
+            terminals[0]["type"].as_str().expect("type"),
+            terminals[0].clone(),
+        )
+    }
+
+    /// Every `progress` event, in delivery order.
+    fn progress_events(seen: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        seen.iter()
+            .filter(|v| v["type"] == serde_json::json!("progress"))
+            .collect()
+    }
+
+    /// Builds a `Channel` that records every op message as JSON (exactly what
+    /// the frontend would receive) and answers each send with `respond`.
+    fn op_recording_channel(
+        seen: &Arc<Mutex<Vec<serde_json::Value>>>,
+        respond: impl Fn() -> tauri::Result<()> + Send + Sync + 'static,
+    ) -> Channel<OpEventDto> {
+        let seen_clone = Arc::clone(seen);
+        Channel::new(move |body| {
+            let json = match &body {
+                InvokeResponseBody::Json(s) => s.clone(),
+                InvokeResponseBody::Raw(_) => panic!("DTOs must encode as JSON"),
+            };
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            seen_clone.lock().expect("lock").push(value);
+            respond()
+        })
+    }
+
+    /// Runs the real [`run_op_blocking`] with a healthy consumer and returns
+    /// the raw JSON messages, i.e. exactly what the frontend would receive.
+    fn run_op_collect(req: OpRequestDto) -> Vec<serde_json::Value> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = op_recording_channel(&seen, || Ok(()));
+        run_op_blocking(7, &req, &CancellationToken::new(), &events);
+        drop(events);
+        Arc::try_unwrap(seen)
+            .expect("seen")
+            .into_inner()
+            .expect("lock")
+    }
+
+    fn copy_req(src: &Path, dst: &Path) -> OpRequestDto {
+        OpRequestDto::Copy {
+            src: src.to_string_lossy().into_owned(),
+            dst: dst.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Each op mints a distinct id; cancelling an unknown id (or twice) is a
+    /// silent no-op, matching `scan_cancel` / `watch_unsubscribe`.
+    #[test]
+    fn op_ids_are_unique_and_cancel_is_race_safe() {
+        let backend = watch_backend();
+        let new_job = || {
+            Arc::new(OpJob {
+                cancel: CancellationToken::new(),
+                description: "test op".to_string(),
+            })
+        };
+        let a = backend.mint();
+        let b = backend.mint();
+        assert_ne!(a, b, "minted op ids must be unique");
+        assert_ne!(a, 0);
+        backend.register_op(a, new_job());
+        backend.register_op(b, new_job());
+        backend.cancel_op(a);
+        assert!(!lock(&backend.ops).contains_key(&a));
+        // Racing cancels and unknown ids are silent no-ops, never panics.
+        backend.cancel_op(a);
+        backend.cancel_op(u64::MAX);
+        // The sibling op survives its neighbour's cancel.
+        assert!(lock(&backend.ops).contains_key(&b));
+        backend.cancel_op(b);
+        assert!(lock(&backend.ops).is_empty());
+    }
+
+    /// A copy streams `measuring` → `copying` progress with non-decreasing
+    /// byte counts, then exactly one `done` naming the file.
+    #[test]
+    fn copy_reports_progress_then_done() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("report.pdf");
+        fs::write(&src, vec![3u8; 512 * 1024]).expect("write");
+        let dst = tmp.path().join("report-copy.pdf");
+
+        let seen = run_op_collect(copy_req(&src, &dst));
+
+        assert_eq!(fs::read(&dst).expect("read").len(), 512 * 1024);
+        let phases: Vec<&str> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("progress"))
+            .filter_map(|v| v["phase"].as_str())
+            .collect();
+        assert!(
+            phases.contains(&"measuring"),
+            "must report a measuring phase, got {seen:?}"
+        );
+        assert!(
+            phases.contains(&"copying"),
+            "must report a copying phase, got {seen:?}"
+        );
+        let mut prev = 0u64;
+        for v in seen
+            .iter()
+            .filter(|v| v["phase"] == serde_json::json!("copying"))
+        {
+            let done = v["doneBytes"].as_u64().expect("doneBytes is a number");
+            assert!(done >= prev, "doneBytes must never go backwards");
+            prev = done;
+            assert!(v["totalBytes"].as_u64().expect("total") > 0);
+            assert_eq!(v["id"], serde_json::json!(7));
+        }
+        let terminals: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| {
+                v["type"] == serde_json::json!("done") || v["type"] == serde_json::json!("error")
+            })
+            .collect();
+        assert_eq!(terminals.len(), 1, "exactly one terminal event: {seen:?}");
+        assert_eq!(terminals[0]["type"], serde_json::json!("done"));
+        assert!(
+            terminals[0]["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("report.pdf")),
+            "the summary must name the file, got {seen:?}"
+        );
+    }
+
+    /// THE data-safety test: a 3a collision is an `error` event with kind
+    /// `already_exists`, and the destination is byte-for-byte unchanged.
+    #[test]
+    fn collision_surfaces_already_exists_and_keeps_destination() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("new.txt");
+        let dst = tmp.path().join("old.txt");
+        fs::write(&src, b"new bytes").expect("write");
+        fs::write(&dst, b"old bytes stay").expect("write");
+
+        let seen = run_op_collect(copy_req(&src, &dst));
+
+        let terminals: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("error"))
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "a collision ends in one error: {seen:?}"
+        );
+        assert_eq!(
+            terminals[0]["error"]["kind"],
+            serde_json::json!("already_exists")
+        );
+        assert_eq!(
+            fs::read(&dst).expect("read"),
+            b"old bytes stay",
+            "the destination must be byte-for-byte unchanged"
+        );
+        assert!(
+            !seen.iter().any(|v| v["type"] == serde_json::json!("done")),
+            "a failed op must not claim done"
+        );
+    }
+
+    /// The engine's self-destination guard must reach the wire as
+    /// `invalid_input`, not as a silent success or a panic.
+    #[test]
+    fn dst_inside_src_reaches_wire_as_invalid_input() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("tree");
+        fs::create_dir_all(src.join("inner")).expect("mkdir");
+        fs::write(src.join("a.txt"), b"precious").expect("write");
+        let dst = src.join("inner/tree");
+
+        let seen = run_op_collect(copy_req(&src, &dst));
+
+        let errors: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("error"))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "the guard must surface one error: {seen:?}"
+        );
+        assert_eq!(
+            errors[0]["error"]["kind"],
+            serde_json::json!("invalid_input")
+        );
+        assert_eq!(
+            fs::read(src.join("a.txt")).expect("read"),
+            b"precious",
+            "the source tree must survive"
+        );
+    }
+
+    /// Mirrors `absent_consumer_does_not_stop_the_watcher`: every
+    /// `Channel::send` fails (webview gone or busy) and the op must still run
+    /// to completion on disk.
+    #[test]
+    fn absent_consumer_does_not_cancel_an_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).expect("mkdir");
+        fs::write(src.join("a.txt"), b"alpha").expect("write");
+        fs::write(src.join("sub/b.txt"), vec![9u8; 1024 * 1024]).expect("write");
+        let dst = tmp.path().join("dst");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = op_recording_channel(&seen, || Err(tauri::Error::Io(io_error())));
+        run_op_blocking(7, &copy_req(&src, &dst), &CancellationToken::new(), &events);
+
+        assert_eq!(fs::read(dst.join("a.txt")).expect("read"), b"alpha");
+        assert_eq!(
+            fs::read(dst.join("sub/b.txt")).expect("read").len(),
+            1024 * 1024,
+            "the whole tree must land even with nobody listening"
+        );
+        assert!(src.join("a.txt").exists(), "the source must be untouched");
+    }
+
+    /// A cancelled move reports `cancelled` as an `error` event and never
+    /// deletes the source. (The mid-copy proof — source intact beside a
+    /// partial destination — is the engine test
+    /// `cancelled_move_keeps_the_source_and_leaves_a_partial_destination`;
+    /// this is the same path driven through the command layer.)
+    #[test]
+    fn cancelled_move_reports_cancelled_and_keeps_the_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("big.bin");
+        fs::write(&src, vec![5u8; 1024 * 1024]).expect("write");
+        let dst = tmp.path().join("big.bin.moved");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = op_recording_channel(&seen, || Ok(()));
+        run_op_blocking(
+            7,
+            &OpRequestDto::Move {
+                src: src.to_string_lossy().into_owned(),
+                dst: dst.to_string_lossy().into_owned(),
+            },
+            &cancel,
+            &events,
+        );
+        drop(events);
+        let seen = Arc::try_unwrap(seen)
+            .expect("seen")
+            .into_inner()
+            .expect("lock");
+
+        let errors: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("error"))
+            .collect();
+        assert_eq!(errors.len(), 1, "a cancel ends in one error: {seen:?}");
+        assert_eq!(errors[0]["error"]["kind"], serde_json::json!("cancelled"));
+        assert!(
+            src.exists(),
+            "a cancelled move must never delete the source"
+        );
+        assert_eq!(fs::read(&src).expect("read").len(), 1024 * 1024);
+        assert!(
+            !dst.exists(),
+            "a pre-cancelled move must not write anything"
+        );
+    }
+
+    /// A recursive delete streams `deleting` progress (with `totalBytes` 0 —
+    /// a delete has no byte total) then one `done`.
+    #[test]
+    fn recursive_delete_reports_deleting_progress_then_done() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("gone");
+        fs::create_dir_all(dir.join("sub")).expect("mkdir");
+        fs::write(dir.join("a.txt"), b"a").expect("write");
+        fs::write(dir.join("sub/b.txt"), b"b").expect("write");
+
+        let seen = run_op_collect(OpRequestDto::Delete {
+            src: dir.to_string_lossy().into_owned(),
+            recursive: true,
+        });
+
+        assert!(!dir.exists(), "the tree must be gone");
+        let progress: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("progress"))
+            .collect();
+        assert!(
+            progress
+                .iter()
+                .any(|v| v["phase"] == serde_json::json!("deleting")),
+            "must report a deleting phase, got {seen:?}"
+        );
+        for v in &progress {
+            assert_eq!(
+                v["totalBytes"],
+                serde_json::json!(0),
+                "a delete must not invent a byte total"
+            );
+        }
+        let terminals: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("done"))
+            .collect();
+        assert_eq!(terminals.len(), 1, "exactly one done: {seen:?}");
+    }
+
+    /// Trashing a path that does not exist reports `not_found` — no job, no
+    /// progress, one honest error.
+    #[test]
+    fn trash_of_a_missing_path_reports_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seen = run_op_collect(OpRequestDto::Trash {
+            src: tmp.path().join("nope").to_string_lossy().into_owned(),
+        });
+        let errors: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("error"))
+            .collect();
+        assert_eq!(errors.len(), 1, "one error: {seen:?}");
+        assert_eq!(errors[0]["error"]["kind"], serde_json::json!("not_found"));
+    }
+
+    /// EXIT-GATE CLAUSE 1 — "a 1 GB copy shows monotonic progress" — proved
+    /// through the **command relay**, not just the engine.
+    ///
+    /// The engine hook is covered at `kestrel-fs/src/ops.rs`, and
+    /// `copy_reports_progress_then_done` covers a 512 KiB copy. Neither
+    /// exercises the seam this clause is really about: whether the relay
+    /// forwards a gigabyte of progress faithfully on the way to the frontend.
+    /// Two throttles sit in that path (the engine's 100 ms and
+    /// [`OP_FORWARD_INTERVAL`]'s 100 ms), so the emitted sequence is a
+    /// subsample of the engine's — and a throttle is exactly the kind of code
+    /// that can reorder, duplicate, or truncate.
+    ///
+    /// So this asserts the four properties the frontend actually depends on,
+    /// over the real [`run_op_blocking`] with a real [`Channel`]:
+    ///
+    /// 1. **Monotonic** — `doneBytes` never decreases within a phase.
+    /// 2. **Not reordered** — the phase sequence only ever advances
+    ///    `measuring → copying`, never back.
+    /// 3. **Not duplicated** — consecutive progress events are distinct, so
+    ///    the relay is not re-sending a stale event.
+    /// 4. **Not truncated** — the last `copying` event reaches the real byte
+    ///    total, so the frontend's bar can actually complete.
+    #[test]
+    fn one_gigabyte_copy_streams_monotonic_progress_through_the_relay() {
+        const MEGABYTES: usize = 1024;
+        let tmp = big_tempdir();
+        let src = tmp.path().join("gigabyte.bin");
+        let src_len = write_mb_file(&src, MEGABYTES);
+        assert_eq!(
+            src_len,
+            1024 * 1024 * 1024,
+            "the clause says 1 GB, not less"
+        );
+        let dst = tmp.path().join("gigabyte-copy.bin");
+
+        let seen = run_op_collect(copy_req(&src, &dst));
+
+        assert_eq!(
+            fs::metadata(&dst).expect("destination").len(),
+            src_len,
+            "the whole gigabyte must land"
+        );
+
+        let progress = progress_events(&seen);
+        assert!(
+            progress.len() >= 3,
+            "a gigabyte must produce a real stream, not one or two events \
+             (throttling has gone wrong): {} events",
+            progress.len()
+        );
+
+        // (1) Monotonic within a phase, and (3) no duplicate event.
+        // A phase change legitimately restarts the byte count (measuring
+        // hands a known total to copying), so the baseline resets there —
+        // exactly the rule `ui/src/lib/ops.ts` applies in `onOpEvent`.
+        let mut prev: Option<(&str, u64, u64)> = None;
+        for v in &progress {
+            let phase = v["phase"].as_str().expect("phase is a string");
+            let done = v["doneBytes"].as_u64().expect("doneBytes is a number");
+            let items = v["doneItems"].as_u64().expect("doneItems is a number");
+            assert_eq!(
+                v["id"],
+                serde_json::json!(7),
+                "every event must carry the one minted id: {v}"
+            );
+            if let Some((_, pbytes, pitems)) = prev.filter(|(p, ..)| *p == phase) {
+                // Same phase: the byte and item counters must both advance.
+                assert!(
+                    done >= pbytes,
+                    "doneBytes went backwards within phase {phase}: \
+                     {pbytes} then {done} — {seen:?}"
+                );
+                assert!(
+                    done != pbytes || items != pitems,
+                    "a byte-for-byte duplicate progress event reached the wire: {v}"
+                );
+                assert!(
+                    items >= pitems,
+                    "doneItems went backwards within phase {phase}: \
+                     {pitems} then {items} — {seen:?}"
+                );
+            }
+            prev = Some((phase, done, items));
+        }
+
+        // (2) Phases only ever advance. A `measuring` event arriving after a
+        // `copying` one is a relay that reordered its own output.
+        let order: [&str; 3] = ["measuring", "copying", "deleting"];
+        let mut highest = 0usize;
+        for v in &progress {
+            let phase = v["phase"].as_str().expect("phase");
+            let rank = order
+                .iter()
+                .position(|p| *p == phase)
+                .unwrap_or_else(|| panic!("unknown phase {phase} on the wire"));
+            assert!(
+                rank >= highest,
+                "the relay reordered phases: {phase} arrived after rank {highest}"
+            );
+            highest = rank;
+        }
+
+        // (4) Not truncated: the final `copying` event must reach the *exact*
+        // byte total, not merely be past halfway. "Past halfway" is what a
+        // truncated stream still satisfies — a relay that dropped the last few
+        // events would leave the frontend bar stuck at 96% forever, which is
+        // precisely the "monotonic but wrong" failure this clause exists to
+        // catch. The engine's trailing `finish()` emit guarantees the final
+        // event carries the true total, so the relay must forward it.
+        let last_copying = progress
+            .iter()
+            .rev()
+            .find(|v| v["phase"] == serde_json::json!("copying"))
+            .expect("a copying phase");
+        assert_eq!(
+            last_copying["totalBytes"],
+            serde_json::json!(src_len),
+            "totalBytes must be the measured byte total: {last_copying}"
+        );
+        assert_eq!(
+            last_copying["doneBytes"],
+            serde_json::json!(src_len),
+            "the final copying event must reach the full byte total, so the \
+             frontend's bar can actually complete. A truncated relay stops \
+             early and the bar stalls short forever: {last_copying}"
+        );
+
+        let (kind, done) = terminal(&seen);
+        assert_eq!(kind, "done");
+        assert!(
+            done["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("gigabyte.bin")),
+            "the summary must name the file: {done}"
+        );
+    }
+
+    /// EXIT-GATE CLAUSE 1, the "does not drop or duplicate under load" half.
+    ///
+    /// A throttle that emits *more* than the engine produced is as broken as
+    /// one that emits less: the frontend would animate a stall that never
+    /// happened. This drives a many-file tree — where the engine emits once
+    /// per *file*, unconditionally, bypassing its own time throttle — and
+    /// requires the relay's event count to be bounded by elapsed time rather
+    /// than by file count. A tree of 4 000 files copied in well under a second
+    /// must not cost 4 000 IPC messages.
+    #[test]
+    fn the_relay_throttles_a_many_file_tree_instead_of_forwarding_every_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("many");
+        fs::create_dir(&src).expect("mkdir");
+        for i in 0..4_000 {
+            fs::write(src.join(format!("f{i:05}")), b"x").expect("write");
+        }
+        let dst = tmp.path().join("many-copy");
+
+        let started = Instant::now();
+        let seen = run_op_collect(copy_req(&src, &dst));
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            fs::read_dir(&dst).expect("dst readable").count(),
+            4_000,
+            "every file must land"
+        );
+        let progress = progress_events(&seen);
+        assert!(
+            !progress.is_empty(),
+            "a 4 000-file copy must report something: {seen:?}"
+        );
+        // Count only the `copying` events: the `measuring` walk is throttled
+        // by the engine's own `SizeOptions::progress_interval` and is a
+        // different code path entirely (see `measure_source`).
+        let copying = progress
+            .iter()
+            .filter(|v| v["phase"] == serde_json::json!("copying"))
+            .count();
+        assert!(
+            copying > 0,
+            "a 4 000-file copy must report copying progress: {seen:?}"
+        );
+        // The engine emits once per *completed file*, unconditionally —
+        // bypassing its own time throttle — precisely so a many-small-file
+        // copy is visible. The relay's `OP_FORWARD_INTERVAL` is the only
+        // thing standing between 4 000 emits and 4 000 `webview.eval` calls.
+        //
+        // Ceiling: one event per interval that actually elapsed, plus the
+        // always-through first event of the phase. Compared against the file
+        // count (4 000), which is what a broken throttle converges to.
+        let intervals = (elapsed.as_millis() / OP_FORWARD_INTERVAL.as_millis().max(1)) as usize;
+        let ceiling = intervals + 4;
+        assert!(
+            copying <= ceiling,
+            "the relay forwarded {copying} copying events for a copy that took \
+             {elapsed:?}; the forward interval alone allows {ceiling}. \
+             4 000 files emitted 4 000 engine events and the throttle let {} \
+             through — one IPC message per file would stall a real webview.",
+            copying - ceiling
+        );
+        assert!(
+            copying < 4_000,
+            "every single file reached the wire: the forward throttle is dead"
+        );
+    }
+
+    /// EXIT-GATE CLAUSE 2 — "cancel leaves a partial and reports `Cancelled`"
+    /// — proved through the **command layer**.
+    ///
+    /// The engine guarantees the partial
+    /// (`kestrel-fs/src/ops.rs::cancelling_mid_file_stops_the_copy_and_leaves_a_partial_destination`),
+    /// and `cancelled_move_reports_cancelled_and_keeps_the_source` covers the
+    /// *pre*-cancelled move. What neither covers is the case the clause is
+    /// actually about: a cancel that lands **mid-copy**, so the op has written
+    /// real bytes, and the command layer must still surface it as a terminal
+    /// `cancelled` event rather than a generic failure or silence.
+    ///
+    /// Both halves are asserted: the partial destination on disk, and the
+    /// terminal event's `kind`. A command layer that reported the cancel as
+    /// `io` or `unknown` would leave the user with no idea their file is
+    /// half-copied.
+    #[test]
+    fn cancelling_a_copy_mid_flight_leaves_a_partial_and_reports_cancelled() {
+        let tmp = big_tempdir();
+        let src = tmp.path().join("big.bin");
+        // Large enough that the cancel provably lands mid-copy rather than
+        // after it: a gigabyte takes ~1s to copy on this disk.
+        let src_len = write_mb_file(&src, 768);
+        let dst = tmp.path().join("big.bin.copy");
+
+        let seen = run_op_cancel_midflight(copy_req(&src, &dst), dst.clone(), 64 * 1024 * 1024);
+
+        let (kind, terminal) = terminal(&seen);
+        assert_eq!(
+            kind, "error",
+            "a cancelled copy is a terminal error event: {seen:?}"
+        );
+        assert_eq!(
+            terminal["error"]["kind"],
+            serde_json::json!("cancelled"),
+            "the frontend routes `cancelled` to a cancelled job and everything \
+             else to a failure; reporting the wrong kind makes a cancel look \
+             like a broken disk: {terminal}"
+        );
+        assert_eq!(
+            terminal["error"]["path"],
+            serde_json::Value::Null,
+            "KestrelError::Cancelled carries no path; the wire must say null, \
+             not a bogus one"
+        );
+
+        let partial = fs::metadata(&dst)
+            .expect("the partial destination must exist")
+            .len();
+        assert!(
+            partial > 0 && partial < src_len,
+            "expected a partial destination, got {partial} of {src_len} bytes — \
+             a cancel that landed before or after the copy is not this test"
+        );
+        assert_eq!(
+            fs::metadata(&src).expect("source").len(),
+            src_len,
+            "the source must be untouched by a cancelled copy"
+        );
+    }
+
+    /// EXIT-GATE CLAUSE 3 — "a cancelled move never deletes the source" —
+    /// proved through the **command layer** on the *copy-then-delete* path.
+    ///
+    /// The engine clause is covered at
+    /// `ops.rs::cancelled_move_keeps_the_source_and_leaves_a_partial_destination`,
+    /// but that test drives `MoveStrategy::CopyThenDelete` directly. The
+    /// command layer always uses [`MoveStrategy::Auto`], which on one
+    /// filesystem is an atomic `rename` — instant, uncancellable, and therefore
+    /// *not the code path that could ever delete the source*. The dangerous
+    /// path is the `EXDEV` fallback: copy into place, then
+    /// `delete_recursive(src)`. If a cancel were mishandled there, the source
+    /// would be deleted with no copy behind it.
+    ///
+    /// So this forces the fallback with two genuinely different filesystems
+    /// (`/dev/shm` and `/tmp` are separate mounts here) rather than a test
+    /// hook, and cancels mid-copy.
+    #[test]
+    fn cancelling_a_cross_device_move_never_deletes_the_source() {
+        // The source goes on a filesystem other than TMPDIR's, so `fs::rename`
+        // fails with EXDEV and `move_` takes its copy-then-delete fallback.
+        let src_dir = foreign_fs_tempdir("src");
+        let dst_dir = tempfile::tempdir().expect("destination tempdir on TMPDIR");
+        assert_ne!(
+            device_id(src_dir.path()),
+            device_id(dst_dir.path()),
+            "source and destination must be on different mounts, or this is the \
+             atomic-rename path and tests nothing about copy-then-delete \
+             (src dev {} vs dst dev {})",
+            device_id(src_dir.path()),
+            device_id(dst_dir.path())
+        );
+        let src = src_dir.path().join("big.bin");
+        let src_len = write_mb_file(&src, 512);
+        let dst = dst_dir.path().join("big.bin.moved");
+
+        let seen = run_op_cancel_midflight(
+            OpRequestDto::Move {
+                src: src.to_string_lossy().into_owned(),
+                dst: dst.to_string_lossy().into_owned(),
+            },
+            dst.clone(),
+            64 * 1024 * 1024,
+        );
+
+        let (kind, terminal) = terminal(&seen);
+        assert_eq!(
+            kind, "error",
+            "a cancelled move is a terminal error: {seen:?}"
+        );
+        assert_eq!(
+            terminal["error"]["kind"],
+            serde_json::json!("cancelled"),
+            "the cancel must be reported as `cancelled` over IPC: {terminal}"
+        );
+
+        // The whole point of the clause. `move_`'s copy-then-delete removes the
+        // source once the destination exists; a cancel between the two would
+        // delete the user's only copy.
+        assert!(
+            src.exists(),
+            "a cancelled move must never delete the source — the copy half \
+             did not finish, so deleting the source would lose data"
+        );
+        assert_eq!(
+            fs::metadata(&src).expect("source stat").len(),
+            src_len,
+            "the source must be byte-for-byte intact"
+        );
+        if let Ok(partial) = fs::metadata(&dst) {
+            assert!(
+                partial.len() < src_len,
+                "the destination must be partial, not a completed copy"
+            );
+        }
+    }
+
+    /// A tempdir on a filesystem *other* than the default one, so the move
+    /// under test takes the `EXDEV` copy-then-delete fallback.
+    ///
+    /// Scans for a mount whose device differs from `/tmp`'s and is big enough
+    /// for a few hundred megabytes. Panics rather than skipping: a silent
+    /// skip would turn "the cancelled-move path was never exercised" into a
+    /// green suite, which is precisely the failure mode this suite exists to
+    /// prevent.
+    fn foreign_fs_tempdir(tag: &str) -> tempfile::TempDir {
+        let base = device_id(&std::env::temp_dir());
+        let mut tried = Vec::new();
+        for candidate in ["/dev/shm", "/run", "/var/tmp", "/home"] {
+            let path = Path::new(candidate);
+            if !path.is_dir() {
+                tried.push(format!("{candidate} (absent)"));
+                continue;
+            }
+            let dev = device_id(path);
+            if dev == base {
+                // Same filesystem: a rename would succeed and the copy half
+                // would never run. Not a candidate.
+                tried.push(format!("{candidate} (same device as TMPDIR)"));
+                continue;
+            }
+            match tempfile::Builder::new()
+                .prefix(&format!("kestrel-{tag}-"))
+                .tempdir_in(path)
+            {
+                Ok(dir) => return dir,
+                Err(e) => tried.push(format!("{candidate} ({e})")),
+            }
+        }
+        panic!(
+            "no second writable filesystem found for the cross-device move test. \
+             Searched: {}. A cancel must be exercised on move's EXDEV \
+             copy-then-delete path — the one that could ever delete the source. \
+             Set TMPDIR to a filesystem other than these, or mount a tmpfs.",
+            tried.join(", ")
+        )
+    }
+
+    /// `st_dev` of a path's filesystem, via `MetadataExt`.
+    fn device_id(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).expect("stat").dev()
     }
 }

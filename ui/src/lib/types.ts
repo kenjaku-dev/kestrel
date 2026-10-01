@@ -90,3 +90,36 @@ export type Row =
 export interface OpenPathResult {
   entered_dir: boolean;
 }
+
+/* Kestrel Phase 3a — file operations (frozen contract, internally tagged
+ * with "op" on the request and "type" on events, matching the scan/watch
+ * normalisers in ipc.ts).
+ *
+ * There is deliberately no `collision` event in 3a: a collision arrives as
+ * an `error` event with kind `already_exists` and the op fails, leaving the
+ * destination untouched. The collision dialog is a later phase.
+ */
+export type OpRequestDto =
+  | { op: "copy"; src: string; dst: string }
+  | { op: "move"; src: string; dst: string }
+  | { op: "trash"; src: string }
+  | { op: "delete"; src: string; recursive: boolean };
+
+export type OpPhaseDto = "measuring" | "copying" | "deleting";
+
+/** Normalised op stream events. See ipc.ts normalizeOpEvent for wire shapes.
+ * During `measuring` there is no total yet: the backend may send
+ * totalBytes 0 and the UI must render an indeterminate state, never a
+ * guessed percentage. */
+export type OpEventDto =
+  | {
+      type: "progress";
+      id: number;
+      phase: OpPhaseDto;
+      doneBytes: number;
+      totalBytes: number;
+      doneItems: number;
+      totalItems: number;
+    }
+  | { type: "done"; id: number; summary: string }
+  | { type: "error"; id: number; error: CmdError };

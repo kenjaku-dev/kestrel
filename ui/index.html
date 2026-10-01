@@ -27,12 +27,20 @@
         <label id="hidden-wrap" title="Show hidden files">
           <input id="hidden-toggle" type="checkbox" checked /> Hidden
         </label>
+        <span id="ops-buttons" role="group" aria-label="File operations">
+          <button id="op-copy" type="button" title="Copy selected (Ctrl+C)">Copy</button>
+          <button id="op-move" type="button" title="Move selected (Ctrl+M)">Move</button>
+          <button id="op-trash" type="button" title="Trash selected (Delete)">Trash</button>
+          <button id="op-delete" type="button" title="Delete permanently (Shift+Delete)">Delete</button>
+        </span>
       </div>
+      <div id="op-panel" style="display: none" aria-live="polite"></div>
       <div id="viewport" tabindex="0" role="listbox" aria-label="Directory listing">
         <div id="spacer"></div>
         <div id="rows"></div>
         <div id="state" style="display: none">Loading…</div>
       </div>
+      <div id="jobs" aria-live="polite" aria-label="File operation jobs"></div>
       <div id="statusbar">
         <span id="status">Starting…</span>
         <span id="backend-tag"></span>

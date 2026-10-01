@@ -23,6 +23,9 @@ import type {
   FileEntryDto,
   JobId,
   OpenPathResult,
+  OpEventDto,
+  OpPhaseDto,
+  OpRequestDto,
   ScanEventDto,
   ScanOptionsDto,
   SortSpecDto,
@@ -31,6 +34,7 @@ import type {
 
 export type ScanEventHandler = (event: ScanEventDto) => void;
 export type WatchEventHandler = (event: WatchEventDto) => void;
+export type OpEventHandler = (event: OpEventDto) => void;
 
 export interface KestrelIpc {
   readonly backend: "tauri" | "mock";
@@ -46,6 +50,12 @@ export interface KestrelIpc {
   watchSubscribe(path: string, onEvent: WatchEventHandler): Promise<JobId>;
   /** Frozen Phase 2 contract: drop a subscription. Never rejects. */
   watchUnsubscribe(id: JobId): Promise<void>;
+  /** Frozen Phase 3a contract: start a copy/move/trash/delete op, streaming
+   * progress over a Channel. Returns the backend-minted JobId (u64). */
+  opStart(req: OpRequestDto, onEvent: OpEventHandler): Promise<JobId>;
+  /** Frozen Phase 3a contract: cancel an op. Never rejects. The engine
+   * leaves a partial destination behind on cancel by design. */
+  opCancel(id: JobId): Promise<void>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -228,6 +238,57 @@ function stringsOf(raw: unknown[]): string[] {
   return out;
 }
 
+/**
+ * Op wire form (frozen Phase 3a contract, internally tagged with "type",
+ * matching the scan/watch normalisers):
+ *   {"type":"progress",id,phase,doneBytes,totalBytes,doneItems,totalItems} |
+ *   {"type":"done",id,summary} |
+ *   {"type":"error",id,error:{kind,path,message}} (nested, like watch) —
+ *   a flat error shape is also accepted via normalizeError.
+ * `type` and `phase` match case-insensitively; `phase` falls back to
+ * "copying" when the backend sends an unknown value rather than dropping
+ * the event. Numbers that arrive missing/not-a-number become 0 (an unknown
+ * total renders as indeterminate — never a guessed percentage).
+ */
+export function normalizeOpEvent(raw: unknown): OpEventDto | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj["type"] !== "string") return null;
+  const t = (obj["type"] as string).toLowerCase();
+  const id = numOf(obj["id"]);
+  if (t === "progress") {
+    return {
+      type: "progress",
+      id,
+      phase: canonicalPhase(obj["phase"]),
+      doneBytes: numOf(obj["doneBytes"]),
+      totalBytes: numOf(obj["totalBytes"]),
+      doneItems: numOf(obj["doneItems"]),
+      totalItems: numOf(obj["totalItems"]),
+    };
+  }
+  if (t === "done") {
+    const s = obj["summary"];
+    return { type: "done", id, summary: typeof s === "string" ? s : "" };
+  }
+  if (t === "error") {
+    const error = normalizeError(obj);
+    return error ? { type: "error", id, error } : null;
+  }
+  return null;
+}
+
+function numOf(v: unknown): number {
+  return typeof v === "number" && !isNaN(v) ? v : 0;
+}
+
+function canonicalPhase(raw: unknown): OpPhaseDto {
+  const p = typeof raw === "string" ? raw.toLowerCase() : "";
+  if (p === "measuring") return "measuring";
+  if (p === "deleting") return "deleting";
+  return "copying";
+}
+
 /* ------------------------------------------------------------------ */
 /* Tauri backend                                                       */
 /* ------------------------------------------------------------------ */
@@ -307,6 +368,26 @@ class TauriIpc implements KestrelIpc {
   async watchUnsubscribe(id: JobId): Promise<void> {
     const { invoke } = await this.load();
     await invoke("watch_unsubscribe", { id });
+  }
+
+  async opStart(req: OpRequestDto, onEvent: OpEventHandler): Promise<JobId> {
+    const { invoke, Channel } = await this.load();
+    // Same backpressure deal as scan/watch: the Channel callback stays cheap
+    // and sync — the ops controller buffers in a plain record, DOM work
+    // happens on later tasks, never here.
+    const progress = new Channel((raw: unknown) => {
+      const ev = normalizeOpEvent(raw);
+      if (ev) onEvent(ev);
+    });
+    // Argument keys must match the Rust parameter names exactly:
+    // op_start(req, progress) -> JobId.
+    const id = await invoke<JobId>("op_start", { req, progress });
+    return typeof id === "number" ? id : Number(id);
+  }
+
+  async opCancel(id: JobId): Promise<void> {
+    const { invoke } = await this.load();
+    await invoke("op_cancel", { id });
   }
 }
 
@@ -428,6 +509,118 @@ class MockIpc implements KestrelIpc {
     this.watches.delete(id);
   }
 
+  /* ---- Phase 3a mock ops: progress stream, cancel, AlreadyExists ---- */
+
+  private opJobs = new Map<
+    JobId,
+    { timers: number[]; cancelled: boolean }
+  >();
+
+  /**
+   * Mock `op_start`: streams a realistic event sequence without a backend —
+   * `measuring` progress events with `totalBytes: 0` (unknown total, must
+   * render indeterminate), then `copying`/`deleting` progress with a real
+   * total, then `done`. A `copy`/`move` whose destination basename collides
+   * with a mock listing name fails with `AlreadyExists`, mirroring the 3a
+   * contract (no collision event — an error, destination untouched).
+   * Cancel stops the timers; the op controller settles the job locally
+   * (the engine leaves a partial destination behind by design, and the UI
+   * says so) — the whole cancel path is exercisable standalone.
+   *
+   * Dev-only `?opslow=1` stretches every delay 8× so the measuring window
+   * (normally ~200 ms) is wide enough to screenshot headlessly. Mock only;
+   * zero production impact.
+   */
+  async opStart(req: OpRequestDto, onEvent: OpEventHandler): Promise<JobId> {
+    const id = this.nextId++;
+    const slow = mockOpSlow() ? 8 : 1;
+    const job = { timers: [] as number[], cancelled: false };
+    this.opJobs.set(id, job);
+    const later = (ms: number, fn: () => void): void => {
+      const t = setTimeout(() => {
+        if (!job.cancelled) fn();
+      }, ms * slow) as unknown as number;
+      job.timers.push(t);
+    };
+    if (
+      (req.op === "copy" || req.op === "move") &&
+      mockCollides(req.dst)
+    ) {
+      later(150, () => {
+        onEvent({
+          type: "error",
+          id,
+          // Backend-exact kind (dto.rs, frozen snake_case): the UI matches
+          // it case- and underscore-insensitively.
+          error: {
+            kind: "already_exists",
+            path: req.dst,
+            message:
+              "Destination already exists (mock): " + req.dst,
+          },
+        });
+        this.opJobs.delete(id);
+      });
+      return id;
+    }
+    const phase = req.op === "delete" || req.op === "trash" ? "deleting" : "copying";
+    const totalBytes = 8 * 1048576;
+    const totalItems = 24;
+    // Measuring window: no total yet (totalBytes 0) — the UI must show an
+    // indeterminate state here, not a guessed percentage.
+    later(60, () =>
+      onEvent({
+        type: "progress",
+        id,
+        phase: "measuring",
+        doneBytes: 0,
+        totalBytes: 0,
+        doneItems: 0,
+        totalItems: 0,
+      })
+    );
+    later(220, () =>
+      onEvent({
+        type: "progress",
+        id,
+        phase: "measuring",
+        doneBytes: 0,
+        totalBytes: 0,
+        doneItems: 3,
+        totalItems: 0,
+      })
+    );
+    // Measured phase: monotonic progress toward a real total.
+    for (let step = 1; step <= 8; step++) {
+      const s = step;
+      later(220 + s * 160, () =>
+        onEvent({
+          type: "progress",
+          id,
+          phase: phase as "copying" | "deleting",
+          doneBytes: Math.floor((totalBytes * s) / 8),
+          totalBytes,
+          doneItems: Math.floor((totalItems * s) / 8),
+          totalItems,
+        })
+      );
+    }
+    later(220 + 9 * 160, () => {
+      onEvent({ type: "done", id, summary: mockSummary(req) });
+      this.opJobs.delete(id);
+    });
+    return id;
+  }
+
+  /** Mock `op_cancel`: stop the stream, report the by-design partial. */
+  async opCancel(id: JobId): Promise<void> {
+    const job = this.opJobs.get(id);
+    if (!job || job.cancelled) return;
+    job.cancelled = true;
+    for (let i = 0; i < job.timers.length; i++) clearTimeout(job.timers[i]);
+    this.opJobs.delete(id);
+  }
+
   /**
    * Dev-only liveness hook: simulate a backend `changed` event, delivered to
    * every live subscription whose path is listed (the browser re-scans only
@@ -457,6 +650,36 @@ class MockIpc implements KestrelIpc {
 /** Trailing-slash-insensitive directory comparison. */
 function sameDir(a: string, b: string): boolean {
   return stripSlash(a) === stripSlash(b);
+}
+
+/**
+ * Mock collision rule: the mock listing holds README.md, src, docs, assets
+ * (plus file-N.txt). A copy/move onto one of those basenames fails with
+ * AlreadyExists — deterministic and demonstrable from the destination
+ * prompt without a backend.
+ */
+function mockCollides(dst: string): boolean {
+  const base = dst.split("/").pop() || "";
+  const known = ["README.md", "src", "docs", "assets", ".hidden-note"];
+  for (let i = 0; i < known.length; i++)
+    if (base === known[i]) return true;
+  return false;
+}
+
+function mockSummary(req: OpRequestDto): string {
+  if (req.op === "copy") return "Copied " + req.src + " to " + req.dst + " (mock)";
+  if (req.op === "move") return "Moved " + req.src + " to " + req.dst + " (mock)";
+  if (req.op === "trash") return "Trashed " + req.src + " (mock)";
+  return "Deleted " + req.src + " (mock)";
+}
+
+/** Dev-only mock timing control (`?opslow=1`): mock seam only. */
+function mockOpSlow(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get("opslow") === "1";
+  } catch {
+    return false;
+  }
 }
 
 function stripSlash(p: string): string {
