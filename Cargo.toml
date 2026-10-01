@@ -13,7 +13,7 @@ default-members = ["kestrel-fs", "kestrel"]
 # engine stays headless-testable; `kestrel` is the egui/eframe shell that
 # depends on it, and is the only member that knows a GPU exists.
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"

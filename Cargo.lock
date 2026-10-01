@@ -3001,7 +3001,7 @@ dependencies = [
 
 [[package]]
 name = "kestrel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "egui",
@@ -3021,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "kestrel-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "freedesktop_entry_parser",
  "mime",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "kestrel-tauri"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kestrel-fs",
  "serde",

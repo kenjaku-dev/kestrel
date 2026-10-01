@@ -114,7 +114,7 @@
 //! }
 //! ```
 
-#![doc(html_root_url = "https://docs.rs/kestrel-fs/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/kestrel-fs/0.2.0")]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
