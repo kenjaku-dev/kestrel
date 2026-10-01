@@ -19,9 +19,9 @@
 //! changing the engine.**
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -30,6 +30,8 @@ use kestrel_fs::model::CancellationToken;
 use kestrel_fs::scan::ScanHandle;
 use kestrel_fs::size::SizeHandle;
 use kestrel_fs::watcher::{DEFAULT_DEBOUNCE, DirWatcher, WatchEvent};
+
+use crate::dto::CollisionDecisionDto;
 
 /// A backend-minted job id. The frontend never invents one: ids come from
 /// [`Backend::mint`] only.
@@ -48,6 +50,31 @@ pub struct OpJob {
     pub cancel: CancellationToken,
     /// Human-readable description for progress UI ("Copying foo → bar").
     pub description: String,
+    /// Collisions this op is currently blocked on, keyed by destination path.
+    ///
+    /// One rendezvous per collision: the worker parks on the receiving end
+    /// (`recv_timeout`, so it also watches `cancel` and the answer deadline),
+    /// and `op_collision_answer` sends on this end. `SyncSender` is `Send` but
+    /// **not** `Sync`, so this field needs the same mechanical `Mutex` adapter
+    /// as every other engine handle in this module — and the lock is held only
+    /// for the `insert`/`remove`, never across `send`/`recv`.
+    ///
+    /// Keyed by path as well as by job so an answer for a stale `dst` (already
+    /// settled, or never asked about) is a silent no-op rather than an
+    /// answer landing on somebody else's channel.
+    pub pending: Mutex<HashMap<PathBuf, SyncSender<CollisionDecisionDto>>>,
+}
+
+impl OpJob {
+    /// A fresh op with no pending collisions.
+    #[must_use]
+    pub fn new(cancel: CancellationToken, description: String) -> Self {
+        Self {
+            cancel,
+            description,
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 /// Phase 2 placeholder: one subscribed directory relay on the long-lived
@@ -177,6 +204,72 @@ impl Backend {
         lock(&self.ops).insert(id, job);
     }
 
+    /// Delivers one collision answer to the op waiting on `dst`.
+    ///
+    /// A **silent no-op** in every case where there is nothing sensible to do,
+    /// which is the same posture as [`cancel_op`](Self::cancel_op) and the
+    /// scan/watch cancels:
+    ///
+    /// * unknown job id (the op finished, or the id never existed),
+    /// * `dst` is not the collision currently pending (already answered, or a
+    ///   path this op was never asked about),
+    /// * the worker thread is gone (the channel receiver was dropped).
+    ///
+    /// Never errors and never panics: an answer racing its own op is normal
+    /// traffic, not a failure, and the frontend must not have to distinguish
+    /// "answered" from "nobody was listening".
+    ///
+    /// The channel is **removed** before sending and the send happens with no
+    /// lock held. That ordering is what makes a second answer for the same
+    /// `dst` a no-op rather than a queue-up: the first caller takes the sender
+    /// out of the map, so the second finds nothing. It also means the op
+    /// record's lock is never held across a `send` that could block on a
+    /// full rendezvous.
+    pub fn answer_collision(&self, id: JobId, dst: &Path, decision: CollisionDecisionDto) {
+        let Some(job) = lock(&self.ops).get(&id).cloned() else {
+            return;
+        };
+        let Some(sender) = lock(&job.pending).remove(dst) else {
+            return;
+        };
+        // `SyncSender::send` on a rendezvous channel blocks until the worker
+        // receives; the worker is either parked on it or gone. If it is gone
+        // the receiver is dropped and `send` returns `Err` immediately, so this
+        // cannot hang. Discarded either way: an answer nobody receives is a
+        // no-op, not an error.
+        let _ = sender.send(decision);
+    }
+
+    /// The collisions every in-flight op is currently blocked on, as
+    /// `(id, dst)` pairs.
+    ///
+    /// This is the discovery half of the round-trip, and it exists because a
+    /// frontend cannot know an op is paused by looking at its own state: the
+    /// `collision` event is fire-and-forget over a `Channel`, so a window that
+    /// reloads (or mounts late) mid-pause has missed it. Mirrors the scan
+    /// pump's posture — the registry is the truth, and the UI resynchronises
+    /// from it rather than trusting it caught every message.
+    ///
+    /// Order is unspecified (a hash map), and the frontend must not depend on
+    /// it; it keys by `id` anyway.
+    #[must_use]
+    pub fn pending_collisions(&self) -> Vec<(JobId, PathBuf)> {
+        let jobs: Vec<(JobId, Arc<OpJob>)> = lock(&self.ops)
+            .iter()
+            .map(|(id, job)| (*id, Arc::clone(job)))
+            .collect();
+        let mut out = Vec::new();
+        for (id, job) in jobs {
+            // The `ops` lock is released before each `pending` lock: two
+            // different locks, never nested, so an answer in flight can never
+            // wait on a registry walk.
+            for dst in lock(&job.pending).keys() {
+                out.push((id, dst.clone()));
+            }
+        }
+        out
+    }
+
     /// Subscribes `dir` on the ONE shared watcher and returns the receiving
     /// end for a [`WatchRelay`].
     ///
@@ -280,6 +373,88 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "minted ids must be unique");
         assert_eq!(ids[0], FIRST_JOB_ID);
+    }
+
+    /// The rendezvous registry is behind a `Mutex` like every other engine
+    /// handle here, and the `Send + Sync` bound must survive it: a
+    /// `SyncSender` is `Send` but **not** `Sync`, so this is exactly the
+    /// `!Sync → Sync` adapter the module documents. Removing the `Mutex` — or
+    /// letting the job hold an `mpsc::Sender` bare — must fail to compile.
+    #[test]
+    fn op_jobs_with_pending_channels_stay_send_sync() {
+        assert_send_sync::<Arc<OpJob>>();
+        let job = OpJob::new(CancellationToken::new(), "test".to_string());
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        lock(&job.pending).insert(PathBuf::from("/tmp/x"), tx);
+        assert_send_sync::<Mutex<HashMap<PathBuf, SyncSender<CollisionDecisionDto>>>>();
+        // And the registry is readable from another thread while a worker
+        // holds the job — the whole point of the adapter.
+        let shared = Arc::new(job);
+        let other = Arc::clone(&shared);
+        assert!(
+            std::thread::spawn(move || lock(&other.pending).len() == 1)
+                .join()
+                .expect("reader thread")
+        );
+    }
+
+    /// One op's answers never reach another's channel: the same `dst` in a
+    /// different op is a different question.
+    #[test]
+    fn an_answer_only_reaches_the_job_that_is_blocked_on_that_path() {
+        let backend = Backend::try_new_watching(std::env::temp_dir(), Duration::from_millis(1))
+            .expect("backend");
+        let skip = serde_json::from_str("\"skip\"").expect("decision");
+        let dst = PathBuf::from("/shared/path.txt");
+        let one = Arc::new(OpJob::new(CancellationToken::new(), "one".to_string()));
+        let two = Arc::new(OpJob::new(CancellationToken::new(), "two".to_string()));
+        let (tx_one, rx_one) = std::sync::mpsc::sync_channel(1);
+        let (tx_two, _rx_two) = std::sync::mpsc::sync_channel(1);
+        lock(&one.pending).insert(dst.clone(), tx_one);
+        lock(&two.pending).insert(dst.clone(), tx_two);
+        backend.register_op(1, Arc::clone(&one));
+        backend.register_op(2, Arc::clone(&two));
+
+        backend.answer_collision(1, &dst, skip);
+
+        assert_eq!(rx_one.try_recv().expect("job 1 received its answer"), skip);
+        assert!(
+            lock(&two.pending).contains_key(&dst),
+            "job 2's question is untouched — the same path in a different op \
+             is a different question"
+        );
+    }
+
+    /// `cancel_op` on a paused op drops the registry entry. The answer then
+    /// goes nowhere, which is the required silent no-op rather than a panic:
+    /// the frontend races this against its own teardown routinely.
+    #[test]
+    fn cancel_op_drops_the_job_and_its_pending_answers_with_it() {
+        let backend = Backend::try_new_watching(std::env::temp_dir(), Duration::from_millis(1))
+            .expect("backend");
+        let dst = PathBuf::from("/tmp/pending.txt");
+        let job = Arc::new(OpJob::new(CancellationToken::new(), "test".to_string()));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        lock(&job.pending).insert(dst.clone(), tx);
+        backend.register_op(9, Arc::clone(&job));
+        assert_eq!(backend.pending_collisions(), vec![(9, dst.clone())]);
+
+        backend.cancel_op(9);
+
+        assert!(
+            backend.pending_collisions().is_empty(),
+            "a cancelled op advertises no questions: the dialog would have \
+             nothing to answer and no op to answer it for"
+        );
+        assert!(
+            job.cancel.is_cancelled(),
+            "the token must be set, not dropped — the pause watches the token"
+        );
+        backend.answer_collision(9, &dst, serde_json::from_str("\"abort\"").expect("d"));
+        assert!(
+            rx.try_recv().is_err(),
+            "an answer for a cancelled op is a silent no-op"
+        );
     }
 
     #[test]

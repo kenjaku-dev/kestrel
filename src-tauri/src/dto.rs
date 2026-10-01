@@ -456,11 +456,121 @@ impl Serialize for WatchEventDto {
 // { "type": "error", "id": 7, "error": CmdError }
 // ```
 //
-// Phase 3b will ADD a `collision` variant (and an `op_collision_answer`
-// command) for the human-in-the-loop round-trip. This enum is where it goes;
-// nothing here needs to change shape to accept it. For 3a a collision is an
-// `error` event with kind `"already_exists"` and the op fails.
+// Phase 3b adds the human-in-the-loop round-trip, one variant and one command:
+// ```json
+// { "type": "collision", "id": 7, "dst": "/abs/path", "kind": "file" }
+// op_collision_answer(id: number, dst: string, decision: "overwrite"|"skip"|"abort")
+// ```
+// A `collision` is **not** terminal: the op is blocked, waiting, and exactly one
+// terminal event still follows. For 3a — and for every collision the 3b worker
+// cannot ask about — a collision is an `error` event with kind
+// `"already_exists"` and the op fails with the destination untouched.
 // ---------------------------------------------------------------------------
+
+/// What already occupies a colliding destination, for the dialog's headline.
+///
+/// `symlink_metadata` answers for the *name*, never its target: a dangling
+/// link occupies a name, so it is a `symlink` collision even though nothing it
+/// points at exists. Frozen wire strings — the frontend matches on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CollisionKindDto {
+    /// A regular file.
+    File,
+    /// A directory (a merge, not a replacement).
+    Dir,
+    /// A symlink, dangling or not.
+    Symlink,
+    /// A socket, fifo or device node: the destination exists, and no
+    /// sensible copy exists either.
+    Other,
+}
+
+impl CollisionKindDto {
+    /// Classifies whatever occupies `dst`, without following a final symlink.
+    ///
+    /// An `lstat` that fails (the entry vanished between the engine's check
+    /// and this call — nothing holds a lock on a directory entry) degrades to
+    /// [`Other`](Self::Other) rather than failing: the question is still
+    /// answerable, and an unreadable path must not take the op down.
+    #[must_use]
+    pub fn of(dst: &Path) -> Self {
+        let Ok(md) = std::fs::symlink_metadata(dst) else {
+            return Self::Other;
+        };
+        let ft = md.file_type();
+        if ft.is_symlink() {
+            Self::Symlink
+        } else if ft.is_dir() {
+            Self::Dir
+        } else if ft.is_file() {
+            Self::File
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// One collision an in-flight op is currently blocked on, as
+/// `op_pending_collisions` reports it.
+///
+/// The discovery half of the round-trip. A `collision` event is fire-and-forget
+/// over a `Channel`, so a frontend that mounted (or reloaded) while an op was
+/// paused never saw it and has no other way to learn there is a question
+/// waiting. This command is the resynchronisation point, mirroring the scan
+/// pump: the registry is the truth, and the UI keys by `id` rather than
+/// assuming it caught every message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PendingCollisionDto {
+    /// The backend-minted job id from `op_start`. The answer must name it.
+    pub id: u64,
+    /// The colliding destination, absolute, exactly as the pending
+    /// [`OpEventDto::Collision`] event carried it — the answer must match this
+    /// string byte-for-byte, which is why it is stored, not recomputed.
+    pub dst: String,
+    /// What already occupies `dst`. Carried alongside `dst` so the dialog can
+    /// render its headline without a second `stat` round-trip.
+    pub kind: CollisionKindDto,
+}
+
+/// The user's answer to one [`OpEventDto::Collision`], sent back by
+/// `op_collision_answer`.
+///
+/// Frozen wire strings — the frontend matches on them. An unrecognised value
+/// is a rejected command, never a guessed answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CollisionDecisionDto {
+    /// Replace what is at the destination — **for this one path only**. The
+    /// backend records it in the engine's `AnsweredCollisions`, keyed by `dst`,
+    /// and retries with [`Collision::Fail`] still in effect, so the next
+    /// collision in the same tree is asked about separately.
+    Overwrite,
+    /// Leave the destination exactly as it is and carry on with the rest.
+    Skip,
+    /// Stop the whole operation. Any partial destination is left in place for
+    /// the user to inspect — never silently cleaned up.
+    Abort,
+}
+
+impl CollisionDecisionDto {
+    /// The engine policy this answer records, or `None` for
+    /// [`Abort`](Self::Abort) — which is not a policy but a stop, and so never
+    /// reaches `AnsweredCollisions`.
+    ///
+    /// The mapping is deliberately narrow: there is no answer that means
+    /// "overwrite every remaining collision", because that is the one answer
+    /// `Collision::Overwrite` would express and the one this design forbids.
+    #[must_use]
+    pub fn as_engine_collision(self) -> Option<kestrel_fs::ops::Collision> {
+        use kestrel_fs::ops::Collision;
+        match self {
+            Self::Overwrite => Some(Collision::Overwrite),
+            Self::Skip => Some(Collision::Skip),
+            Self::Abort => None,
+        }
+    }
+}
 
 /// One mutating operation the frontend asks for. Internally tagged with
 /// `"op"`; every variant carries exactly the paths the frozen contract shows
@@ -525,8 +635,8 @@ impl OpPhase {
 
 /// One message sent over an `op_start` [`Channel`](tauri::ipc::Channel).
 ///
-/// Deliberately extensible: Phase 3b adds a `Collision` variant here without
-/// touching any existing one.
+/// Deliberately extensible: Phase 3b adds the [`Collision`](Self::Collision)
+/// variant here without touching any existing one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpEventDto {
     /// Running totals for `id`. `totalBytes`/`totalItems` are 0 while unknown
@@ -560,6 +670,26 @@ pub enum OpEventDto {
         id: u64,
         /// The failure, as the standard error shape.
         error: CmdError,
+    },
+    /// A destination already exists and the op is **blocked**, waiting for
+    /// `op_collision_answer(id, dst, decision)`.
+    ///
+    /// Not a terminal event: the worker is parked at this `dst` and nothing
+    /// else is happening. Exactly one terminal event still follows — `done`,
+    /// or an `error` once every collision is answered, cancelled, or timed
+    /// out.
+    ///
+    /// Emitted only for a path with **no answer recorded**. Once an answer is
+    /// in the engine's `AnsweredCollisions` the path is settled and is never
+    /// asked about again, however many times the op is retried.
+    Collision {
+        /// The backend-minted job id from `op_start`.
+        id: u64,
+        /// The colliding destination, absolute, as the engine reported it. The
+        /// answer must name this exact string.
+        dst: String,
+        /// What already occupies `dst`.
+        kind: CollisionKindDto,
     },
 }
 
@@ -596,6 +726,16 @@ impl Serialize for OpEventDto {
                 out.serialize_field("type", "error")?;
                 out.serialize_field("id", id)?;
                 out.serialize_field("error", error)?;
+                out.end()
+            }
+            Self::Collision { id, dst, kind } => {
+                // Field order is part of the committed golden bytes: `type`
+                // first, then the job id, then the question.
+                let mut out = s.serialize_struct("OpEventDto", 4)?;
+                out.serialize_field("type", "collision")?;
+                out.serialize_field("id", id)?;
+                out.serialize_field("dst", dst)?;
+                out.serialize_field("kind", kind)?;
                 out.end()
             }
         }
@@ -895,6 +1035,97 @@ mod tests {
             );
             assert!(!CmdError::kind_of_open(&err).is_empty());
         }
+    }
+
+    /// `CollisionKindDto` classifies a destination from the *name*, never its
+    /// target — the same rule the engine's `path_entry_exists` follows, and the
+    /// reason a dangling link is a collision at all.
+    #[test]
+    fn collision_kind_reads_the_name_and_never_the_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("file");
+        let dir = tmp.path().join("dir");
+        let link = tmp.path().join("link");
+        let dangling = tmp.path().join("dangling");
+        std::fs::write(&file, b"x").expect("write");
+        std::fs::create_dir(&dir).expect("mkdir");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&file, &link).expect("link");
+            std::os::unix::fs::symlink(tmp.path().join("nowhere"), &dangling).expect("dangling");
+        }
+        let absent = tmp.path().join("absent");
+
+        assert_eq!(CollisionKindDto::of(&file), CollisionKindDto::File);
+        assert_eq!(CollisionKindDto::of(&dir), CollisionKindDto::Dir);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                CollisionKindDto::of(&link),
+                CollisionKindDto::Symlink,
+                "a link to a file is a symlink, not a file: the question is what \
+                 occupies the name"
+            );
+            assert_eq!(
+                CollisionKindDto::of(&dangling),
+                CollisionKindDto::Symlink,
+                "a dangling link still occupies the name — `Path::exists` would \
+                 have said this was absent, which is the wrong answer"
+            );
+        }
+        // A failed `lstat` degrades rather than failing: an unreadable path
+        // must never take the op down.
+        assert_eq!(CollisionKindDto::of(&absent), CollisionKindDto::Other);
+
+        // And the frozen wire strings, in both directions.
+        for (dto, wire) in [
+            (CollisionKindDto::File, "\"file\""),
+            (CollisionKindDto::Dir, "\"dir\""),
+            (CollisionKindDto::Symlink, "\"symlink\""),
+            (CollisionKindDto::Other, "\"other\""),
+        ] {
+            assert_eq!(serde_json::to_string(&dto).expect("serializes"), wire);
+            assert_eq!(
+                serde_json::from_str::<CollisionKindDto>(wire).expect(wire),
+                dto
+            );
+        }
+    }
+
+    /// `abort` is not a policy and must not be recorded as one: there is no
+    /// `Collision` that means "stop the whole operation", and inventing one
+    /// would make it reachable from `AnsweredCollisions`.
+    #[test]
+    fn abort_maps_to_no_engine_collision() {
+        assert_eq!(
+            CollisionDecisionDto::Overwrite.as_engine_collision(),
+            Some(kestrel_fs::ops::Collision::Overwrite)
+        );
+        assert_eq!(
+            CollisionDecisionDto::Skip.as_engine_collision(),
+            Some(kestrel_fs::ops::Collision::Skip)
+        );
+        assert_eq!(
+            CollisionDecisionDto::Abort.as_engine_collision(),
+            None,
+            "abort stops the op; it is not a per-path policy"
+        );
+    }
+
+    /// The discovery row is the shape a frontend needs to rebuild a dialog
+    /// after mounting mid-pause: an id to key on, the exact `dst` the answer
+    /// must name, and a kind so it can render without a second `stat`.
+    #[test]
+    fn pending_collision_row_serializes_to_the_frozen_shape() {
+        let dto = PendingCollisionDto {
+            id: 7,
+            dst: "/home/u/dst.txt".to_string(),
+            kind: CollisionKindDto::File,
+        };
+        assert_eq!(
+            serde_json::to_string(&dto).expect("serializes"),
+            r#"{"id":7,"dst":"/home/u/dst.txt","kind":"file"}"#
+        );
     }
 
     #[test]

@@ -91,13 +91,17 @@ export interface OpenPathResult {
   entered_dir: boolean;
 }
 
-/* Kestrel Phase 3a — file operations (frozen contract, internally tagged
+/* Kestrel Phase 3a/3b — file operations (frozen contract, internally tagged
  * with "op" on the request and "type" on events, matching the scan/watch
  * normalisers in ipc.ts).
  *
- * There is deliberately no `collision` event in 3a: a collision arrives as
- * an `error` event with kind `already_exists` and the op fails, leaving the
- * destination untouched. The collision dialog is a later phase.
+ * 3a had no collision event: a collision arrived as an `error` with kind
+ * `already_exists` and the op failed, leaving the destination untouched.
+ * 3b adds `collision`, and the answer that settles it. The engine scopes an
+ * answer to ONE destination path (`AnsweredCollisions`, kestrel-fs/src/ops.rs):
+ * there is deliberately no "apply to all", because `CopyOptions::collision`
+ * would answer every remaining path in the tree — silently, which is the
+ * opposite of what "overwrite this one" means.
  */
 export type OpRequestDto =
   | { op: "copy"; src: string; dst: string }
@@ -107,10 +111,22 @@ export type OpRequestDto =
 
 export type OpPhaseDto = "measuring" | "copying" | "deleting";
 
+/** What is already sitting at the destination. Drives the wording of the
+ *  consequence sentences — overwriting a folder is not overwriting a file,
+ *  and the dialog has to say which one it is doing. */
+export type CollisionKindDto = "file" | "dir" | "symlink" | "other";
+
+/** The three answers the engine understands. Frozen; nothing is added here. */
+export type CollisionDecision = "overwrite" | "skip" | "abort";
+
 /** Normalised op stream events. See ipc.ts normalizeOpEvent for wire shapes.
  * During `measuring` there is no total yet: the backend may send
  * totalBytes 0 and the UI must render an indeterminate state, never a
- * guessed percentage. */
+ * guessed percentage.
+ *
+ * `collision` is NOT terminal and NOT an error: the backend emits it and then
+ * blocks on that one `dst` until `op_collision_answer` arrives. A terminal
+ * `done`/`error` always follows once the op finishes or is aborted. */
 export type OpEventDto =
   | {
       type: "progress";
@@ -122,4 +138,5 @@ export type OpEventDto =
       totalItems: number;
     }
   | { type: "done"; id: number; summary: string }
-  | { type: "error"; id: number; error: CmdError };
+  | { type: "error"; id: number; error: CmdError }
+  | { type: "collision"; id: number; dst: string; kind: CollisionKindDto };

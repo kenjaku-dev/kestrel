@@ -7,8 +7,9 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "esbuild test/op-seam.test.ts --bundle --platform=node --format=esm --external:@tauri-apps/api/core --outfile=/tmp/opencode/kestrel-op-seam.test.mjs --log-level=warning && node --test /tmp/opencode/kestrel-op-seam.test.mjs",
-    "test:tokens": "esbuild test/tokens-layering.test.ts --bundle --platform=node --format=esm --outfile=/tmp/opencode/kestrel-tokens-layering.test.mjs --log-level=warning && node --test /tmp/opencode/kestrel-tokens-layering.test.mjs",
+    "test": "esbuild test/op-seam.test.ts test/collision.test.ts test/tokens-layering.test.ts --bundle --platform=node --format=esm --external:@tauri-apps/api/core --outdir=/tmp/opencode/kestrel-tests --log-level=warning && node --test /tmp/opencode/kestrel-tests/",
+    "test:tokens": "npm run test:tokens-only",
+    "test:tokens-only": "esbuild test/tokens-layering.test.ts --bundle --platform=node --format=esm --outdir=/tmp/opencode/kestrel-tests-tokens --log-level=warning && node --test /tmp/opencode/kestrel-tests-tokens/",
     "audit:tokens": "node test/token-audit.mjs"
   },
   "dependencies": {

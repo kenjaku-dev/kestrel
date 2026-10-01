@@ -227,9 +227,12 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
- * Phase 3a — destination prompt + delete confirm. Plain block layout, no dialog
- * element: 3a ships no modal dialogs. Inline form, always obvious which
- * directory is targeted.
+ * Phase 3a — destination prompt + delete confirm. Plain block layout, not a
+ * modal dialog: an inline form keeps the listing visible, which is what you
+ * want while naming a destination. (The one true blocking dialog in the app
+ * is the Phase 3b collision dialog further down, and it is a modal for the
+ * opposite reason: the engine is stopped and cannot continue without an
+ * answer.)
  * ------------------------------------------------------------------------ */
 
 #op-panel {
@@ -322,6 +325,331 @@ body {
 
 #op-panel button.k-op-danger:hover {
   background: var(--kestrel-dialog-btn-destructive-bg-hover);
+}
+
+/* ---------------------------------------------------------------------------
+ * Phase 3b — the collision dialog.
+ *
+ * NO `<dialog>` ELEMENT: `showModal()` is Safari 15.4 and this renderer's floor
+ * is 13 (WebKitGTK, Tauri's oldest backend). NO `inert` either (15.5). Both
+ * consequences are paid for explicitly rather than silently:
+ *   * the scrim covers the whole window, so nothing behind it is clickable;
+ *   * `planCollisionKey` (lib/collision.ts) traps Tab/Shift+Tab WITHIN the
+ *     three choices, wrapping at both ends, so nothing behind it is reachable
+ *     by keyboard either;
+ *   * `#app` gets `aria-hidden="true"` while the dialog is up, applied AFTER
+ *     focus has moved in — doing it in the other order would hide the subtree
+ *     that currently owns focus, which is an ARIA violation.
+ * Between those three, `aria-modal="true"` is a true statement rather than a
+ * hopeful one.
+ *
+ * The scrim is deliberately NOT a light-dismiss surface: clicking away from a
+ * question that must be answered would be "abort by accident", which is the
+ * exact failure this phase exists to prevent. It swallows the click.
+ *
+ * Everything visual is a token. No raw hex, no rgba(), no hard-coded px —
+ * which is a hard gate (test/tokens-layering.test.ts) and also the reason the
+ * values below read as a list of names rather than a list of numbers.
+ * ------------------------------------------------------------------------ */
+
+.k-collision-layer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--kestrel-dialog-collision-layer-padding);
+  z-index: var(--kestrel-dialog-scrim-layer);
+}
+
+/* `hidden` is the semantic "hidden from everyone" state; the explicit rule is
+   here because `display: flex` on the layer would otherwise win. */
+.k-collision-layer[hidden] {
+  display: none;
+}
+
+.k-collision-scrim {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--kestrel-dialog-scrim);
+  animation: k-collision-scrim-in var(--kestrel-dialog-collision-scrim-duration)
+    var(--kestrel-dialog-collision-scrim-ease) both;
+}
+
+@keyframes k-collision-scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.k-collision {
+  position: relative;
+  box-sizing: border-box;
+  width: var(--kestrel-dialog-collision-width);
+  /* Cap against the window so a long path wraps instead of clipping. `vh` is
+     plain and safe; `dvh` is Safari 15.4 and is used nowhere here. */
+  max-width: 100%;
+  max-height: var(--kestrel-dialog-collision-max-height);
+  overflow-y: auto;
+  padding: var(--kestrel-dialog-padding);
+  border: var(--kestrel-dialog-border-width) solid var(--kestrel-dialog-border);
+  border-radius: var(--kestrel-dialog-radius);
+  background: var(--kestrel-dialog-background);
+  box-shadow: var(--kestrel-dialog-elevation);
+  z-index: var(--kestrel-dialog-layer);
+  animation: k-collision-in var(--kestrel-dialog-collision-card-duration)
+    var(--kestrel-dialog-collision-card-ease) both;
+}
+
+/* §4.7: a 4px rise plus opacity on the way in. Opacity and transform only —
+   never a box-model property (§2.11 rule 2). */
+@keyframes k-collision-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--kestrel-dialog-collision-rise));
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The card carries tabindex="-1" as the programmatic focus fallback, so it
+   gets a ring rather than a bare `outline: none`. */
+.k-collision:focus {
+  outline: var(--kestrel-dialog-btn-focus-ring-width) solid
+    var(--kestrel-dialog-btn-focus-ring-color);
+  outline-offset: var(--kestrel-dialog-btn-focus-ring-offset);
+}
+
+.k-collision-op {
+  font: var(--kestrel-dialog-op-font);
+  letter-spacing: var(--kestrel-dialog-op-tracking);
+  text-transform: uppercase;
+  color: var(--kestrel-dialog-op-color);
+  margin: 0 0 var(--kestrel-dialog-op-gap) 0;
+}
+
+.k-collision-title {
+  font: var(--kestrel-dialog-title-font);
+  color: var(--kestrel-dialog-title-color);
+  margin: 0 0 var(--kestrel-dialog-title-gap) 0;
+  /* A long filename can push the card past its token; break it instead. */
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+/* "from <path>" and "to <path>" as a label/value grid. The label column has
+   to line up across both rows, which margins alone cannot do here. */
+.k-collision-paths {
+  display: grid;
+  grid-template-columns: var(--kestrel-dialog-path-label-width) 1fr;
+  row-gap: var(--kestrel-dialog-paths-gap);
+  column-gap: var(--kestrel-dialog-path-gap);
+  margin: 0 0 var(--kestrel-dialog-paths-margin-bottom) 0;
+}
+
+.k-collision-path-label {
+  font: var(--kestrel-dialog-path-label-font);
+  letter-spacing: var(--kestrel-dialog-path-label-tracking);
+  text-transform: uppercase;
+  color: var(--kestrel-dialog-path-label-color);
+  align-self: center;
+}
+
+.k-collision-path {
+  font: var(--kestrel-dialog-path-font);
+  color: var(--kestrel-dialog-path-color);
+  /* `code` carries a UA margin; the grid owns the spacing here. */
+  margin: 0;
+  /* A path is one long token with slashes in it. Break anywhere rather than
+     overflow it. */
+  overflow-wrap: break-word;
+  word-break: break-all;
+}
+
+/* The destination is the thing in question, so it is the one on a tinted
+   plate — the same treatment §4.7 gives path-quote. The source stays plain. */
+.k-collision-path-dst {
+  background: var(--kestrel-dialog-path-dst-bg);
+  border-radius: var(--kestrel-dialog-path-dst-radius);
+  padding: var(--kestrel-dialog-path-dst-padding-y)
+    var(--kestrel-dialog-path-dst-padding-x);
+}
+
+.k-collision-existing {
+  display: flex;
+  align-items: baseline;
+  font: var(--kestrel-dialog-existing-font);
+  color: var(--kestrel-dialog-existing-color);
+  margin: var(--kestrel-dialog-existing-margin-y) 0 0 0;
+}
+
+.k-collision-glyph {
+  display: inline-block;
+  width: var(--kestrel-dialog-glyph-width);
+  flex: none;
+}
+
+.k-collision-desc {
+  font: var(--kestrel-dialog-desc-font);
+  color: var(--kestrel-dialog-desc-color);
+  margin: var(--kestrel-dialog-desc-margin-y) 0 0 0;
+  /* One prose block: the situation, then the statement that nothing is being
+     written. Both are facts the user is owed before choosing. */
+  max-width: 62ch;
+}
+
+.k-collision-options {
+  list-style: none;
+  margin: var(--kestrel-dialog-options-margin-top) 0 0 0;
+  padding: 0;
+}
+
+/* Vertical spacing between the choices is a margin on each row, not `gap`:
+   flex/grid `gap` on a column is Safari 14.1 territory. */
+.k-collision-option-slot {
+  margin: 0 0 var(--kestrel-dialog-option-gap) 0;
+}
+
+.k-collision-option-slot.is-separate {
+  margin-top: var(--kestrel-dialog-option-gap);
+  /* The separator is the isolation. Abort is about the whole operation and
+     must not read as a third way to handle THIS file, sitting next to the
+     destructive fill. */
+  border-top: var(--kestrel-dialog-option-separator-width) solid
+    var(--kestrel-dialog-option-separator-color);
+  padding-top: var(--kestrel-dialog-option-gap);
+}
+
+.k-collision-option {
+  display: flex;
+  align-items: flex-start;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: start;
+  cursor: pointer;
+  font: var(--kestrel-dialog-btn-font);
+  padding: var(--kestrel-dialog-option-padding-y)
+    var(--kestrel-dialog-option-padding-x);
+  border: var(--kestrel-dialog-option-border-width) solid
+    var(--kestrel-dialog-option-border);
+  border-radius: var(--kestrel-dialog-option-radius);
+  background: var(--kestrel-dialog-option-bg);
+  color: var(--kestrel-dialog-option-label-color);
+}
+
+/* `:focus`, not `:focus-visible` — the latter is Safari 15.4. Every focus in
+   a keyboard-only dialog is a deliberate one, so always showing the ring is
+   correct here rather than merely compatible. */
+.k-collision-option:focus {
+  outline: var(--kestrel-dialog-btn-focus-ring-width) solid
+    var(--kestrel-dialog-btn-focus-ring-color);
+  outline-offset: var(--kestrel-dialog-btn-focus-ring-offset);
+}
+
+.k-collision-option:hover {
+  background: var(--kestrel-dialog-option-bg-hover);
+}
+
+.k-collision-option-glyph {
+  font: var(--kestrel-dialog-option-glyph-font);
+  width: var(--kestrel-dialog-option-glyph-width);
+  flex: none;
+  color: var(--kestrel-dialog-option-glyph-color);
+}
+
+.k-collision-option-body {
+  flex: 1;
+}
+
+.k-collision-option-label {
+  display: block;
+  font: var(--kestrel-dialog-option-label-font);
+  color: var(--kestrel-dialog-option-label-color);
+}
+
+.k-collision-option-detail {
+  display: block;
+  font: var(--kestrel-dialog-option-detail-font);
+  color: var(--kestrel-dialog-option-detail-color);
+}
+
+/* --- tone: destructive. The only filled control in the dialog. ------------ */
+
+.k-collision-option-slot.is-tone-destructive .k-collision-option {
+  background: var(--kestrel-dialog-option-destructive-bg);
+  border-color: var(--kestrel-dialog-option-destructive-border);
+}
+
+.k-collision-option-slot.is-tone-destructive .k-collision-option:hover {
+  background: var(--kestrel-dialog-option-destructive-bg-hover);
+}
+
+.k-collision-option-slot.is-tone-destructive .k-collision-option-label,
+.k-collision-option-slot.is-tone-destructive .k-collision-option-detail,
+.k-collision-option-slot.is-tone-destructive .k-collision-option-glyph {
+  color: var(--kestrel-dialog-option-destructive-label-color);
+}
+
+/* --- tone: caution. Abort is outlined, never filled. --------------------- */
+
+.k-collision-option-slot.is-tone-caution .k-collision-option {
+  background: var(--kestrel-dialog-option-bg);
+  border-color: var(--kestrel-dialog-option-caution-border);
+}
+
+.k-collision-option-slot.is-tone-caution .k-collision-option:hover {
+  border-color: var(--kestrel-dialog-option-caution-border-hover);
+}
+
+.k-collision-option-slot.is-tone-caution .k-collision-option-label {
+  color: var(--kestrel-dialog-option-caution-label-color);
+}
+
+.k-collision-option-slot.is-tone-caution .k-collision-option-detail {
+  color: var(--kestrel-dialog-option-caution-detail-color);
+}
+
+.k-collision-option-slot.is-tone-caution .k-collision-option-glyph {
+  color: var(--kestrel-dialog-option-caution-glyph-color);
+}
+
+.k-collision-seq {
+  font: var(--kestrel-dialog-seq-font);
+  color: var(--kestrel-dialog-seq-color);
+  margin: var(--kestrel-dialog-seq-margin-top) 0 0 0;
+  max-width: 62ch;
+}
+
+.k-collision-hint {
+  font: var(--kestrel-dialog-hint-font);
+  color: var(--kestrel-dialog-hint-color);
+  margin: var(--kestrel-dialog-hint-margin-top) 0 0 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Reduced motion, named next to the animations it cancels. The global block at
+ * the end of this file already zeroes them via `--kestrel-motion-role-reduced`
+ * on `*`; repeating it here makes the intent legible where the animation is,
+ * and survives someone moving the global block. A dialog that fades and rises
+ * is motion; a dialog that simply appears is not.
+ * ------------------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  .k-collision-scrim,
+  .k-collision {
+    animation-duration: var(--kestrel-motion-role-reduced) !important;
+  }
 }
 
 /* ---------------------------------------------------------------------------

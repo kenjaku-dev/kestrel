@@ -19,8 +19,14 @@ import {
   perfHudWanted,
 } from "./lib/fixture";
 import { createIpc, type KestrelIpc } from "./lib/ipc";
-import type { FileEntryDto, OpRequestDto, SortKeyDto } from "./lib/types";
+import type {
+  CollisionDecision,
+  FileEntryDto,
+  OpRequestDto,
+  SortKeyDto,
+} from "./lib/types";
 import { OpManager, isAlreadyExistsKind, type OpJob } from "./lib/ops";
+import { CollisionDialog } from "./lib/collision";
 import { formatSize } from "./lib/format";
 import { OVERSCAN, ROW_HEIGHT, Windower } from "./lib/windower";
 
@@ -80,9 +86,28 @@ function opDemoParam(): string | null {
       v === "move" ||
       v === "trash" ||
       v === "delete" ||
-      v === "copy-collide"
+      v === "copy-collide" ||
+      v === "copy-ask"
       ? v
       : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Dev-only `?collide=<file|dir|symlink|other>`: after an op starts, make the
+ * mock hit a collision with THAT kind at that destination. Separated from
+ * `?opdemo=copy-ask` so the wording for a folder collision — the one that
+ * merges rather than replaces, and is the easiest thing to get wrong — is
+ * reachable without editing code. No-op on the real backend.
+ */
+function collideParam(): string | null {
+  try {
+    const v = new URLSearchParams(window.location.search).get("collide");
+    if (v === "file" || v === "dir" || v === "symlink" || v === "other")
+      return v;
+    return null;
   } catch {
     return null;
   }
@@ -283,11 +308,13 @@ async function main(): Promise<void> {
   });
 
   // --- Phase 3a ops wiring (selection lives in Browser; jobs live here) ---
+  const appEl = el<HTMLElement>("app");
   const opsUi = setupOps({
     browser,
     ipc,
     statusEl,
     viewport,
+    appEl,
     panelEl: el<HTMLElement>("op-panel"),
     jobsEl: el<HTMLElement>("jobs"),
     copyBtn: el<HTMLButtonElement>("op-copy"),
@@ -436,6 +463,51 @@ async function main(): Promise<void> {
     opsActive: (): number => opsUi.ops.activeCount(),
     /** Phase 3a: DOM pool size after the job list was added (must stay flat). */
     domPoolSize: (): number => windowerPoolSize(windower),
+    /* ---- Phase 3b: the collision dialog ------------------------------- */
+    /** Is the collision dialog on screen right now? */
+    collisionOpen: (): boolean => opsUi.dialog.isOpen,
+    /** The collision currently on screen, or null. Read-only introspection. */
+    collisionPending: (): { id: number; dst: string; kind: string } | null => {
+      const jobs = opsUi.ops.liveJobs();
+      for (let i = 0; i < jobs.length; i++) {
+        const c = jobs[i].collision;
+        if (c) return { id: c.id, dst: c.dst, kind: c.kind };
+      }
+      return null;
+    },
+    /** Answer the pending collision. Mirrors a click on a dialog button, and
+     *  reports whether the answer was actually routed — a false here means it
+     *  was stale, which is the guard doing its job rather than a failure. */
+    answerCollision: (decision: string): boolean => {
+      const pending = kestrel.collisionPending();
+      if (!pending) return false;
+      const coll = opsUi.ops.collisionFor(pending.id);
+      if (!coll) return false;
+      return opsUi.ops.answer(coll, decision as CollisionDecision);
+    },
+    /** Every answer sent, as the IPC seam recorded it. */
+    collisionAnswers: () => CollisionDialog.answersOf(ipc),
+    /** Re-sync: ask the backend what it is blocked on and open the dialog for
+     *  each. This is the path that matters after a reload — a `collision`
+     *  event is fire-and-forget over a Channel, so a window that mounted while
+     *  an op was paused never saw the question. Returns how many it opened. */
+    syncCollisions: async (): Promise<number> => {
+      const rows = await ipc.opPendingCollisions();
+      let opened = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const known = opsUi.ops.collisionFor(row.id);
+        // Already showing it: the event did arrive, or this call already ran.
+        if (known && known.dst === row.dst) continue;
+        const job = opsUi.ops
+          .liveJobs()
+          .find((j) => j.id === row.id);
+        if (!job) continue; // we have no job row for it; nothing to show
+        opsUi.ops.adoptCollision(job, { id: row.id, dst: row.dst, kind: row.kind, seq: 0 });
+        opened++;
+      }
+      return opened;
+    },
   };
   (window as unknown as Record<string, unknown>)["__kestrel"] = kestrel;
 }
@@ -646,6 +718,7 @@ interface OpsContext {
   viewport: HTMLElement;
   panelEl: HTMLElement;
   jobsEl: HTMLElement;
+  appEl: HTMLElement;
   copyBtn: HTMLButtonElement;
   moveBtn: HTMLButtonElement;
   trashBtn: HTMLButtonElement;
@@ -657,6 +730,7 @@ interface OpsContext {
 
 interface OpsHandle {
   ops: OpManager;
+  dialog: CollisionDialog;
   startForTest(kind: string): Promise<number | null>;
   cancelAll(): void;
   openPrompt(kind: string): void;
@@ -681,16 +755,31 @@ interface JobNodes {
  * in the filter, the sort box, or the destination prompt.
  */
 function setupOps(ctx: OpsContext): OpsHandle {
-  const ops = new OpManager(
+  // The dialog is constructed first: it needs the manager, and the manager's
+  // collision sinks need the dialog. Neither constructor talks to the other,
+  // so the ordering is a wiring convenience and nothing more.
+  let dialog: CollisionDialog;
+  const ops = new OpManager(ctx.ipc, {
+    onJobsChanged: (jobs) => renderJobs(ctx, ops, jobs),
+    onOpError: (error) => ctx.browser.showOpError(error),
+    onSettled: () => {
+      ctx.browser.rescan();
+      ctx.onHud();
+    },
+    // Phase 3b. Both sinks are the OpManager telling the view the truth: a
+    // job is now blocked, or no longer blocked. The view never guesses from
+    // progress events, because "blocked" is not derivable from them.
+    onCollision: (job) => {
+      if (job.collision) dialog.enqueue(job, job.collision);
+    },
+    onCollisionClosed: (id) => dialog.release(id),
+  });
+  dialog = new CollisionDialog(
+    document.body,
+    ctx.appEl,
+    ops,
     ctx.ipc,
-    {
-      onJobsChanged: (jobs) => renderJobs(ctx, ops, jobs),
-      onOpError: (error) => ctx.browser.showOpError(error),
-      onSettled: () => {
-        ctx.browser.rescan();
-        ctx.onHud();
-      },
-    }
+    () => ctx.viewport
   );
 
   const selectedOrHint = (): FileEntryDto | null => {
@@ -719,6 +808,10 @@ function setupOps(ctx: OpsContext): OpsHandle {
   });
 
   ctx.browser.opKeyHandler = (e) => {
+    // The collision dialog is modal: while it is up, the list is not
+    // answering keys at all. Without this the shortcuts below would start a
+    // SECOND op from under an open dialog.
+    if (dialog.isOpen) return true;
     if (isTypingTarget(ctx)) return false;
     const mod = e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey;
     if (mod && (e.key === "c" || e.key === "C")) {
@@ -747,6 +840,7 @@ function setupOps(ctx: OpsContext): OpsHandle {
 
   const handle: OpsHandle = {
     ops,
+    dialog,
     cancelAll: () => {
       const jobs = ops.liveJobs();
       for (let i = 0; i < jobs.length; i++) ops.cancel(jobs[i].id);
@@ -769,14 +863,19 @@ function setupOps(ctx: OpsContext): OpsHandle {
         });
       }
       if (kind === "copy-collide")
-        // Targets an existing README.md in the viewed directory: exercises
-        // the already_exists error path end to end (op fails, destination
-        // untouched, no dialog).
+        // Targets an existing README.md in the viewed directory: the mock
+        // parks there and the 3b dialog opens (3b asks; `already_exists` is
+        // still covered by the seam suite from the committed Rust bytes).
         return startOp(ctx, ops, {
           op: "copy",
           src: e.path,
           dst: dirName(e.path) + "/README.md",
         });
+      if (kind === "copy-ask")
+        // Forces a collision at a destination the mock's name heuristic would
+        // not recognise, so the dialog is reachable for any op and any `kind`
+        // via `&collide=`. Waits for the op to exist before asking.
+        return startForcedCollision(ctx, ops, e, "file");
       if (kind === "trash") return startOp(ctx, ops, { op: "trash", src: e.path });
       if (kind === "delete")
         return startOp(ctx, ops, {
@@ -788,6 +887,38 @@ function setupOps(ctx: OpsContext): OpsHandle {
     },
   };
   return handle;
+}
+
+/**
+ * Dev-only: start a copy and make the mock collide on it at a destination the
+ * name heuristic would not catch. Polls briefly for the job to exist rather
+ * than assuming a JobId, because `op_start` returns before the stream begins.
+ */
+async function startForcedCollision(
+  ctx: OpsContext,
+  ops: OpManager,
+  entry: FileEntryDto,
+  kind: "file" | "dir" | "symlink" | "other"
+): Promise<number | null> {
+  const dst = dirName(entry.path) + "/" + entry.name + "-ask";
+  const id = await startOp(ctx, ops, { op: "copy", src: entry.path, dst });
+  if (id === null) return null;
+  const mock = ctx.ipc as unknown as Record<string, unknown>;
+  const sim = mock["simulateCollision"];
+  if (typeof sim !== "function") {
+    ctx.statusEl.textContent =
+      "simulateCollision is mock-only; the real backend sends collisions itself.";
+    return id;
+  }
+  const want = collideParam() || kind;
+  const t0 = Date.now();
+  while (Date.now() - t0 < 2000) {
+    if ((sim as (d: string, k: string) => boolean).call(mock, dst, want))
+      return id;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  ctx.statusEl.textContent = "no live op to collide with";
+  return id;
 }
 
 /** Selected entry, else the first entry row (dev/automation entry point). */
@@ -1052,7 +1183,14 @@ function makeJobRow(ctx: OpsContext, ops: OpManager, id: number): JobNodes {
   const cancelBtn = document.createElement("button");
   cancelBtn.type = "button";
   cancelBtn.textContent = "Cancel";
-  cancelBtn.addEventListener("click", () => ops.cancel(id));
+  cancelBtn.addEventListener("click", () => {
+    // One route to "stop this op": a paused job answers its pending collision
+    // with `abort` rather than sending op_cancel, because the engine is
+    // blocked inside the handshake and only the answer releases it.
+    const coll = ops.collisionFor(id);
+    if (coll) ops.abortForCollision(coll);
+    else ops.cancel(id);
+  });
   const dismissBtn = document.createElement("button");
   dismissBtn.type = "button";
   dismissBtn.textContent = "Dismiss";
@@ -1098,14 +1236,22 @@ function paintJobRow(n: JobNodes, job: OpJob, showStats: boolean): void {
     n.bytes.textContent = "";
   }
   n.note.textContent = jobNoteText(job, showStats);
-  const running = job.status === "running";
+  // A paused job keeps its Cancel button, because stopping the operation is
+  // still available — it is one of the three answers. The button does not
+  // work by dismissing the dialog; it routes through the same `answer` path
+  // so there is exactly one implementation of "stop this op".
+  const running = job.status === "running" || job.status === "paused";
   const terminal =
     job.status === "done" ||
     job.status === "failed" ||
     job.status === "cancelled";
+  n.root.className =
+    "k-job" +
+    (job.status === "failed" ? " is-failed" : "") +
+    (job.status === "paused" ? " is-paused" : "");
   n.cancelBtn.style.display = running || job.status === "cancelling" ? "" : "none";
   n.cancelBtn.textContent = job.status === "cancelling" ? "Cancelling…" : "Cancel";
-  n.cancelBtn.disabled = job.status !== "running";
+  n.cancelBtn.disabled = job.status !== "running" && job.status !== "paused";
   n.dismissBtn.style.display = terminal ? "" : "none";
 }
 
@@ -1114,6 +1260,10 @@ function jobPhaseText(job: OpJob): string {
   if (job.status === "failed") return "failed";
   if (job.status === "cancelled") return "cancelled";
   if (job.status === "cancelling") return "cancelling";
+  // "paused", not the copy phase. The engine is not copying; it is waiting on
+  // a human, and a row that says "copying" during a blocking question is a
+  // progress lie.
+  if (job.status === "paused") return "paused";
   return job.phase;
 }
 
@@ -1135,6 +1285,7 @@ function jobNoteText(job: OpJob, showStats: boolean): string {
         "]"
       : "";
   if (job.status === "cancelling") return "Cancelling…";
+  if (job.status === "paused") return pausedNote(job);
   if (job.status === "cancelled") return cancelNote(job);
   if (job.status === "done") return job.summary + stats;
   if (job.status === "failed" && job.error) {
@@ -1147,6 +1298,34 @@ function jobNoteText(job: OpJob, showStats: boolean): string {
     return "Measuring size — no total yet, so no percentage is shown." + stats;
   if (job.status === "running") return stats !== "" ? stats.slice(1) : "";
   return "";
+}
+
+/**
+ * The paused note. Says the op is stopped and WHY, names the destination the
+ * decision is about, and says how many collisions this op has already had —
+ * so "one at a time" is visible rather than assumed. A paused job keeps
+ * whatever byte count it had reached: that number is true as of the pause, and
+ * it does not move, which is exactly why the phase reads "paused".
+ */
+function pausedNote(job: OpJob): string {
+  if (!job.collision) return "Paused.";
+  const bytes =
+    !job.unknownTotal && job.totalBytes > 0
+      ? " " + formatSize(job.doneBytes) + " of " + formatSize(job.totalBytes) +
+        " written before the pause."
+      : "";
+  const more =
+    job.collisionCount > 1
+      ? " This is collision " + job.collisionCount + " in this operation; " +
+        "each one is answered on its own."
+      : "";
+  return (
+    "Paused, waiting for you to decide about " +
+    job.collision.dst +
+    ". Nothing is being written until you do." +
+    bytes +
+    more
+  );
 }
 
 function cancelNote(job: OpJob): string {

@@ -51,8 +51,8 @@ use kestrel_fs::watcher::{ChangeSet, WatchEvent};
 use tauri::{AppHandle, Manager, Runtime, async_runtime, ipc::Channel};
 
 use crate::dto::{
-    CmdError, FileEntryDto, OpEventDto, OpPhase, OpRequestDto, OpenResultDto, ScanEventDto,
-    ScanOptionsDto, WatchEventDto,
+    CmdError, CollisionDecisionDto, CollisionKindDto, FileEntryDto, OpEventDto, OpPhase,
+    OpRequestDto, OpenResultDto, PendingCollisionDto, ScanEventDto, ScanOptionsDto, WatchEventDto,
 };
 use crate::state::{Backend, JobId, OpJob, WatchRelay};
 
@@ -348,10 +348,13 @@ fn watch_touches(changes: &ChangeSet, dir: &Path) -> bool {
 
 // ---------------------------------------------------------------------------
 // op_start / op_cancel (Phase 3a)
+// op_collision_answer / op_pending_collisions (Phase 3b)
 //
 // ```ts
 // op_start(req: OpRequestDto, progress: Channel<OpEventDto>): Promise<number>
 // op_cancel(id: number): Promise<void>
+// op_collision_answer(id: number, dst: string, decision: "overwrite"|"skip"|"abort"): Promise<void>
+// op_pending_collisions(): Promise<Array<{ id: number, dst: string, kind: "file"|"dir"|"symlink"|"other" }>>
 // ```
 //
 // Delivery posture is the scan/watch pumps': the worker drains the engine and
@@ -359,6 +362,13 @@ fn watch_touches(changes: &ChangeSet, dir: &Path) -> bool {
 // every `Channel::send` result is discarded with a comment saying why. A busy
 // or gone frontend must not cancel a file operation midway — a dropped send
 // during a half-finished copy is exactly the case where the op keeps going.
+//
+// Phase 3b adds the one exception, and it is a deliberate one: `ask_collision`
+// blocks the worker until the user answers. It is the only place in this
+// codebase where a thread parks on a human, which is why it is bounded by
+// [`COLLISION_ANSWER_TIMEOUT`], interruptible by `op_cancel` within
+// [`COLLABORATIVE_WAIT`], and never entered at all unless the op is registered
+// and therefore answerable. See [`Answering`].
 // ---------------------------------------------------------------------------
 
 /// How often the op worker forwards engine progress to the frontend. The
@@ -366,6 +376,29 @@ fn watch_touches(changes: &ChangeSet, dir: &Path) -> bool {
 /// an op touches thousands of files (one engine emit per file) — without it a
 /// big tree would cost one `webview.eval` per file.
 const OP_FORWARD_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a paused op waits for one collision answer before giving up.
+///
+/// A blocking pause must be bounded. An op parked on a `collision` event is a
+/// blocked OS thread holding a file operation half-finished, and a frontend
+/// that never answers — a window that was closed mid-copy, a dialog that lost
+/// its job, a tab that reloaded — would otherwise pin that thread for the life
+/// of the process. Two minutes is long enough that a human who stepped away
+/// for a moment is not punished by a spurious failure, and short enough that
+/// the leak is bounded.
+///
+/// Expiry is reported as `Cancelled` with a distinct message, not as a
+/// collision: the answer never arrived, so there is nothing to report about
+/// the destination beyond "untouched". The partial destination is left in
+/// place, like every other cancel.
+const COLLISION_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the worker sleeps between checks on a paused rendezvous.
+///
+/// A `recv_timeout` cannot also watch a [`CancellationToken`], so the wait is
+/// sliced: this is the granularity of "a cancel interrupts the pause", and it
+/// is short enough to be imperceptible and long enough not to spin.
+const COLLABORATIVE_WAIT: Duration = Duration::from_millis(50);
 
 /// Starts a mutating operation (copy / move / trash / delete). Returns the
 /// backend-minted [`JobId`]; progress and exactly one terminal event (`done`
@@ -386,21 +419,23 @@ pub fn op_start<R: Runtime>(
 ) -> Result<JobId, CmdError> {
     let backend = app.state::<Backend>();
     let id = backend.mint();
-    let cancel = CancellationToken::new();
-    backend.register_op(
-        id,
-        Arc::new(OpJob {
-            cancel: cancel.clone(),
-            description: describe_op(&req),
-        }),
-    );
+    let job = Arc::new(OpJob::new(CancellationToken::new(), describe_op(&req)));
+    backend.register_op(id, Arc::clone(&job));
 
     // `spawn_blocking`, not `spawn`: the worker is synchronous blocking code
-    // and must not stall the async executor. `AppHandle` is `'static`, so
-    // state re-resolves inside for the completion cleanup — a no-op when
-    // `op_cancel` already ran.
+    // — it can now genuinely *block* on a human answer — and must not stall the
+    // async executor. `AppHandle` is `'static`, so state re-resolves inside for
+    // the completion cleanup — a no-op when `op_cancel` already ran.
     async_runtime::spawn_blocking(move || {
-        run_op_blocking(id, &req, &cancel, &progress);
+        run_op_job_blocking(
+            id,
+            &req,
+            &job,
+            &progress,
+            Answering::Open {
+                timeout: COLLISION_ANSWER_TIMEOUT,
+            },
+        );
         app.state::<Backend>().cancel_op(id);
     });
     Ok(id)
@@ -410,26 +445,129 @@ pub fn op_start<R: Runtime>(
 /// cleaned itself up, or the id never existed) — the same posture as
 /// `scan_cancel` and `watch_unsubscribe`. Never blocks: see
 /// [`Backend::cancel_op`].
+///
+/// This is also how a *paused* op is stopped: the worker watches
+/// [`OpJob::cancel`] between answer checks, so a cancel lands within
+/// [`COLLABORATIVE_WAIT`] even while the op is parked on a question. A pause
+/// that could not be cancelled would be a hang with no way out.
 #[tauri::command]
 pub fn op_cancel<R: Runtime>(app: AppHandle<R>, id: JobId) {
     app.state::<Backend>().cancel_op(id);
 }
 
+/// Answers the collision at `dst` for op `id`. `decision` is one of
+/// `"overwrite" | "skip" | "abort"` (frozen — see [`CollisionDecisionDto`]).
+///
+/// A **silent no-op** in every case where there is nothing to answer: an
+/// unknown or already-finished `id`, a `dst` this op is not (or is no longer)
+/// blocked on, and a repeat answer for a path already settled. That posture is
+/// the same as `scan_cancel` / `op_cancel` and it is load-bearing: the frontend
+/// legitimately races this command against its own teardown (a modal closing
+/// while the job is being cancelled) and against the backend's own timeout, and
+/// none of those races are errors.
+///
+/// Never blocks either. The worker has already taken the channel out of the
+/// registry by the time any send happens, so a second answer finds nothing and
+/// returns; the first send completes immediately because a rendezvous channel
+/// with an absent receiver fails rather than blocking.
+#[tauri::command]
+pub fn op_collision_answer<R: Runtime>(
+    app: AppHandle<R>,
+    id: JobId,
+    dst: String,
+    decision: CollisionDecisionDto,
+) {
+    app.state::<Backend>()
+        .answer_collision(id, Path::new(&dst), decision);
+}
+
+/// Every collision an in-flight op is currently blocked on, as
+/// `{ id, dst, kind }` rows.
+///
+/// The discovery half of the round-trip, and the reason the answer command is
+/// safe to be this dumb: a `collision` event is fire-and-forget over a
+/// `Channel`, so a frontend that mounted — or reloaded — while an op was paused
+/// never saw the question. It asks here instead, keys by `id`, and answers by
+/// `(id, dst)`.
+///
+/// An empty list is the normal answer: no op is paused. Order is unspecified
+/// and must not be relied on.
+///
+/// Cheap enough to call on any UI refresh: it walks the op registry and reads
+/// each paused path's kind, with no filesystem writes and no locks held across
+/// an `lstat`.
+#[tauri::command]
+pub fn op_pending_collisions<R: Runtime>(app: AppHandle<R>) -> Vec<PendingCollisionDto> {
+    app.state::<Backend>()
+        .pending_collisions()
+        .into_iter()
+        .map(|(id, dst)| {
+            let kind = CollisionKindDto::of(&dst);
+            PendingCollisionDto {
+                id,
+                dst: dst.to_string_lossy().into_owned(),
+                kind,
+            }
+        })
+        .collect()
+}
+
+/// Whether a paused collision can be answered by anyone.
+///
+/// This is not a hypothetical distinction: an op whose job is *not* registered
+/// with the [`Backend`] has no address an answer could be routed to, so asking
+/// it a question would park it until [`COLLISION_ANSWER_TIMEOUT`] for nothing.
+/// `Nobody` reports the collision as an `already_exists` error instead, which
+/// is the Phase 3a behaviour and remains correct for every collision this
+/// backend cannot ask about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answering {
+    /// No frontend can answer: never open a pause, fail the collision.
+    Nobody,
+    /// A frontend can answer: park for at most `timeout` waiting for it.
+    Open {
+        /// How long to wait for one answer before giving up on the op.
+        timeout: Duration,
+    },
+}
+
 /// Runs one op to exactly one terminal event (`done` or `error`) on `events`.
 ///
-/// This is the whole body of [`op_start`]'s worker, factored out so tests can
-/// drive it with a [`Channel`] recorder and no Tauri runtime — exactly like
-/// `pump_scan_loop`. Public so out-of-tree probes can exercise the same path
-/// the command spawns.
+/// This is the whole body of [`op_start`]'s worker with no answer channel, for
+/// callers that hold only a [`CancellationToken`] — a collision is reported as
+/// `already_exists` and the op fails, the Phase 3a behaviour. [`op_start`]
+/// itself goes through [`run_op_job_blocking`], which can ask.
+///
+/// Public so out-of-tree probes can exercise the same path the command spawns.
 pub fn run_op_blocking(
     id: JobId,
     req: &OpRequestDto,
     cancel: &CancellationToken,
     events: &Channel<OpEventDto>,
 ) {
+    let job = OpJob::new(cancel.clone(), String::new());
+    run_op_job_blocking(id, req, &job, events, Answering::Nobody);
+}
+
+/// [`run_op_blocking`] against a registered [`OpJob`], with the collision
+/// round-trip live. This is what [`op_start`]'s worker runs.
+///
+/// The job carries both the cancellation token and the pending-collision
+/// rendezvous registry, which is why it is passed whole: a pause can only be
+/// answerable if the job is addressable, and addressability is exactly what
+/// `register_op` established.
+pub fn run_op_job_blocking(
+    id: JobId,
+    req: &OpRequestDto,
+    job: &OpJob,
+    events: &Channel<OpEventDto>,
+    answering: Answering,
+) {
     match req {
-        OpRequestDto::Copy { src, dst } => run_copylike(id, src, dst, cancel, events, false),
-        OpRequestDto::Move { src, dst } => run_copylike(id, src, dst, cancel, events, true),
+        OpRequestDto::Copy { src, dst } => {
+            run_copylike(id, src, dst, job, events, false, answering)
+        }
+        OpRequestDto::Move { src, dst } => run_copylike(id, src, dst, job, events, true, answering),
         OpRequestDto::Trash { src } => match ops::trash(src) {
             Ok(()) => send_done(id, events, format!("trashed {}", short_name(src))),
             Err(e) => send_error(id, events, &e),
@@ -439,7 +577,7 @@ pub fn run_op_blocking(
                 let path = PathBuf::from(src);
                 let forward = Forwarder::new(events.clone(), id, OpPhase::Deleting, 0, 0);
                 let sink: ProgressSink = Arc::new(move |ev| forward.push(&ev));
-                match ops::delete_recursive_with_progress(&path, Some(cancel), Some(&sink)) {
+                match ops::delete_recursive_with_progress(&path, Some(&job.cancel), Some(&sink)) {
                     Ok(()) => send_done(id, events, format!("deleted {}", short_name(src))),
                     Err(e) => send_error(id, events, &e),
                 }
@@ -453,15 +591,43 @@ pub fn run_op_blocking(
     }
 }
 
-/// Shared body for copy and move: measure, then run, then one terminal event.
+/// Shared body for copy and move: measure once, then run, answering collisions
+/// as they come, to exactly one terminal event.
+///
+/// ## The retry loop
+///
+/// The engine has no notion of "ask the user": `Collision` is one value that
+/// applies to *every* colliding path in a call, which is why `copy(src, dst,
+/// Overwrite)` silently answers "overwrite this one and ask me about the next"
+/// for you — by clobbering the next one. [`ops::AnsweredCollisions`] is the
+/// engine's escape hatch, and this loop is the only correct way to drive it:
+///
+/// 1. run with [`Collision::Fail`] — still in effect — and the answers given so
+///    far,
+/// 2. on [`KestrelError::AlreadyExists`], ask about *that one path* and record
+///    the answer,
+/// 3. retry the whole call.
+///
+/// A settled path resolves from the answers map instead of raising, so each
+/// retry skips it and stops at the first path with no answer. `Collision::Fail`
+/// is never swapped for `Overwrite` on the whole call — that single line is
+/// the data-loss bug this mechanism exists to prevent, and it is the reason
+/// `AnsweredCollisions` exists at all.
+///
+/// A retry re-walks the source, so files copied before the collision are
+/// rewritten. That is redundant work, never lost work: an answered `skip` is
+/// never rewritten (the engine returns before touching the destination), and an
+/// answered `overwrite` is rewritten with the source's own bytes.
 fn run_copylike(
     id: JobId,
     src: &str,
     dst: &str,
-    cancel: &CancellationToken,
+    job: &OpJob,
     events: &Channel<OpEventDto>,
     is_move: bool,
+    answering: Answering,
 ) {
+    let cancel = &job.cancel;
     let src_path = PathBuf::from(src);
     let dst_path = PathBuf::from(dst);
     let Some((total_bytes, total_items)) = measure_source(&src_path, id, cancel, events) else {
@@ -476,25 +642,197 @@ fn run_copylike(
         total_items,
     );
     let sink: ProgressSink = Arc::new(move |ev| forward.push(&ev));
-    // Phase 3a has no collision dialog yet, so the policy is `Fail`: a
-    // collision surfaces as `AlreadyExists` and the op fails without writing.
-    // Phase 3b adds the question round-trip; nothing here changes shape for it.
-    let options = CopyOptions {
-        collision: Collision::Fail,
-        answered: ops::AnsweredCollisions::new(),
-        preserve_permissions: false,
-        cancel: Some(cancel.clone()),
-        progress: Some(sink),
-    };
     let verb = if is_move { "moved" } else { "copied" };
-    let result = if is_move {
-        ops::move_(&src_path, &dst_path, options, MoveStrategy::Auto)
-    } else {
-        ops::copy(&src_path, &dst_path, options)
+    let mut answered = ops::AnsweredCollisions::new();
+
+    loop {
+        if cancel.is_cancelled() {
+            send_error(id, events, &KestrelError::Cancelled);
+            return;
+        }
+        let options = CopyOptions {
+            // `Fail` always. See the loop's doc comment: this is the whole
+            // reason `AnsweredCollisions` exists.
+            collision: Collision::Fail,
+            answered: answered.clone(),
+            preserve_permissions: false,
+            cancel: Some(cancel.clone()),
+            progress: Some(Arc::clone(&sink)),
+        };
+        let result = if is_move {
+            ops::move_(&src_path, &dst_path, options, MoveStrategy::Auto)
+        } else {
+            ops::copy(&src_path, &dst_path, options)
+        };
+        match result {
+            Ok(()) => {
+                send_done(id, events, format!("{verb} {}", short_name(src)));
+                return;
+            }
+            Err(KestrelError::AlreadyExists { path }) => {
+                match ask_collision(id, &path, events, job, answering) {
+                    Ok(Some(decision)) => {
+                        // Only a real policy arrives here; `Abort` is an error.
+                        if let Some(collision) = decision.as_engine_collision() {
+                            answered.answer(path, collision);
+                        }
+                    }
+                    Ok(None) => {
+                        // Unanswerable (no channel): the Phase 3a shape, one
+                        // honest `already_exists`, no destination change.
+                        send_error(id, events, &KestrelError::AlreadyExists { path });
+                        return;
+                    }
+                    Err(e) => {
+                        send_error(id, events, &e);
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                send_error(id, events, &e);
+                return;
+            }
+        }
+    }
+}
+
+/// Emits a `collision` event for `path` and parks until the user answers it.
+///
+/// Four exits, and only four:
+///
+/// * `Ok(Some(Overwrite | Skip))` — a real policy answer. `Abort` never arrives
+///   here: it is a whole-op stop, not a policy, so it must not reach
+///   `AnsweredCollisions`.
+/// * `Ok(None)` — nobody can answer ([`Answering::Nobody`]). The caller reports
+///   it as `already_exists`, the Phase 3a shape.
+/// * `Err(Cancelled)` — `op_cancel` landed while paused, or the user answered
+///   `abort`.
+/// * `Err(InvalidInput)` — the deadline expired, or the channel was lost. The
+///   frontend's fault rather than the user's, so it is a failure with a path.
+///
+/// The rendezvous is one [`std::sync::mpsc::sync_channel`] per collision,
+/// registered in [`OpJob::pending`] **before** the event goes out, so an answer
+/// can never arrive before there is a channel to receive it — that race would
+/// otherwise make a fast frontend's first click a silent no-op and hang the op
+/// until the deadline.
+///
+/// The wait is sliced by [`COLLABORATIVE_WAIT`] rather than one long
+/// `recv_timeout`, because a `recv_timeout` cannot also observe a
+/// [`CancellationToken`]: without the slice, an `op_cancel` arriving during a
+/// pause would wait out the full deadline, and a pause you cannot cancel is a
+/// hang.
+fn ask_collision(
+    id: JobId,
+    path: &Path,
+    events: &Channel<OpEventDto>,
+    job: &OpJob,
+    answering: Answering,
+) -> Result<Option<CollisionDecisionDto>, KestrelError> {
+    let Answering::Open { timeout } = answering else {
+        return Ok(None);
     };
-    match result {
-        Ok(()) => send_done(id, events, format!("{verb} {}", short_name(src))),
-        Err(e) => send_error(id, events, &e),
+    // Registered first: the frontend's answer has to have somewhere to land.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let key = path.to_path_buf();
+    lock(&job.pending).insert(key.clone(), sender);
+
+    // The `kind` is read from the name, not its target, so a dangling symlink
+    // still reports as a `symlink` collision. It is read *before* the event so
+    // the two can never disagree.
+    let kind = CollisionKindDto::of(path);
+    let _ = events.send(OpEventDto::Collision {
+        id,
+        dst: path.to_string_lossy().into_owned(),
+        kind,
+    });
+
+    let deadline = Instant::now() + timeout;
+    let decision = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining.min(COLLABORATIVE_WAIT)) {
+            Ok(decision) => break decision,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The worker's own registry is the one the answer command looks
+                // in, so drop the entry on every non-answer exit: a paused op
+                // must never advertise a question nobody is waiting on.
+                if job.cancel.is_cancelled() {
+                    lock(&job.pending).remove(&key);
+                    return Err(KestrelError::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    lock(&job.pending).remove(&key);
+                    return Err(unanswered_error(
+                        path,
+                        format!(
+                            "no answer for the collision at {} within {:?}; \
+                             the operation was stopped and nothing there was \
+                             changed",
+                            path.display(),
+                            timeout,
+                        ),
+                    ));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The sender is gone without an answer. Only reachable if the
+                // registry entry was dropped underneath us, which is exactly as
+                // unfriendly to the caller as a missing answer: stop, change
+                // nothing.
+                lock(&job.pending).remove(&key);
+                return Err(unanswered_error(
+                    path,
+                    format!(
+                        "the collision at {} could no longer be answered; \
+                         the operation was stopped and nothing there was changed",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    };
+
+    // Settled: the question is over and must never be asked again.
+    lock(&job.pending).remove(&key);
+
+    if decision == CollisionDecisionDto::Abort {
+        // Stop the whole op. Whatever landed stays — an abort is the user
+        // changing their mind, and silently deleting a half-copied tree to
+        // tidy up is the opposite of what that means.
+        return Err(abort_error());
+    }
+    Ok(Some(decision))
+}
+
+/// A whole-op stop caused by an `abort` answer: reported as
+/// [`KestrelError::Cancelled`].
+///
+/// The user chose "stop" at the collision dialog, which *is* a cancellation,
+/// and the frontend settles a job to `cancelled` on exactly this kind
+/// (`ui/src/lib/ops.ts::isCancelKind`, with the comment "An abort answered at
+/// a collision arrives the same way"). Reporting an `abort` as a failure would
+/// raise an error dialog about something the user just asked for, and would
+/// leave the partial-destination note — the thing that matters here — behind a
+/// red banner.
+///
+/// The two ways a pause can end are deliberately *not* the same shape: a
+/// timeout is the backend giving up on a frontend that never answered, which is
+/// a genuine failure and goes through [`unanswered_error`]. "Nobody answered"
+/// and "the user said stop" are different facts and the user needs to be able
+/// to tell them apart after the fact.
+fn abort_error() -> KestrelError {
+    KestrelError::Cancelled
+}
+
+/// A whole-op stop because no answer ever arrived, or the channel was lost.
+///
+/// [`KestrelError::InvalidInput`] with the colliding path, so the frontend
+/// routes it to its failure path and the message can say which of the two
+/// happened.
+fn unanswered_error(path: &Path, reason: String) -> KestrelError {
+    KestrelError::InvalidInput {
+        path: path.to_path_buf(),
+        reason,
     }
 }
 
@@ -1257,6 +1595,872 @@ mod tests {
             .expect("lock")
     }
 
+    // ------------------------------------------------------------------
+    // op collision round-trip (Phase 3b)
+    // ------------------------------------------------------------------
+
+    /// The load-bearing test of the whole mechanism.
+    ///
+    /// A tree with **two** colliding files, answered `overwrite` then `skip`.
+    /// `AnsweredCollisions` exists precisely so that "overwrite this one and
+    /// ask me about the next" is expressible, and this is what proves the
+    /// backend actually does it: a blanket `Collision::Overwrite` retry would
+    /// also overwrite the second file, silently answering a question nobody
+    /// was asked.
+    ///
+    /// Asserted on the bytes, not on the absence of an error: a round-trip that
+    /// clobbered both files would still report `done`.
+    #[test]
+    fn two_collisions_are_answered_independently_overwrite_then_skip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        // Sorted order is what `copy_recursive` walks, so `a.txt` is asked
+        // about first and `b.txt` second. Do not rely on it in the assertions;
+        // rely on the recorded answers being applied to their own paths.
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::create_dir_all(&dst).expect("mkdir");
+        fs::write(src.join("a.txt"), b"NEW-a").expect("write");
+        fs::write(src.join("b.txt"), b"NEW-b").expect("write");
+        fs::write(dst.join("a.txt"), b"OLD-a").expect("write");
+        fs::write(dst.join("b.txt"), b"OLD-b").expect("write");
+
+        let backend = Arc::new(watch_backend());
+        // Question 0 is the destination *directory*: `dst` already exists, so
+        // the top-level check raises before any child is reached. Answering it
+        // `overwrite` is what makes it a merge — in the engine, an existing
+        // destination directory with a non-`Skip` policy is `create_dir` +
+        // recurse, never a replacement. Questions 1 and 2 are the two files.
+        let seen = run_op_answered(
+            &backend,
+            copy_req(&src, &dst),
+            &[("overwrite", 0), ("overwrite", 1), ("skip", 2)],
+        );
+
+        assert_eq!(
+            fs::read(dst.join("a.txt")).expect("read"),
+            b"NEW-a",
+            "the overwritten collision must carry the source's bytes"
+        );
+        assert_eq!(
+            fs::read(dst.join("b.txt")).expect("read"),
+            b"OLD-b",
+            "THE bug this mechanism exists to prevent: a blanket Overwrite \
+             retry silently answers the second collision too, destroying a \
+             file the user was never asked about. A `skip` answer must leave \
+             this byte-for-byte unchanged."
+        );
+        let (kind, _) = terminal(&seen);
+        assert_eq!(
+            kind, "done",
+            "every collision answered, so the op finished: {seen:?}"
+        );
+
+        // The directory question comes first and is a `dir` — you cannot get
+        // to a question about a folder's contents without having answered for
+        // the folder.
+        let asked: Vec<(&str, &str)> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("collision"))
+            .map(|v| {
+                (
+                    v["dst"].as_str().expect("dst"),
+                    v["kind"].as_str().expect("kind"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (dst.to_str().expect("utf-8 path"), "dir"),
+                (dst.join("a.txt").to_str().expect("utf-8 path"), "file"),
+                (dst.join("b.txt").to_str().expect("utf-8 path"), "file"),
+            ],
+            "one question per colliding path, in the order they are reached, \
+             and the directory is asked before its children: {seen:?}"
+        );
+    }
+
+    /// A `collision` event per distinct unrecorded path, never for a settled
+    /// one — and never twice for the same path, however many retries happen.
+    #[test]
+    fn a_collision_is_emitted_once_per_unrecorded_path_and_never_for_a_settled_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::create_dir_all(&dst).expect("mkdir");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.join(name), b"new").expect("write");
+            fs::write(dst.join(name), b"old").expect("write");
+        }
+
+        let backend = Arc::new(watch_backend());
+        let seen = run_op_answered(
+            &backend,
+            copy_req(&src, &dst),
+            // 0 = the destination directory (merge), 1..3 = the files.
+            &[("overwrite", 0), ("skip", 1), ("skip", 2), ("skip", 3)],
+        );
+
+        let asked: Vec<String> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("collision"))
+            .map(|v| v["dst"].as_str().expect("dst is a string").to_string())
+            .collect();
+        let mut unique = asked.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            asked.len(),
+            4,
+            "the destination directory plus three distinct files is four \
+             questions: {seen:?}"
+        );
+        assert_eq!(asked.len(), unique.len(), "no path asked twice: {seen:?}");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let path = dst.join(name);
+            assert!(
+                unique.contains(&path.to_string_lossy().into_owned()),
+                "expected a question for {}, asked {unique:?}",
+                path.display()
+            );
+            assert_eq!(
+                fs::read(&path).expect("read"),
+                b"old",
+                "every skip must leave the destination byte-for-byte intact"
+            );
+        }
+        let (kind, _) = terminal(&seen);
+        assert_eq!(kind, "done", "{seen:?}");
+    }
+
+    /// Answers carry `id`, an absolute `dst`, and a real kind, and the op
+    /// really is blocked while the question is outstanding.
+    #[test]
+    fn the_collision_event_names_the_path_and_kind_and_pauses_the_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src.txt");
+        let dst = tmp.path().join("dst.txt");
+        fs::write(&src, b"new bytes").expect("write");
+        fs::write(&dst, b"old bytes").expect("write");
+
+        let backend = Arc::new(watch_backend());
+        let seen = run_op_answered(&backend, copy_req(&src, &dst), &[("overwrite", 0)]);
+
+        let questions: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("collision"))
+            .collect();
+        assert_eq!(questions.len(), 1, "{seen:?}");
+        assert_eq!(questions[0]["id"], serde_json::json!(42));
+        assert_eq!(
+            questions[0]["dst"],
+            serde_json::json!(dst.to_string_lossy())
+        );
+        assert_eq!(questions[0]["kind"], serde_json::json!("file"));
+        assert_eq!(
+            fs::read(&dst).expect("read"),
+            b"new bytes",
+            "the answered overwrite must have landed"
+        );
+    }
+
+    /// The destination's kind is read from the name without following a final
+    /// symlink: a dangling link occupies a name, so it is a `symlink`
+    /// collision even though nothing it points at exists.
+    #[test]
+    fn a_dangling_symlink_destination_reports_kind_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src.txt");
+        let link = tmp.path().join("link.txt");
+        fs::write(&src, b"new bytes").expect("write");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).expect("link");
+
+        let backend = Arc::new(watch_backend());
+        let seen = run_op_answered(&backend, copy_req(&src, &link), &[("skip", 0)]);
+
+        let question = seen
+            .iter()
+            .find(|v| v["type"] == serde_json::json!("collision"))
+            .unwrap_or_else(|| panic!("expected a collision event: {seen:?}"));
+        assert_eq!(
+            question["kind"],
+            serde_json::json!("symlink"),
+            "a dangling link still occupies the name: {question}"
+        );
+    }
+
+    /// A paused op is discoverable from the registry, not only from the
+    /// `collision` event — a window that mounted (or reloaded) mid-pause never
+    /// saw the event and would otherwise have no way to show the dialog.
+    #[test]
+    fn a_paused_op_is_discoverable_and_stops_being_pending_once_answered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src.txt");
+        let dst = tmp.path().join("dst.txt");
+        fs::write(&src, b"new").expect("write");
+        fs::write(&dst, b"old").expect("write");
+
+        let backend = watch_backend();
+        // A job registered directly, so the registry can be inspected while the
+        // "worker" is still parked.
+        let job = Arc::new(OpJob::new(CancellationToken::new(), "test".to_string()));
+        backend.register_op(42, Arc::clone(&job));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        lock(&job.pending).insert(dst.clone(), tx);
+
+        let pending = backend.pending_collisions();
+        assert_eq!(
+            pending,
+            vec![(42, dst.clone())],
+            "a paused op must be visible in the registry"
+        );
+
+        // An answer for an unknown dst does not disturb the real one.
+        backend.answer_collision(42, Path::new("/nowhere/at/all"), decision("skip"));
+        assert_eq!(
+            backend.pending_collisions().len(),
+            1,
+            "unknown dst is a no-op"
+        );
+
+        backend.answer_collision(42, &dst, decision("overwrite"));
+        assert_eq!(
+            rx.try_recv().expect("the worker received the answer"),
+            decision("overwrite")
+        );
+        assert!(
+            backend.pending_collisions().is_empty(),
+            "an answered collision is no longer pending"
+        );
+    }
+
+    /// `op_collision_answer` for an unknown id, an unknown `dst`, and a
+    /// finished op are all silent no-ops: no error, no panic, and a real
+    /// sibling collision keeps waiting.
+    #[test]
+    fn answers_for_unknown_ids_paths_and_finished_ops_are_silent_no_ops() {
+        let backend = watch_backend();
+        let job = Arc::new(OpJob::new(CancellationToken::new(), "test".to_string()));
+        let dst = PathBuf::from("/tmp/pending.txt");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        lock(&job.pending).insert(dst.clone(), tx);
+        backend.register_op(42, Arc::clone(&job));
+
+        // Unknown id.
+        backend.answer_collision(9999, &dst, decision("overwrite"));
+        // Known id, unknown dst.
+        backend.answer_collision(42, Path::new("/some/other/path"), decision("overwrite"));
+        // A finished op: the job left the registry, exactly as
+        // `cancel_op`'s post-run cleanup removes it.
+        backend.cancel_op(42);
+        backend.answer_collision(42, &dst, decision("overwrite"));
+
+        // Nothing was consumed, and nothing panicked.
+        assert!(
+            rx.try_recv().is_err(),
+            "every one of those must be a no-op — the answer must not have \
+             reached a channel nobody registered"
+        );
+        assert!(backend.pending_collisions().is_empty(), "the op is gone");
+
+        // And the ultimate no-op: no job at all, and a repeat answer.
+        backend.answer_collision(u64::MAX, &dst, decision("abort"));
+        backend.answer_collision(42, &dst, decision("abort"));
+    }
+
+    /// Only the FIRST answer for a `dst` is delivered. A double-click on
+    /// "Overwrite", or an answer plus a stale re-answer from a dialog the
+    /// frontend failed to close, must not queue a second decision that the
+    /// next collision would then consume.
+    #[test]
+    fn a_second_answer_for_the_same_path_is_dropped() {
+        let backend = watch_backend();
+        let job = Arc::new(OpJob::new(CancellationToken::new(), "test".to_string()));
+        let dst = PathBuf::from("/tmp/pending.txt");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        lock(&job.pending).insert(dst.clone(), tx);
+        backend.register_op(42, Arc::clone(&job));
+
+        backend.answer_collision(42, &dst, decision("overwrite"));
+        backend.answer_collision(42, &dst, decision("abort"));
+
+        assert_eq!(rx.try_recv().expect("first answer"), decision("overwrite"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a repeat answer must not queue behind the first: a single \
+             rendezvous per collision, and a late answer is a no-op"
+        );
+    }
+
+    /// `abort` stops the WHOLE operation rather than skipping the file it was
+    /// asked about, and leaves whatever landed in place for the user.
+    ///
+    /// It settles as `cancelled`, not as a failure: see [`abort_error`]. The
+    /// test asserts the whole destination tree, because the alternative bug —
+    /// treating `abort` as "skip this one" — would still pass a check that
+    /// only looked at the file the question was about.
+    #[test]
+    fn abort_stops_the_whole_op_and_leaves_the_partial_destination() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::create_dir_all(&dst).expect("mkdir");
+        // `a.txt` copies cleanly first; `b.txt` is the question the user
+        // answers "abort" to.
+        fs::write(src.join("a.txt"), b"new-a").expect("write");
+        fs::write(src.join("b.txt"), b"new-b").expect("write");
+        fs::write(src.join("c.txt"), b"new-c").expect("write");
+        fs::write(dst.join("b.txt"), b"OLD-b").expect("write");
+
+        let backend = Arc::new(watch_backend());
+        // 0 = the destination directory (merged), 1 = the file the user
+        // aborts on.
+        let seen = run_op_answered(
+            &backend,
+            copy_req(&src, &dst),
+            &[("overwrite", 0), ("abort", 1)],
+        );
+
+        let (kind, terminal) = terminal(&seen);
+        assert_eq!(
+            kind, "error",
+            "abort is a terminal failure, not a silent success: {seen:?}"
+        );
+        assert_eq!(
+            terminal["error"]["kind"],
+            serde_json::json!("cancelled"),
+            "an `abort` the user chose must settle as `cancelled`, which is what \\
+             the frontend's isCancelKind recognises — reporting it as a failure \\
+             would raise an error dialog about something they just asked for: \\
+             {terminal}"
+        );
+        assert_eq!(
+            terminal["error"]["path"],
+            serde_json::Value::Null,
+            "KestrelError::Cancelled carries no path: {terminal}"
+        );
+        assert!(
+            !seen.iter().any(|v| v["type"] == serde_json::json!("done")),
+            "abort must never claim done: {seen:?}"
+        );
+        // The already-copied file stays — abort leaves the destination for the
+        // user to inspect, it never silently cleans up.
+        assert_eq!(
+            fs::read(dst.join("a.txt")).expect("read"),
+            b"new-a",
+            "work already done before the abort stays on disk for inspection"
+        );
+        assert_eq!(
+            fs::read(dst.join("b.txt")).expect("read"),
+            b"OLD-b",
+            "the aborted collision's destination is untouched"
+        );
+        assert!(
+            !dst.join("c.txt").exists(),
+            "the op stopped at the abort: nothing after it ran. Skipping one \
+             file and carrying on would have written c.txt."
+        );
+    }
+
+    /// Cancelling while the op is PAUSED (waiting for a human) must abort
+    /// promptly and report `cancelled` — a pause that cannot be cancelled is
+    /// a hang, and a hang here is an unkillable blocked task in the backend.
+    ///
+    /// The cancel comes from the [`OpJob`]'s own token, which is exactly what
+    /// `op_cancel` reaches through `Backend::cancel_op`, and the op is
+    /// registered so the pause is genuinely open. The bound asserted is
+    /// [`COLLABORATIVE_WAIT`], not the answer deadline: the whole point of the
+    /// sliced wait is that a cancel lands within one slice instead of parking
+    /// the op for the full timeout.
+    #[test]
+    fn cancelling_while_paused_for_an_answer_aborts_promptly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::create_dir_all(&dst).expect("mkdir");
+        fs::write(src.join("a.txt"), b"new-a").expect("write");
+        fs::write(dst.join("a.txt"), b"OLD-a").expect("write");
+
+        let backend = Arc::new(watch_backend());
+        let cancel = CancellationToken::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = op_recording_channel(&seen, || Ok(()));
+        let job = Arc::new(OpJob::new(cancel.clone(), "paused op".to_string()));
+        backend.register_op(TEST_OP_ID, Arc::clone(&job));
+        let req = copy_req(&src, &dst);
+        let colliding = dst.clone();
+        let worker = std::thread::spawn(move || {
+            run_op_job_blocking(
+                TEST_OP_ID,
+                &req,
+                &job,
+                &events,
+                Answering::Open {
+                    // Far longer than the cancel: a test that let the deadline
+                    // expire would pass this while the cancel did nothing.
+                    timeout: Duration::from_secs(300),
+                },
+            );
+        });
+
+        // Wait until the op is genuinely parked on a question, then cancel it
+        // the way `op_cancel` does — through the registry, no answer ever sent.
+        let paused = wait_until(Duration::from_secs(10), || {
+            seen.lock()
+                .expect("lock")
+                .iter()
+                .any(|v| v["type"] == serde_json::json!("collision"))
+        });
+        assert!(paused, "the op never reached its collision");
+        assert_eq!(
+            backend.pending_collisions(),
+            vec![(TEST_OP_ID, colliding.clone())],
+            "a paused op advertises exactly the question it is blocked on"
+        );
+        assert!(
+            colliding == dst,
+            "the pause is on the destination itself: `copy` checks the top \
+             level before recursing, so a merge into an existing directory \
+             asks about the directory first. Expected {dst:?}, got {colliding:?}"
+        );
+        let started = Instant::now();
+        // The real cancel path: `op_cancel` → `Backend::cancel_op`.
+        backend.cancel_op(TEST_OP_ID);
+
+        worker.join().expect("op worker joins");
+        assert!(
+            started.elapsed() < COLLABORATIVE_WAIT * 40,
+            "a cancel must interrupt the pause within a few wait slices, \
+             not at the answer deadline: took {:?}",
+            started.elapsed()
+        );
+        let seen = Arc::try_unwrap(seen)
+            .expect("seen")
+            .into_inner()
+            .expect("lock");
+        let (kind, terminal) = terminal(&seen);
+        assert_eq!(
+            kind, "error",
+            "a cancelled pause is a terminal error: {seen:?}"
+        );
+        assert_eq!(
+            terminal["error"]["kind"],
+            serde_json::json!("cancelled"),
+            "{terminal}"
+        );
+        assert_eq!(
+            terminal["error"]["path"],
+            serde_json::Value::Null,
+            "KestrelError::Cancelled carries no path: {terminal}"
+        );
+        assert_eq!(
+            fs::read(dst.join("a.txt")).expect("read"),
+            b"OLD-a",
+            "a cancelled pause leaves the partial destination in place, \
+             byte-for-byte as it was — consistent with every other cancel path"
+        );
+        assert!(
+            backend.pending_collisions().is_empty(),
+            "a cancelled pause must not leave a question advertised forever"
+        );
+    }
+
+    /// A frontend that never answers must not wedge the backend forever.
+    ///
+    /// The pause is bounded by [`COLLISION_ANSWER_TIMEOUT`]: when it expires
+    /// the op is abandoned with an honest `cancelled` terminal and the
+    /// partial destination is left for the user. Leaking a blocked task would
+    /// pin an OS thread per paused op for the lifetime of the process, and a
+    /// modal the user can walk away from is not a modal that blocks forever.
+    #[test]
+    fn a_frontend_that_never_answers_times_out_instead_of_wedging_the_backend() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::create_dir_all(&dst).expect("mkdir");
+        fs::write(src.join("a.txt"), b"new-a").expect("write");
+        fs::write(dst.join("a.txt"), b"OLD-a").expect("write");
+
+        let backend = Arc::new(watch_backend());
+        let started = Instant::now();
+        // No answers at all: the pause has to end on its own.
+        let seen = run_op_answered_with(
+            &backend,
+            copy_req(&src, &dst),
+            &[],
+            // Far below the production value: this test must not take two
+            // minutes to prove a timeout exists.
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the pause gave up after {elapsed:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|v| v["type"] == serde_json::json!("collision")),
+            "the op did reach a collision, so the timeout is what ended it: {seen:?}"
+        );
+        let (kind, terminal) = terminal(&seen);
+        assert_eq!(
+            kind, "error",
+            "an unanswered collision ends the op rather than parking it \
+             forever: {seen:?}"
+        );
+        assert_eq!(
+            terminal["error"]["kind"],
+            serde_json::json!("invalid_input"),
+            "a pause nobody answered is reported as a stop with a reason, not \
+             as a cancellation the user asked for: {terminal}"
+        );
+        assert!(
+            terminal["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no answer")),
+            "the message must say the question went unanswered: {terminal}"
+        );
+        assert_eq!(
+            fs::read(dst.join("a.txt")).expect("read"),
+            b"OLD-a",
+            "the destination is untouched, and left for the user"
+        );
+        assert!(
+            backend.pending_collisions().is_empty(),
+            "an abandoned pause must leave nothing advertised in the registry"
+        );
+    }
+
+    /// A retry must not re-prompt for, or re-copy over, a path that was already
+    /// settled — and must not lose the answers already given.
+    ///
+    /// The engine re-walks the source on every retry, so "do not duplicate
+    /// work" is a claim about the *settled* paths: a `skip` must keep its
+    /// answer (never asked again, never written), and an `overwrite` must be
+    /// written once and stay written.
+    #[test]
+    fn a_retry_keeps_earlier_answers_and_does_not_re_touch_settled_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::create_dir_all(&dst).expect("mkdir");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.join(name), b"new").expect("write");
+            fs::write(dst.join(name), b"old").expect("write");
+        }
+        // A distinct mtime marker on the skipped path, so "was re-copied" is
+        // answerable from the filesystem and not just from the bytes.
+        let skip_path = dst.join("b.txt");
+        let marker = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        set_mtime(&skip_path, marker);
+
+        let backend = Arc::new(watch_backend());
+        let seen = run_op_answered(
+            &backend,
+            copy_req(&src, &dst),
+            // 0 = the destination directory, then the three files.
+            &[
+                ("overwrite", 0),
+                ("overwrite", 1),
+                ("skip", 2),
+                ("overwrite", 3),
+            ],
+        );
+
+        let asked: Vec<String> = seen
+            .iter()
+            .filter(|v| v["type"] == serde_json::json!("collision"))
+            .map(|v| v["dst"].as_str().expect("dst").to_string())
+            .collect();
+        assert_eq!(
+            asked.len(),
+            4,
+            "each unrecorded path is asked once: {seen:?}"
+        );
+        assert!(
+            asked.contains(&skip_path.to_string_lossy().into_owned()),
+            "the skipped path must have been asked about: {asked:?}"
+        );
+        assert_eq!(
+            fs::metadata(&skip_path)
+                .expect("stat")
+                .modified()
+                .expect("mtime"),
+            marker,
+            "a settled `skip` must never be re-copied on a later retry — the \
+             answer survives the retry, it is not re-derived"
+        );
+        assert_eq!(fs::read(&skip_path).expect("read"), b"old");
+        assert_eq!(fs::read(dst.join("a.txt")).expect("read"), b"new");
+        assert_eq!(fs::read(dst.join("c.txt")).expect("read"), b"new");
+        let (kind, _) = terminal(&seen);
+        assert_eq!(kind, "done", "{seen:?}");
+    }
+
+    /// Move honours the same round-trip: an answered `overwrite` replaces the
+    /// destination, an answered `skip` leaves both sides exactly as they were.
+    ///
+    /// Two *separate* ops, because a move of a directory onto an existing
+    /// non-empty directory has no merge semantics in the engine at all:
+    /// `move_` checks the top level, answers with `fs::rename`, and `rename`
+    /// refuses a non-empty destination directory with `ENOTEMPTY` — so there
+    /// is no second question to ask, only one error. That is pre-existing
+    /// engine behaviour, not something this seam introduces or should paper
+    /// over. Single files are the case the round-trip is actually for.
+    #[test]
+    fn a_move_answers_collisions_the_same_way_a_copy_does() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::create_dir_all(&dst).expect("mkdir");
+
+        let move_of = |name: &str| OpRequestDto::Move {
+            src: src.join(name).to_string_lossy().into_owned(),
+            dst: dst.join(name).to_string_lossy().into_owned(),
+        };
+
+        // Answered `overwrite`: the destination is replaced and the source is
+        // gone — the move happened.
+        fs::write(src.join("a.txt"), b"new-a").expect("write");
+        fs::write(dst.join("a.txt"), b"OLD-a").expect("write");
+        let backend = Arc::new(watch_backend());
+        let moved = run_op_answered(&backend, move_of("a.txt"), &[("overwrite", 0)]);
+        assert_eq!(fs::read(dst.join("a.txt")).expect("read"), b"new-a");
+        assert!(
+            !src.join("a.txt").exists(),
+            "the source was moved, not copied"
+        );
+        assert_eq!(terminal(&moved).0, "done", "{moved:?}");
+
+        // Answered `skip`: neither side moved.
+        let backend = Arc::new(watch_backend());
+        fs::write(src.join("b.txt"), b"new-b").expect("write");
+        fs::write(dst.join("b.txt"), b"OLD-b").expect("write");
+        let skipped = run_op_answered(&backend, move_of("b.txt"), &[("skip", 0)]);
+        assert_eq!(
+            fs::read(dst.join("b.txt")).expect("read"),
+            b"OLD-b",
+            "a skipped move leaves the destination alone"
+        );
+        assert!(
+            src.join("b.txt").exists(),
+            "a skipped collision must not delete the source — that is how a \
+             cross-device move-then-delete loses data"
+        );
+        assert_eq!(terminal(&skipped).0, "done", "{skipped:?}");
+    }
+
+    /// The wire bytes of the new variant, pinned exactly like the golden
+    /// fixture pins the 3a ones.
+    #[test]
+    fn collision_event_bytes_are_frozen() {
+        let cases: [(&str, OpEventDto, &str); 4] = [
+            (
+                "file",
+                OpEventDto::Collision {
+                    id: 7,
+                    dst: "/home/u/dst.txt".to_string(),
+                    kind: crate::dto::CollisionKindDto::File,
+                },
+                r#"{"type":"collision","id":7,"dst":"/home/u/dst.txt","kind":"file"}"#,
+            ),
+            (
+                "dir",
+                OpEventDto::Collision {
+                    id: 8,
+                    dst: "/home/u/dst".to_string(),
+                    kind: crate::dto::CollisionKindDto::Dir,
+                },
+                r#"{"type":"collision","id":8,"dst":"/home/u/dst","kind":"dir"}"#,
+            ),
+            (
+                "symlink",
+                OpEventDto::Collision {
+                    id: 9,
+                    dst: "/home/u/link".to_string(),
+                    kind: crate::dto::CollisionKindDto::Symlink,
+                },
+                r#"{"type":"collision","id":9,"dst":"/home/u/link","kind":"symlink"}"#,
+            ),
+            (
+                "other",
+                OpEventDto::Collision {
+                    id: 10,
+                    dst: "/home/u/fifo".to_string(),
+                    kind: crate::dto::CollisionKindDto::Other,
+                },
+                r#"{"type":"collision","id":10,"dst":"/home/u/fifo","kind":"other"}"#,
+            ),
+        ];
+        for (name, dto, want) in cases {
+            assert_eq!(
+                serde_json::to_string(&dto).expect("serializes"),
+                want,
+                "the collision wire bytes changed for {name}: the frontend \
+                 normaliser reads this exact text"
+            );
+        }
+    }
+
+    /// The three decisions round-trip from the frozen wire strings, and
+    /// anything else is rejected rather than guessed.
+    #[test]
+    fn collision_decisions_parse_from_the_frozen_strings_only() {
+        for (wire, want) in [
+            ("\"overwrite\"", CollisionDecisionDto::Overwrite),
+            ("\"skip\"", CollisionDecisionDto::Skip),
+            ("\"abort\"", CollisionDecisionDto::Abort),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<CollisionDecisionDto>(wire).expect(wire),
+                want
+            );
+        }
+        for bad in ["\"replace\"", "\"Overwrite\"", "\"\"", "null", "7"] {
+            assert!(
+                serde_json::from_str::<CollisionDecisionDto>(bad).is_err(),
+                "{bad} must not parse: an unrecognised answer is refused at \
+                 the boundary, never guessed into a clobber"
+            );
+        }
+    }
+
+    /// The load-bearing one: drives the real worker with a real [`Channel`] and
+    /// a real [`Backend`] answering each question through
+    /// [`Backend::answer_collision`] — the whole round-trip, not a mock of it.
+    ///
+    /// `answers` is `(decision, nth_question)`: the nth `collision` event
+    /// (0-based, in arrival order) is answered with `decision`. Answering goes
+    /// by `(id, dst)` through the registry exactly as the IPC command does, so a
+    /// test cannot accidentally pass by wiring the answer straight into the
+    /// worker.
+    fn run_op_answered(
+        backend: &Arc<Backend>,
+        req: OpRequestDto,
+        answers: &[(&str, usize)],
+    ) -> Vec<serde_json::Value> {
+        run_op_answered_with(backend, req, answers, COLLISION_ANSWER_TIMEOUT)
+    }
+
+    /// [`run_op_answered`] with an explicit pause budget, for the timeout test.
+    fn run_op_answered_with(
+        backend: &Arc<Backend>,
+        req: OpRequestDto,
+        answers: &[(&str, usize)],
+        answer_timeout: Duration,
+    ) -> Vec<serde_json::Value> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = op_recording_channel(&seen, || Ok(()));
+        let job = Arc::new(OpJob::new(CancellationToken::new(), "test op".to_string()));
+        backend.register_op(TEST_OP_ID, Arc::clone(&job));
+
+        // A second thread stands in for the frontend: it watches the recorded
+        // stream, and when the nth question appears it answers through the
+        // backend exactly as `op_collision_answer` does.
+        let scripted: Vec<(usize, CollisionDecisionDto)> = answers
+            .iter()
+            .map(|(wire, nth)| (*nth, decision(wire)))
+            .collect();
+        let count = scripted.len();
+        let responder_seen = Arc::clone(&seen);
+        let responder_backend = Arc::clone(backend);
+        let responder = std::thread::spawn(move || {
+            for nth in 0..count {
+                let Some(dst) = wait_for_collision(&responder_seen, nth, Duration::from_secs(20))
+                else {
+                    return;
+                };
+                let Some((_, d)) = scripted.iter().find(|(n, _)| *n == nth) else {
+                    return;
+                };
+                responder_backend.answer_collision(TEST_OP_ID, Path::new(&dst), *d);
+            }
+        });
+
+        run_op_job_blocking(
+            TEST_OP_ID,
+            &req,
+            &job,
+            &events,
+            Answering::Open {
+                timeout: answer_timeout,
+            },
+        );
+        drop(events);
+        responder.join().expect("responder joins");
+
+        Arc::try_unwrap(seen)
+            .expect("seen")
+            .into_inner()
+            .expect("lock")
+    }
+
+    /// The job id every collision test uses; ids are minted by the backend in
+    /// production, but the round-trip is keyed on whatever id is registered.
+    const TEST_OP_ID: JobId = 42;
+
+    /// A frozen wire *value* (`"overwrite"`, without the quotes a caller would
+    /// have to escape) as the parsed decision.
+    fn decision(wire: &str) -> CollisionDecisionDto {
+        serde_json::from_str(&format!("\"{wire}\"")).expect("a frozen decision string")
+    }
+
+    /// Waits for the `nth` (0-based) `collision` event in the stream and
+    /// returns its `dst`. `None` if it never arrives.
+    fn wait_for_collision(
+        seen: &Arc<Mutex<Vec<serde_json::Value>>>,
+        nth: usize,
+        within: Duration,
+    ) -> Option<String> {
+        let started = Instant::now();
+        loop {
+            {
+                let guard = lock(seen);
+                let asked: Vec<&serde_json::Value> = guard
+                    .iter()
+                    .filter(|v| v["type"] == serde_json::json!("collision"))
+                    .collect();
+                if let Some(v) = asked.get(nth) {
+                    return Some(v["dst"].as_str().expect("dst is a string").to_string());
+                }
+            }
+            if started.elapsed() > within {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_until(within: Duration, mut ready: impl FnMut() -> bool) -> bool {
+        let started = Instant::now();
+        while started.elapsed() <= within {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// Sets a file's mtime, so "was this file re-copied" is a question the
+    /// filesystem can answer.
+    fn set_mtime(path: &Path, to: std::time::SystemTime) {
+        let times = std::fs::FileTimes::new().set_modified(to);
+        std::fs::File::open(path)
+            .expect("open")
+            .set_times(times)
+            .expect("set mtime");
+    }
+
     /// The one terminal event of a stream, with its kind.
     fn terminal(seen: &[serde_json::Value]) -> (&str, serde_json::Value) {
         let terminals: Vec<&serde_json::Value> = seen
@@ -1331,13 +2535,8 @@ mod tests {
     /// silent no-op, matching `scan_cancel` / `watch_unsubscribe`.
     #[test]
     fn op_ids_are_unique_and_cancel_is_race_safe() {
-        let backend = watch_backend();
-        let new_job = || {
-            Arc::new(OpJob {
-                cancel: CancellationToken::new(),
-                description: "test op".to_string(),
-            })
-        };
+        let backend = Arc::new(watch_backend());
+        let new_job = || Arc::new(OpJob::new(CancellationToken::new(), "test op".to_string()));
         let a = backend.mint();
         let b = backend.mint();
         assert_ne!(a, b, "minted op ids must be unique");

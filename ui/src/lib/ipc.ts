@@ -9,6 +9,9 @@
  *   scan_cancel(id: JobId) -> ()
  *   stat(path: string) -> FileEntryDto
  *   open_path(path: string) -> { entered_dir: boolean }
+ *   op_start(req: OpRequestDto, events: Channel<OpEventDto>) -> JobId (u64)
+ *   op_cancel(id: JobId) -> ()
+ *   op_collision_answer(id: JobId, dst: string, decision: Decision) -> ()   [3b]
  *
  * Backpressure (MIGRATION.md §3, load-bearing): the backend pump task drains
  * with try_recv and never blocks on the frontend. Our side of that deal is
@@ -20,6 +23,8 @@
 
 import type {
   CmdError,
+  CollisionDecision,
+  CollisionKindDto,
   FileEntryDto,
   JobId,
   OpenPathResult,
@@ -35,6 +40,25 @@ import type {
 export type ScanEventHandler = (event: ScanEventDto) => void;
 export type WatchEventHandler = (event: WatchEventDto) => void;
 export type OpEventHandler = (event: OpEventDto) => void;
+
+/** One answered collision, for the mock's introspection list. */
+export interface CollisionAnswer {
+  id: JobId;
+  dst: string;
+  decision: CollisionDecision;
+}
+
+/** Mock-side state for one in-flight op. See `MockIpc.opJobs`. */
+interface MockOpJob {
+  timers: number[];
+  cancelled: boolean;
+  /** Set while the mock is blocked awaiting an answer for exactly one dst. */
+  pending: { dst: string; kind: CollisionKindDto } | null;
+  /** Runs when the pending collision is answered; null when not parked. */
+  resume: ((decision: CollisionDecision) => void) | null;
+  req: OpRequestDto;
+  onEvent: OpEventHandler;
+}
 
 export interface KestrelIpc {
   readonly backend: "tauri" | "mock";
@@ -56,6 +80,31 @@ export interface KestrelIpc {
   /** Frozen Phase 3a contract: cancel an op. Never rejects. The engine
    * leaves a partial destination behind on cancel by design. */
   opCancel(id: JobId): Promise<void>;
+  /** Frozen Phase 3b contract: every collision an in-flight op is currently
+   *  blocked on, as `{id, dst, kind}` rows. The RESYNCHRONISATION point: a
+   *  `collision` event is fire-and-forget over a Channel, so a UI that mounted
+   *  or reloaded while an op was paused never saw the question and has no other
+   *  way to learn one is waiting. Empty is the normal answer.
+   *
+   *  Added because the Rust command of this name exists; it is optional in the
+   *  interface sense only in that an older backend simply has no rows to
+   *  report. Never rejects: a missing command is "nothing pending". */
+  opPendingCollisions(): Promise<Array<{
+    id: JobId;
+    dst: string;
+    kind: CollisionKindDto;
+  }>>;
+  /** Frozen Phase 3b contract: settle ONE colliding destination.
+   *
+   * `dst` is not decoration. The engine keys `AnsweredCollisions` by path, so
+   * answering the wrong `dst` leaves the real one blocking forever. Rejects
+   * only if the command itself is missing; the caller treats that as fatal to
+   * the dialog but not to the op. */
+  opCollisionAnswer(
+    id: JobId,
+    dst: string,
+    decision: CollisionDecision
+  ): Promise<void>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -239,16 +288,27 @@ function stringsOf(raw: unknown[]): string[] {
 }
 
 /**
- * Op wire form (frozen Phase 3a contract, internally tagged with "type",
+ * Op wire form (frozen Phase 3a/3b contract, internally tagged with "type",
  * matching the scan/watch normalisers):
  *   {"type":"progress",id,phase,doneBytes,totalBytes,doneItems,totalItems} |
  *   {"type":"done",id,summary} |
  *   {"type":"error",id,error:{kind,path,message}} (nested, like watch) —
- *   a flat error shape is also accepted via normalizeError.
+ *   a flat error shape is also accepted via normalizeError |
+ *   {"type":"collision",id,dst,kind} (Phase 3b)
  * `type` and `phase` match case-insensitively; `phase` falls back to
  * "copying" when the backend sends an unknown value rather than dropping
  * the event. Numbers that arrive missing/not-a-number become 0 (an unknown
  * total renders as indeterminate — never a guessed percentage).
+ *
+ * `collision` is the one variant that REQUIRES a field: a collision with no
+ * `dst` string is dropped (returns null) rather than surfaced with an empty
+ * destination. That is deliberate and load-bearing. `op_collision_answer` is
+ * keyed by (id, dst); showing a dialog for a path we cannot name produces an
+ * answer that settles nothing, the engine stays blocked, and the UI would be
+ * showing a choice that does nothing. Dropping the event keeps the frozen
+ * 3a behaviour — the op ends with `already_exists` and nothing is overwritten.
+ * `kind` degrades to "other" rather than dropping the event: the kind only
+ * chooses the wording, never whether the answer can be routed.
  */
 export function normalizeOpEvent(raw: unknown): OpEventDto | null {
   if (!raw || typeof raw !== "object") return null;
@@ -271,11 +331,33 @@ export function normalizeOpEvent(raw: unknown): OpEventDto | null {
     const s = obj["summary"];
     return { type: "done", id, summary: typeof s === "string" ? s : "" };
   }
+  if (t === "collision") {
+    const dst = obj["dst"];
+    // The one hard requirement. See the note above.
+    if (typeof dst !== "string" || dst === "") return null;
+    return {
+      type: "collision",
+      id,
+      dst,
+      kind: canonicalCollisionKind(obj["kind"]),
+    };
+  }
   if (t === "error") {
     const error = normalizeError(obj);
     return error ? { type: "error", id, error } : null;
   }
   return null;
+}
+
+/** `kind` on the wire is lowercase in the frozen contract; accept the
+ *  capitalised spellings the mock path uses and the ones a Rust `Kind` enum
+ *  might serialise, and fall back to "other" rather than dropping the event. */
+function canonicalCollisionKind(raw: unknown): CollisionKindDto {
+  const k = typeof raw === "string" ? raw.toLowerCase().split("_").join("") : "";
+  if (k === "file") return "file";
+  if (k === "dir" || k === "directory") return "dir";
+  if (k === "symlink" || k === "link") return "symlink";
+  return "other";
 }
 
 function numOf(v: unknown): number {
@@ -389,6 +471,62 @@ class TauriIpc implements KestrelIpc {
     const { invoke } = await this.load();
     await invoke("op_cancel", { id });
   }
+
+  async opCollisionAnswer(
+    id: JobId,
+    dst: string,
+    decision: CollisionDecision
+  ): Promise<void> {
+    const { invoke } = await this.load();
+    // Argument keys must match the Rust parameter names exactly (commands.rs
+    // `op_collision_answer(app, id, dst, decision)`). `dst` travels with `id`
+    // because the engine's `AnsweredCollisions` map is keyed by destination
+    // path — an answer without it could not be matched to the collision it
+    // settles. The decision is sent as the frozen lowercase wire string.
+    await invoke("op_collision_answer", { id, dst, decision });
+  }
+
+  async opPendingCollisions(): Promise<
+    Array<{ id: JobId; dst: string; kind: CollisionKindDto }>
+  > {
+    const { invoke } = await this.load();
+    try {
+      const raw = await invoke<unknown>("op_pending_collisions");
+      return normalizePendingCollisions(raw);
+    } catch {
+      // A backend without the command has nothing to report. An empty list is
+      // the documented normal answer, so a failure here must not be an error
+      // the UI has to explain.
+      return [];
+    }
+  }
+}
+
+/**
+ * Pending-collision rows straight off the wire. Same tolerance as the other
+ * normalisers: a row without a `dst` is dropped, because a question we cannot
+ * name is one we cannot answer (the same rule as `normalizeOpEvent`'s
+ * collision branch, and for the same reason).
+ */
+export function normalizePendingCollisions(raw: unknown): Array<{
+  id: JobId;
+  dst: string;
+  kind: CollisionKindDto;
+}> {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ id: JobId; dst: string; kind: CollisionKindDto }> = [];
+  for (let i = 0; i < raw.length; i++) {
+    const row = raw[i] as Record<string, unknown> | null;
+    if (!row || typeof row !== "object") continue;
+    const dst = row["dst"];
+    if (typeof dst !== "string" || dst === "") continue;
+    out.push({
+      id: numOf(row["id"]),
+      dst,
+      kind: canonicalCollisionKind(row["kind"]),
+    });
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -509,32 +647,52 @@ class MockIpc implements KestrelIpc {
     this.watches.delete(id);
   }
 
-  /* ---- Phase 3a mock ops: progress stream, cancel, AlreadyExists ---- */
+/* ---- Mock ops: progress stream, cancel, and the 3b collision handshake ---- */
 
-  private opJobs = new Map<
-    JobId,
-    { timers: number[]; cancelled: boolean }
-  >();
+  /**
+   * A live mock op. `pending`/`resume` are the collision handshake: the mock
+   * parks with `pending` set and `resume` waiting, and `op_collision_answer`
+   * is the only thing that lets the stream continue. That is what makes the
+   * "sequential, not batched" rule testable — a second collision parks again
+   * rather than inheriting the first answer.
+   */
+  private opJobs = new Map<JobId, MockOpJob>();
+  /** Every answer the mock was asked to settle. Introspection only. */
+  private answerLog: CollisionAnswer[] = [];
 
   /**
    * Mock `op_start`: streams a realistic event sequence without a backend —
    * `measuring` progress events with `totalBytes: 0` (unknown total, must
    * render indeterminate), then `copying`/`deleting` progress with a real
-   * total, then `done`. A `copy`/`move` whose destination basename collides
-   * with a mock listing name fails with `AlreadyExists`, mirroring the 3a
-   * contract (no collision event — an error, destination untouched).
-   * Cancel stops the timers; the op controller settles the job locally
-   * (the engine leaves a partial destination behind by design, and the UI
-   * says so) — the whole cancel path is exercisable standalone.
+   * total, then `done`.
    *
-   * Dev-only `?opslow=1` stretches every delay 8× so the measuring window
-   * (normally ~200 ms) is wide enough to screenshot headlessly. Mock only;
-   * zero production impact.
+   * A `copy`/`move` whose destination basename collides with a mock listing
+   * name BLOCKS: it emits a `collision` event and parks until
+   * `op_collision_answer` names that exact `dst`. `skip` and `overwrite` both
+   * resume the stream (the mock honours exactly the one path it was asked
+   * about and does not model the rest of the engine's `AnsweredCollisions`
+   * map); `abort` ends the op with a terminal `cancelled` error.
+   *
+   * The 3a `already_exists` policy is deliberately not simulated here: under
+   * 3b the engine asks rather than fails, and the seam suite still drives the
+   * real `already_exists` bytes through the real normalizer and the real
+   * OpManager, so that path stays covered.
+   *
+   * Dev-only `?opslow=1` stretches every delay 8× so the measuring and
+   * collision windows are wide enough to observe. Mock only; zero production
+   * impact.
    */
   async opStart(req: OpRequestDto, onEvent: OpEventHandler): Promise<JobId> {
     const id = this.nextId++;
     const slow = mockOpSlow() ? 8 : 1;
-    const job = { timers: [] as number[], cancelled: false };
+    const job: MockOpJob = {
+      timers: [],
+      cancelled: false,
+      pending: null,
+      resume: null,
+      req,
+      onEvent,
+    };
     this.opJobs.set(id, job);
     const later = (ms: number, fn: () => void): void => {
       const t = setTimeout(() => {
@@ -542,83 +700,198 @@ class MockIpc implements KestrelIpc {
       }, ms * slow) as unknown as number;
       job.timers.push(t);
     };
-    if (
-      (req.op === "copy" || req.op === "move") &&
-      mockCollides(req.dst)
-    ) {
-      later(150, () => {
-        onEvent({
-          type: "error",
-          id,
-          // Backend-exact kind (dto.rs, frozen snake_case): the UI matches
-          // it case- and underscore-insensitively.
-          error: {
-            kind: "already_exists",
-            path: req.dst,
-            message:
-              "Destination already exists (mock): " + req.dst,
-          },
-        });
-        this.opJobs.delete(id);
-      });
-      return id;
-    }
-    const phase = req.op === "delete" || req.op === "trash" ? "deleting" : "copying";
-    const totalBytes = 8 * 1048576;
-    const totalItems = 24;
-    // Measuring window: no total yet (totalBytes 0) — the UI must show an
-    // indeterminate state here, not a guessed percentage.
-    later(60, () =>
-      onEvent({
-        type: "progress",
-        id,
-        phase: "measuring",
-        doneBytes: 0,
-        totalBytes: 0,
-        doneItems: 0,
-        totalItems: 0,
-      })
-    );
-    later(220, () =>
-      onEvent({
-        type: "progress",
-        id,
-        phase: "measuring",
-        doneBytes: 0,
-        totalBytes: 0,
-        doneItems: 3,
-        totalItems: 0,
-      })
-    );
-    // Measured phase: monotonic progress toward a real total.
-    for (let step = 1; step <= 8; step++) {
-      const s = step;
-      later(220 + s * 160, () =>
-        onEvent({
+
+    /** Emit progress up to `done`, then the terminal `done` event. */
+    const stream = (): void => {
+      const phase =
+        req.op === "delete" || req.op === "trash" ? "deleting" : "copying";
+      const totalBytes = 8 * 1048576;
+      const totalItems = 24;
+      // Measuring window: no total yet (totalBytes 0) — the UI must show an
+      // indeterminate state here, not a guessed percentage.
+      later(60, () =>
+        job.onEvent({
           type: "progress",
           id,
-          phase: phase as "copying" | "deleting",
-          doneBytes: Math.floor((totalBytes * s) / 8),
-          totalBytes,
-          doneItems: Math.floor((totalItems * s) / 8),
-          totalItems,
+          phase: "measuring",
+          doneBytes: 0,
+          totalBytes: 0,
+          doneItems: 0,
+          totalItems: 0,
         })
       );
+      later(220, () =>
+        job.onEvent({
+          type: "progress",
+          id,
+          phase: "measuring",
+          doneBytes: 0,
+          totalBytes: 0,
+          doneItems: 3,
+          totalItems: 0,
+        })
+      );
+      // Measured phase: monotonic progress toward a real total.
+      for (let step = 1; step <= 8; step++) {
+        const s = step;
+        later(220 + s * 160, () =>
+          job.onEvent({
+            type: "progress",
+            id,
+            phase: phase as "copying" | "deleting",
+            doneBytes: Math.floor((totalBytes * s) / 8),
+            totalBytes,
+            doneItems: Math.floor((totalItems * s) / 8),
+            totalItems,
+          })
+        );
+      }
+      later(220 + 9 * 160, () => {
+        job.onEvent({ type: "done", id, summary: mockSummary(req) });
+        this.opJobs.delete(id);
+      });
+    };
+
+    if ((req.op === "copy" || req.op === "move") && mockCollides(req.dst)) {
+      later(150, () =>
+        this.parkOnCollision(id, req.dst, "file", (decision) => {
+          if (decision === "abort") {
+            // The engine unblocks and reports the abort terminally, exactly as
+            // it reports a user cancel: one `cancelled` error per op.
+            job.onEvent({
+              type: "error",
+              id,
+              error: {
+                kind: "cancelled",
+                path: req.dst,
+                message: "aborted at a collision on " + req.dst + " (mock)",
+              },
+            });
+            this.opJobs.delete(id);
+            return;
+          }
+          stream();
+        })
+      );
+      return id;
     }
-    later(220 + 9 * 160, () => {
-      onEvent({ type: "done", id, summary: mockSummary(req) });
-      this.opJobs.delete(id);
-    });
+    stream();
     return id;
   }
 
-  /** Mock `op_cancel`: stop the stream, report the by-design partial. */
+  /** Mock `op_cancel`: stop the stream, report the by-design partial.
+   *  A parked mock is blocked inside the collision handshake, so cancel has to
+   *  release it — otherwise the op would hang with no terminal event. */
   async opCancel(id: JobId): Promise<void> {
     const job = this.opJobs.get(id);
     if (!job || job.cancelled) return;
     job.cancelled = true;
+    const resume = job.resume;
+    job.pending = null;
+    job.resume = null;
+    if (resume) resume("abort");
     for (let i = 0; i < job.timers.length; i++) clearTimeout(job.timers[i]);
     this.opJobs.delete(id);
+  }
+
+  /**
+   * Mock `op_collision_answer`: settle exactly one parked collision.
+   *
+   * Every way this can be wrong is dropped rather than guessed:
+   *   * no such job (the op already settled),
+   *   * nothing parked (the answer arrived late, or the same one twice),
+   *   * a `dst` that is not the parked one — the engine keys its answers by
+   *     destination path, so an answer naming another path settles nothing,
+   *     and applying it anyway would be the data-loss bug this seam exists to
+   *     prevent,
+   *   * the job was cancelled.
+   */
+  async opCollisionAnswer(
+    id: JobId,
+    dst: string,
+    decision: CollisionDecision
+  ): Promise<void> {
+    this.answerLog.push({ id, dst, decision });
+    const job = this.opJobs.get(id);
+    if (!job || job.cancelled) return;
+    if (!job.pending) return;
+    if (!samePath(job.pending.dst, dst)) return;
+    const resume = job.resume;
+    job.pending = null;
+    job.resume = null;
+    if (resume) resume(decision);
+  }
+
+  /** Real collisions parked right now, as `{id, dst, kind}` rows — the shape
+   *  `op_pending_collisions` returns on the Tauri backend. The discovery half
+   *  of the round-trip: a `collision` event is fire-and-forget over a
+   *  Channel, so a UI that mounted (or reloaded) while an op was paused never
+   *  saw the question. The dialog re-syncs from here; the mock answers it
+   *  from its own parked set so the two paths agree. */
+  async opPendingCollisions(): Promise<
+    Array<{ id: JobId; dst: string; kind: CollisionKindDto }>
+  > {
+    const out: Array<{ id: JobId; dst: string; kind: CollisionKindDto }> = [];
+    this.opJobs.forEach((job, id) => {
+      if (job.cancelled || !job.pending) return;
+      out.push({ id, dst: job.pending.dst, kind: job.pending.kind });
+    });
+    return out;
+  }
+
+  /** Emit a `collision` event and park until `settle` is called with the
+   *  answer. Shared by the dst-name heuristic and `simulateCollision`. */
+  private parkOnCollision(
+    id: JobId,
+    dst: string,
+    kind: CollisionKindDto,
+    settle: (decision: CollisionDecision) => void
+  ): void {
+    const job = this.opJobs.get(id);
+    if (!job || job.cancelled || job.pending) return;
+    job.pending = { dst, kind };
+    job.resume = settle;
+    job.onEvent({ type: "collision", id, dst, kind });
+  }
+
+  /**
+   * Dev-only: make a live op hit a collision right now, whatever its
+   * destination is named. Lets the 3b dialog be exercised from devtools or
+   * automation on any op, and with any `kind`, so the folder and symlink
+   * wordings are reachable too. Returns false when no op is waiting to ask.
+   */
+  simulateCollision(dst: string, kind: CollisionKindDto = "file"): boolean {
+    const ids = Array.from(this.opJobs.keys());
+    for (let i = 0; i < ids.length; i++) {
+      const job = this.opJobs.get(ids[i]);
+      if (!job || job.cancelled || job.pending) continue;
+      const id = ids[i];
+      const req = job.req;
+      this.parkOnCollision(id, dst, kind, (decision) => {
+        if (decision === "abort") {
+          job.onEvent({
+            type: "error",
+            id,
+            error: {
+              kind: "cancelled",
+              path: dst,
+              message: "aborted at a collision on " + dst + " (mock)",
+            },
+          });
+          this.opJobs.delete(id);
+          return;
+        }
+        job.onEvent({ type: "done", id, summary: mockSummary(req) });
+        this.opJobs.delete(id);
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /** Introspection for devtools / tests: the answers the mock was given. */
+  collisionAnswers(): CollisionAnswer[] {
+    return this.answerLog.slice();
   }
 
   /**
@@ -647,9 +920,16 @@ class MockIpc implements KestrelIpc {
   }
 }
 
+/** Trailing-slash-insensitive path comparison. Used for watch dirs AND for
+ *  collision answers: the engine keys `AnsweredCollisions` by path, so an
+ *  answer whose `dst` differs only by a trailing slash must still match. */
+function samePath(a: string, b: string): boolean {
+  return stripSlash(a) === stripSlash(b);
+}
+
 /** Trailing-slash-insensitive directory comparison. */
 function sameDir(a: string, b: string): boolean {
-  return stripSlash(a) === stripSlash(b);
+  return samePath(a, b);
 }
 
 /**

@@ -160,6 +160,8 @@ pub fn run() {
             commands::watch_unsubscribe,
             commands::op_start,
             commands::op_cancel,
+            commands::op_collision_answer,
+            commands::op_pending_collisions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

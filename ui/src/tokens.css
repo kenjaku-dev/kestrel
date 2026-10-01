@@ -1364,6 +1364,127 @@
   --kestrel-dialog-checkbox-glyph-color: var(--kestrel-text-on-accent);
   --kestrel-dialog-checkbox-disabled-border: var(--kestrel-border-subtle);
 
+  /* ---- §4.7 Confirmation dialog — Phase 3b collision variant -------------
+   *
+   * §4.7's own table stops at a two-button confirmation. The collision dialog
+   * is a three-choice decision where each choice carries its consequence, so
+   * it needs three visual registers the spec does not describe (and which
+   * therefore sit under `dialog-`, not under a new §4 block — this is still
+   * the confirmation dialog, not a seventh component).
+   *
+   * THE REGISTER IS THE DESIGN. Overwrite fills with `status.danger-solid`;
+   * abort is an outlined caution control in `status.warning-*`; skip is a
+   * neutral outline. Fill versus outline is what separates "replaces data"
+   * from "stops work" at a glance — they are different in kind, not degree,
+   * and colour alone would not carry that. Abort is additionally isolated by
+   * a separator so it is not adjacent to the destructive fill.
+   */
+
+  /* Wider than §4.7's 400px: two full paths plus a sentence per choice. The
+     width is capped against the viewport so a narrow window wraps rather than
+     clipping. */
+  --kestrel-dialog-collision-width: 460px;
+  --kestrel-dialog-collision-max-height: 88vh;
+  --kestrel-dialog-collision-scroll-padding: var(--kestrel-space-2);
+  /* Inset from the window edge to the card, so a short dialog does not sit
+     flush against the scrim on a small window. */
+  --kestrel-dialog-collision-layer-padding: var(--kestrel-space-4);
+
+  /* "COPY · PAUSED" kicker. A warning hue because "paused" is the thing the
+     user most needs to notice, and it is not an error. */
+  --kestrel-dialog-op-font: var(--kestrel-text-role-label-font);
+  --kestrel-dialog-op-tracking: var(--kestrel-text-role-label-tracking);
+  --kestrel-dialog-op-color: var(--kestrel-status-warning-text);
+  --kestrel-dialog-op-gap: var(--kestrel-space-1);
+  --kestrel-dialog-title-gap: var(--kestrel-space-2);
+
+  /* The two paths, as a label/value grid. `code` is mono (type.meta), which
+     is why these are `path` and not `body`: a path read in a proportional
+     face is genuinely easy to misread. */
+  --kestrel-dialog-paths-gap: var(--kestrel-space-2);
+  --kestrel-dialog-paths-margin-bottom: var(--kestrel-space-1);
+  --kestrel-dialog-path-gap: var(--kestrel-space-2);
+  --kestrel-dialog-path-label-font: var(--kestrel-text-role-label-font);
+  --kestrel-dialog-path-label-tracking: var(--kestrel-text-role-label-tracking);
+  --kestrel-dialog-path-label-color: var(--kestrel-text-tertiary);
+  --kestrel-dialog-path-label-width: 34px;
+  --kestrel-dialog-path-font: var(--kestrel-text-role-meta-font);
+  --kestrel-dialog-path-color: var(--kestrel-text-primary);
+  /* The destination is the thing in question, so it is the one on a tinted
+     plate (state.hover, as §4.7's path-quote does). The source is plain. */
+  --kestrel-dialog-path-dst-bg: var(--kestrel-state-hover);
+  --kestrel-dialog-path-dst-radius: var(--kestrel-radius-md);
+  --kestrel-dialog-path-dst-padding-y: var(--kestrel-space-half);
+  --kestrel-dialog-path-dst-padding-x: var(--kestrel-space-1-5);
+
+  --kestrel-dialog-existing-margin-y: var(--kestrel-space-3);
+  --kestrel-dialog-existing-font: var(--kestrel-text-role-meta-font);
+  --kestrel-dialog-existing-color: var(--kestrel-status-warning-text);
+  --kestrel-dialog-existing-gap: var(--kestrel-space-2);
+  --kestrel-dialog-glyph-width: var(--kestrel-impl-glyph-cell-width);
+
+  /* One prose target for aria-describedby, then the honesty statement in
+     caption type: the situation, then the fact that nothing is moving. */
+  --kestrel-dialog-desc-margin-y: var(--kestrel-space-3);
+  --kestrel-dialog-desc-font: var(--kestrel-text-role-dialog-body-font);
+  --kestrel-dialog-desc-color: var(--kestrel-dialog-body-color);
+  --kestrel-dialog-paused-font: var(--kestrel-text-role-caption-font);
+  --kestrel-dialog-paused-color: var(--kestrel-text-tertiary);
+
+  /* The choices. Each is a full-width row, not a footer button: a decision
+     that needs a sentence cannot live in a 30px button. */
+  --kestrel-dialog-options-margin-top: var(--kestrel-space-4);
+  --kestrel-dialog-option-gap: var(--kestrel-space-2);
+  --kestrel-dialog-option-padding-y: var(--kestrel-space-2-5);
+  --kestrel-dialog-option-padding-x: var(--kestrel-space-3);
+  --kestrel-dialog-option-radius: var(--kestrel-radius-md);
+  --kestrel-dialog-option-border-width: var(--kestrel-border-hairline);
+  --kestrel-dialog-option-border: var(--kestrel-border-strong);
+  --kestrel-dialog-option-bg: var(--kestrel-surface-input);
+  --kestrel-dialog-option-bg-hover: var(--kestrel-state-hover-strong);
+  --kestrel-dialog-option-label-font: var(--kestrel-text-role-ui-strong-font);
+  --kestrel-dialog-option-label-color: var(--kestrel-text-primary);
+  --kestrel-dialog-option-detail-font: var(--kestrel-text-role-caption-font);
+  --kestrel-dialog-option-detail-color: var(--kestrel-text-secondary);
+  --kestrel-dialog-option-glyph-font: var(--kestrel-text-role-ui-strong-font);
+  --kestrel-dialog-option-glyph-width: var(--kestrel-metric-icon);
+  --kestrel-dialog-option-glyph-color: var(--kestrel-icon-chrome);
+
+  /* Destructive: the only filled control in the dialog. */
+  --kestrel-dialog-option-destructive-bg: var(--kestrel-dialog-btn-destructive-bg);
+  --kestrel-dialog-option-destructive-bg-hover: var(--kestrel-dialog-btn-destructive-bg-hover);
+  --kestrel-dialog-option-destructive-border: var(--kestrel-dialog-btn-destructive-bg);
+  --kestrel-dialog-option-destructive-label-color: var(--kestrel-dialog-btn-destructive-text);
+  --kestrel-dialog-option-destructive-detail-color: var(--kestrel-dialog-btn-destructive-text);
+  --kestrel-dialog-option-destructive-glyph-color: var(--kestrel-dialog-btn-destructive-text);
+
+  /* Caution: abort. Outlined, never filled — it stops work, it does not
+     destroy data, and a red fill would say otherwise. */
+  --kestrel-dialog-option-caution-border: var(--kestrel-status-warning-border);
+  --kestrel-dialog-option-caution-border-hover: var(--kestrel-status-warning-solid);
+  --kestrel-dialog-option-caution-label-color: var(--kestrel-status-warning-text);
+  --kestrel-dialog-option-caution-detail-color: var(--kestrel-text-secondary);
+  --kestrel-dialog-option-caution-glyph-color: var(--kestrel-status-warning-text);
+
+  --kestrel-dialog-option-separator-width: var(--kestrel-border-hairline);
+  --kestrel-dialog-option-separator-color: var(--kestrel-border-default);
+  --kestrel-dialog-seq-margin-top: var(--kestrel-space-3);
+  --kestrel-dialog-seq-font: var(--kestrel-text-role-caption-font);
+  --kestrel-dialog-seq-color: var(--kestrel-text-tertiary);
+  --kestrel-dialog-hint-margin-top: var(--kestrel-space-1-5);
+  --kestrel-dialog-hint-font: var(--kestrel-text-role-micro-font);
+  --kestrel-dialog-hint-color: var(--kestrel-text-disabled);
+
+  /* §4.7's own motion cells, reused verbatim: the scrim fades, the card rises
+     and fades in, exit is opacity only. Nothing new is invented here — the
+     collision dialog should feel like the confirmation dialog already
+     specified, only with more to read. */
+  --kestrel-dialog-collision-scrim-duration: var(--kestrel-dialog-scrim-enter-duration);
+  --kestrel-dialog-collision-scrim-ease: var(--kestrel-dialog-scrim-enter-ease);
+  --kestrel-dialog-collision-card-duration: var(--kestrel-dialog-enter-duration);
+  --kestrel-dialog-collision-card-ease: var(--kestrel-dialog-enter-ease);
+  --kestrel-dialog-collision-rise: var(--kestrel-dialog-enter-rise);
+
   /* ---- §4.8 Text input / search field ----------------------------------- */
 
   /* The placeholder is "Filter…", not "Search" — the field filters a list, it
